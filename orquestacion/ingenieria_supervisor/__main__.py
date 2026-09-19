@@ -39,6 +39,9 @@ from .tarea import ErrorFicha
 
 ANCHO = 74
 
+# PRAGMA synchronous devuelve un número; el nombre es el de SQLite.
+SYNCHRONOUS_LEGIBLE = {"0": "OFF", "1": "NORMAL", "2": "FULL", "3": "EXTRA"}
+
 
 def _preparar_salida() -> None:
     """La consola debe poder mostrar acentos sin depender de su codificación."""
@@ -131,11 +134,6 @@ def mostrar_tablero(raiz: Path) -> int:
                 str(verificacion.get("fecha"))
                 + "  "
                 + str(verificacion.get("resultado"))
-                + "  ("
-                + str(verificacion.get("ok"))
-                + " de "
-                + str(verificacion.get("total"))
-                + ")"
             )
             if verificacion
             else None,
@@ -198,7 +196,9 @@ def mostrar_tablero(raiz: Path) -> int:
 
     print("")
 
-    return 0
+    # Mismo criterio que `diagnostico`: si no se pudo leer la base global,
+    # el tablero mostrado no es el estado real y el código de salida lo dice.
+    return 0 if base["estado"] == "ACTIVA" else 1
 
 
 def mostrar_diagnostico(raiz: Path) -> int:
@@ -221,7 +221,13 @@ def mostrar_diagnostico(raiz: Path) -> int:
         + ")",
     )
     _linea("journal_mode", informe["journal_mode"])
-    _linea("synchronous", informe["synchronous"])
+    _linea(
+        "synchronous",
+        None if informe["synchronous"] is None
+        else str(informe["synchronous"]) + " (" + SYNCHRONOUS_LEGIBLE.get(
+            str(informe["synchronous"]), "desconocido"
+        ) + ")",
+    )
     _linea("busy_timeout (ms)", informe["busy_timeout_ms"])
     _linea(
         "foreign_keys",

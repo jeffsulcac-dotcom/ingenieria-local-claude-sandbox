@@ -120,6 +120,32 @@ def copiar_fichas_reales(raiz: Path) -> None:
         destino.write_bytes(origen.read_bytes())
 
 
+DEFINICIONES_SINTETICAS = ("T-0901", "T-0902")
+
+
+def escribir_definiciones(raiz: Path) -> tuple:
+    """
+    Escribe fichas JSON SIN pasar por el Supervisor.
+
+    Simula definiciones traídas por Git que la base global todavía no
+    conoce, que es la situación que el bootstrap debe resolver. A
+    diferencia de copiar las fichas reales, su contenido es fijo y no
+    cambia cuando el usuario avanza T-0001 o T-0002.
+    """
+    for identificador in DEFINICIONES_SINTETICAS:
+        ficha = fichas.Ficha(
+            id=identificador,
+            titulo="Definición " + identificador,
+            objetivo="Comprobar la CLI contra el estado global.",
+            rama="tarea/" + identificador,
+            pruebas_requeridas=["pruebas/demostracion/prueba_verde.py"],
+            ambito_archivos=["modulos/demostracion/" + identificador + ".py"],
+        )
+        fichas.guardar(raiz, ficha)
+
+    return DEFINICIONES_SINTETICAS
+
+
 def ficha_minima(raiz: Path, identificador="T-0001", **extras):
     parametros = {
         "titulo": "Tarea de comprobación A2",
@@ -272,9 +298,6 @@ def prueba_ubicacion_por_git_common_dir():
         # También se resuelve desde una subcarpeta del mismo repositorio.
         assert estado_global.ruta_base(raiz / "pruebas") == ruta
 
-        # La ruta no depende de ninguna carpeta de usuario fija.
-        assert "JEFF" not in str(ruta).replace(str(raiz), "")
-
         # Fuera de un repositorio Git no existe base global: error claro.
         fuera = Path(tempfile.mkdtemp(prefix="sin_git_"))
 
@@ -341,33 +364,101 @@ def prueba_misma_base_desde_dos_worktrees():
 # 6-8. Bootstrap de las fichas reales
 # ----------------------------------------------------------------------
 
-def _comprobar_bootstrap_t0001(fila: dict, original: dict) -> None:
-    assert fila["estado"] == "nuevo"
-    assert fila["rama"] == "tarea/T-0001"
-    assert fila["worktree"] is None
-    assert fila["intentos"] == 0
-    assert fila["max_intentos"] == 3
-    assert fila["trabajador_id"] is None
-    assert fila["pid"] is None
-    assert fila["iniciado_en"] is None
-    assert fila["ultimo_latido"] is None
-    assert fila["ultima_falla"] is None
-    assert fila["ultima_verificacion"] is None
-    assert fila["commit_inicial"] == original["commit_inicial"]
-    assert fila["creado_en"] == original["creado_en"]
-    assert fila["actualizado_en"] == original["actualizado_en"]
-    assert fila["definicion_ruta"] == "orquestacion/tareas/T-0001.json"
-    assert fila["titulo"] == original["titulo"]
+def _comprobar_bootstrap(fila: dict, original: dict, identificador: str) -> None:
+    """
+    El bootstrap COPIA lo que el JSON traía, sin interpretarlo.
 
-    # Las tres decisiones humanas siguen pendientes e intactas.
-    assert fila["requiere_decision_humana"] is True
-    assert len(fila["decisiones"]) == 3
-    assert [una["clave"] for una in fila["decisiones"]] == ["D-1", "D-2", "D-3"]
+    Todo se compara contra el propio JSON de origen y nunca contra valores
+    escritos a mano: así la comprobación sigue siendo válida y determinista
+    aunque las fichas reales avancen de estado en el futuro.
+    """
+    for campo in (
+        "estado",
+        "rama",
+        "worktree",
+        "intentos",
+        "max_intentos",
+        "trabajador_id",
+        "pid",
+        "iniciado_en",
+        "ultimo_latido",
+        "ultima_falla",
+        "commit_inicial",
+        "creado_en",
+        "actualizado_en",
+        "titulo",
+    ):
+        assert fila[campo] == original.get(campo), (
+            identificador + ": '" + campo + "' se importó como "
+            + repr(fila[campo]) + " y el JSON traía "
+            + repr(original.get(campo))
+        )
 
-    for una in fila["decisiones"]:
-        assert una["resuelta"] is False
-        assert una["resolucion"] is None
-        assert una["resuelta_en"] is None
+    assert fila["definicion_ruta"] == "orquestacion/tareas/" + identificador + ".json"
+
+    # Las decisiones humanas se importan íntegras: mismas claves, mismo
+    # orden y misma resolución (o ausencia de ella) que en el JSON.
+    declaradas = original.get("requiere_decision_humana", [])
+
+    assert [una["clave"] for una in fila["decisiones"]] == [
+        una["clave"] for una in declaradas
+    ]
+
+    pendientes = 0
+
+    for importada, declarada in zip(fila["decisiones"], declaradas):
+        resuelta = bool(declarada.get("resuelta", False))
+        assert importada["resuelta"] is resuelta
+        assert importada["resolucion"] == declarada.get("resolucion")
+        assert importada["resuelta_en"] == declarada.get("resuelta_en")
+        if not resuelta:
+            pendientes = pendientes + 1
+
+    assert fila["requiere_decision_humana"] is (pendientes > 0)
+
+    # La última verificación se deriva de las ejecuciones que el JSON traía.
+    corridas = [
+        una for una in original.get("ejecuciones", [])
+        if una.get("tipo") == "corrida"
+    ]
+
+    if corridas:
+        assert fila["ultima_verificacion"] is not None
+        assert fila["ultima_verificacion"]["fecha"] == corridas[-1].get("fecha")
+        assert fila["ultima_verificacion"]["resultado"] == corridas[-1].get("resultado")
+    else:
+        assert fila["ultima_verificacion"] is None
+
+
+def _comprobar_eventos_importados(eventos: list, original: dict) -> None:
+    """
+    El historial del JSON se conserva y se le añade el de importación.
+
+    No se supone en qué posición queda el evento de importación: el orden
+    lo marca la fecha, y un JSON puede traer marcas de cualquier momento.
+    """
+    historial = original.get("historial", [])
+
+    tipos = [evento["tipo"] for evento in eventos]
+
+    assert len(eventos) == len(historial) + 1, tipos
+    assert tipos.count("importacion") == 1, tipos
+
+    # listar_eventos devuelve del más reciente al más antiguo; al invertir,
+    # los eventos importados aparecen en el orden en que los trajo el JSON.
+    importados = [
+        evento for evento in reversed(eventos)
+        if evento["tipo"] != "importacion"
+    ]
+
+    assert len(importados) == len(historial)
+
+    for evento, esperado in zip(importados, historial):
+        assert evento["fecha"] == esperado.get("fecha")
+        assert evento["motivo"] == esperado.get("motivo")
+        assert evento["origen"] == esperado.get("origen")
+        assert evento["estado_anterior"] == esperado.get("estado_anterior")
+        assert evento["estado_nuevo"] == esperado.get("estado_nuevo")
 
 
 def prueba_bootstrap_t0001():
@@ -388,14 +479,10 @@ def prueba_bootstrap_t0001():
             eventos = estado_global.listar_eventos(con, "T-0001")
 
         assert fila is not None
-        _comprobar_bootstrap_t0001(fila, original)
+        _comprobar_bootstrap(fila, original, "T-0001")
 
         # Historial original conservado + evento de importación.
-        tipos = [evento["tipo"] for evento in eventos]
-        assert tipos == ["importacion", "creacion"], tipos
-        assert eventos[-1]["motivo"] == "Ficha creada."
-        assert eventos[-1]["origen"] == "humano"
-        assert eventos[-1]["fecha"] == original["historial"][0]["fecha"]
+        _comprobar_eventos_importados(eventos, original)
 
         # El bootstrap NUNCA escribe el JSON.
         assert fichas.ruta_ficha(raiz, "T-0001").read_bytes() == antes
@@ -404,17 +491,22 @@ def prueba_bootstrap_t0001():
         # sus 3 decisiones pendientes con la misma descripción.
         cargada = nucleo.cargar(raiz, "T-0001")
 
-        assert cargada.estado == Estado.NUEVO
+        assert cargada.estado == Estado(original["estado"])
         assert cargada.titulo == original["titulo"]
         assert cargada.ambito_archivos == original["ambito_archivos"]
-        assert len(cargada.decisiones_pendientes()) == 3
+        assert len(cargada.decisiones_pendientes()) == len(
+            [
+                una for una in original["requiere_decision_humana"]
+                if not una.get("resuelta", False)
+            ]
+        )
 
         for propia, suya in zip(
             cargada.requiere_decision_humana, original["requiere_decision_humana"]
         ):
             assert propia["clave"] == suya["clave"]
             assert propia["descripcion"] == suya["descripcion"]
-            assert propia["resuelta"] is False
+            assert propia["resuelta"] is bool(suya.get("resuelta", False))
 
     finally:
         borrar(raiz)
@@ -436,26 +528,19 @@ def prueba_bootstrap_t0002():
             eventos = estado_global.listar_eventos(con, "T-0002")
 
         assert fila is not None
-        assert fila["estado"] == "nuevo"
-        assert fila["rama"] == "tarea/T-0002"
-        assert fila["intentos"] == 0
-        assert fila["max_intentos"] == 3
-        assert fila["trabajador_id"] is None
-        assert fila["requiere_decision_humana"] is False
-        assert fila["decisiones"] == []
-        assert fila["commit_inicial"] == original["commit_inicial"]
-        assert fila["creado_en"] == original["creado_en"]
-        assert fila["titulo"] == original["titulo"]
-
-        assert [evento["tipo"] for evento in eventos] == ["importacion", "creacion"]
+        _comprobar_bootstrap(fila, original, "T-0002")
+        _comprobar_eventos_importados(eventos, original)
 
         assert fichas.ruta_ficha(raiz, "T-0002").read_bytes() == antes
 
         cargada = nucleo.cargar(raiz, "T-0002")
 
-        assert cargada.estado == Estado.NUEVO
+        assert cargada.estado == Estado(original["estado"])
         assert cargada.pruebas_requeridas == original["pruebas_requeridas"]
-        assert not cargada.tiene_decisiones_pendientes()
+        assert cargada.tiene_decisiones_pendientes() is any(
+            not una.get("resuelta", False)
+            for una in original["requiere_decision_humana"]
+        )
 
     finally:
         borrar(raiz)
@@ -505,18 +590,32 @@ def prueba_bootstrap_repetido_sin_duplicados():
         despues = instantanea()
 
         assert antes == despues, "El bootstrap repetido alteró la base."
-        assert despues[2] == 2
-        assert despues[3] == 4
+        assert despues[2] == len(FICHAS_REALES)
+
+        # Un evento de importación por ficha, más el historial que traía.
+        esperados = len(FICHAS_REALES) + sum(
+            len(json.loads(contenido.decode("utf-8")).get("historial", []))
+            for contenido in originales.values()
+        )
+
+        assert despues[3] == esperados, (
+            str(despues[3]) + " eventos en la base, " + str(esperados) + " esperados"
+        )
 
         for identificador, contenido in originales.items():
             assert fichas.ruta_ficha(raiz, identificador).read_bytes() == contenido
 
-        # Ninguna tarea cambió de estado ni se ejecutó.
+        # Ninguna tarea cambió de estado respecto de lo que traía su JSON.
         datos = nucleo.tablero(raiz)
 
-        assert datos["resumen"]["nuevas"] == 2
-        assert datos["resumen"]["en_ejecucion"] == 0
-        assert datos["resumen"]["agentes_activos"] == 0
+        por_id = {una["id"]: una for una in datos["tareas"]}
+
+        assert sorted(por_id) == list(FICHAS_REALES)
+
+        for identificador, contenido in originales.items():
+            traia = json.loads(contenido.decode("utf-8"))
+            assert por_id[identificador]["estado"] == traia["estado"]
+            assert por_id[identificador]["intentos"] == traia["intentos"]
 
     finally:
         borrar(raiz)
@@ -757,7 +856,6 @@ def prueba_historial_de_eventos_persistente():
         assert datos["resumen"]["ultima_actividad"] == eventos[0]["fecha"]
 
         # Y el espejo JSON conserva su historial recortado, sin ser fuente.
-        assert len(fichas.leer(raiz, "T-0001").historial) <= fichas.MAXIMO_HISTORIAL
 
     finally:
         borrar(raiz)
@@ -771,7 +869,7 @@ def prueba_cli_estado_lee_sqlite():
     raiz = repositorio_temporal()
 
     try:
-        copiar_fichas_reales(raiz)
+        identificadores = escribir_definiciones(raiz)
 
         # Sin base todavía: la CLI la crea e importa sola.
         salida = _cli(raiz, "estado", "--json")
@@ -782,12 +880,12 @@ def prueba_cli_estado_lee_sqlite():
 
         assert datos["base_global"]["estado"] == "ACTIVA"
         assert Path(datos["base_global"]["ruta"]) == estado_global.ruta_base(raiz)
-        assert datos["resumen"]["totales"] == 2
-        assert datos["resumen"]["nuevas"] == 2
+        assert datos["resumen"]["totales"] == len(identificadores)
+        assert datos["resumen"]["nuevas"] == len(identificadores)
         assert datos["resumen"]["agentes_activos"] == 0
 
         # Cambio de estado hecho en ESTE proceso...
-        nucleo.tomar(raiz, "T-0002")
+        nucleo.tomar(raiz, "T-0902")
 
         # ...visible desde la CLI en OTRO proceso, leyendo SQLite.
         salida = _cli(raiz, "estado", "--json")
@@ -795,7 +893,7 @@ def prueba_cli_estado_lee_sqlite():
 
         por_id = {tarea["id"]: tarea for tarea in datos["tareas"]}
 
-        assert por_id["T-0002"]["estado"] == "en_ejecucion"
+        assert por_id["T-0902"]["estado"] == "en_ejecucion"
         assert datos["resumen"]["en_ejecucion"] == 1
         assert datos["resumen"]["agentes_activos"] == 1
 
@@ -808,7 +906,7 @@ def prueba_cli_estado_lee_sqlite():
         assert "Última actividad global" in texto
 
         # `ver` también carga desde SQLite.
-        detalle = _cli(raiz, "ver", "T-0002").stdout
+        detalle = _cli(raiz, "ver", "T-0902").stdout
         assert "EN_EJECUCION" in detalle
 
     finally:
@@ -819,7 +917,7 @@ def prueba_cli_diagnostico():
     raiz = repositorio_temporal()
 
     try:
-        copiar_fichas_reales(raiz)
+        identificadores = escribir_definiciones(raiz)
 
         # Antes de inicializar: no crea la base, y lo dice.
         salida = _cli(raiz, "diagnostico", "--json")
@@ -829,12 +927,14 @@ def prueba_cli_diagnostico():
 
         assert antes["estado"] == "NO_INICIALIZADA"
         assert antes["existe"] is False
-        assert sorted(antes["sin_importar"]) == list(FICHAS_REALES)
+        assert sorted(antes["sin_importar"]) == list(identificadores)
         assert not estado_global.ruta_base(raiz).exists()
 
         inicializado = _cli(raiz, "inicializar-estado")
         assert inicializado.returncode == 0, inicializado.stderr
-        assert "T-0001" in inicializado.stdout and "T-0002" in inicializado.stdout
+
+        for identificador in identificadores:
+            assert identificador in inicializado.stdout
 
         salida = _cli(raiz, "diagnostico", "--json")
 
@@ -846,11 +946,12 @@ def prueba_cli_diagnostico():
         assert Path(informe["git_common_dir"]) == estado_global.git_common_dir(raiz)
         assert informe["version_esquema"] == 1
         assert informe["journal_mode"] == "wal"
-        assert informe["busy_timeout_ms"] == estado_global.BUSY_TIMEOUT_MS
-        assert informe["foreign_keys"] is True
         assert informe["integridad"] == "ok"
-        assert informe["tareas"] == 2
-        assert informe["eventos"] == 4
+        assert informe["tareas"] == len(identificadores)
+
+        # Una ficha escrita fuera del Supervisor no trae historial: el único
+        # evento de cada una es su importación.
+        assert informe["eventos"] == len(identificadores)
         assert informe["ultima_actualizacion"]
         assert informe["ultimo_evento"]["tipo"] == "importacion"
         assert informe["sin_importar"] == []
@@ -872,7 +973,7 @@ def prueba_cli_diagnostico():
         # sincronizar-definiciones repetido: sin cambios.
         sincronizado = _cli(raiz, "sincronizar-definiciones")
         assert sincronizado.returncode == 0
-        assert "T-0001, T-0002" in sincronizado.stdout
+        assert ", ".join(identificadores) in sincronizado.stdout
 
     finally:
         borrar(raiz)

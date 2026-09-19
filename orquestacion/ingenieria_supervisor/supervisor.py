@@ -1609,7 +1609,6 @@ def tablero(raiz: Path, maximo_actividad: int = 20) -> dict:
         "estado": "ERROR",
         "ruta": None,
         "ubicacion_resumida": None,
-        "git_common_dir": None,
         "version_esquema": None,
         "journal_mode": None,
         "detalle": None,
@@ -1624,7 +1623,6 @@ def tablero(raiz: Path, maximo_actividad: int = 20) -> dict:
 
         base["ruta"] = str(ruta)
         base["ubicacion_resumida"] = global_.ubicacion_resumida(ruta)
-        base["git_common_dir"] = str(ruta.parent)
 
         with global_.conexion(raiz) as con:
             # Camino de sólo lectura: incorpora tareas ausentes, no
@@ -1679,7 +1677,6 @@ def tablero(raiz: Path, maximo_actividad: int = 20) -> dict:
             "estado_nuevo": evento.get("estado_nuevo"),
             "motivo": evento.get("motivo"),
             "origen": evento.get("origen"),
-            "datos": evento.get("datos"),
         }
         for evento in eventos
     ]

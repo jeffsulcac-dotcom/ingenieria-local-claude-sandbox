@@ -205,7 +205,7 @@ def prueba_pagina_desarrollo():
     assert "Requiere decisión humana" in texto
 
     # El tablero se alimenta de su propia API local, sin recursos externos.
-    assert "/api/desarrollo/estado" in texto
+    assert "/api/desarrollo/tareas" in texto
 
     minuscula = texto.lower()
 
@@ -342,16 +342,7 @@ def _comprobar_estado_desarrollo(ruta: str) -> dict:
 
 
 def prueba_api_desarrollo():
-    _comprobar_estado_desarrollo("/api/desarrollo/estado")
-
-
-def prueba_api_desarrollo_ruta_v1():
-    """La ruta de V1 se conserva y responde exactamente lo mismo."""
-    nueva = _comprobar_estado_desarrollo("/api/desarrollo/estado")
-    antigua = _comprobar_estado_desarrollo("/api/desarrollo/tareas")
-
-    assert antigua["resumen"] == nueva["resumen"]
-    assert [t["id"] for t in antigua["tareas"]] == [t["id"] for t in nueva["tareas"]]
+    _comprobar_estado_desarrollo("/api/desarrollo/tareas")
 
 
 # ----------------------------------------------------------------------
@@ -373,9 +364,7 @@ COMPROBACIONES = [
     ("POST viga, luz no numérica = 422",
      prueba_calculo_viga_luz_no_numerica),
     ("GET /desarrollo", prueba_pagina_desarrollo),
-    ("GET /api/desarrollo/estado (SQLite global)", prueba_api_desarrollo),
-    ("GET /api/desarrollo/tareas (ruta V1 conservada)",
-     prueba_api_desarrollo_ruta_v1),
+    ("GET /api/desarrollo/tareas (SQLite global)", prueba_api_desarrollo),
 ]
 
 

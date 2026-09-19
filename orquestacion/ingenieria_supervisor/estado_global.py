@@ -73,23 +73,6 @@ EVENTO_RECUPERACION = "recuperacion"
 
 ORIGEN_AUTOMATICO = "automático"
 
-# Campos operativos de la ficha que gobierna SQLite. Cualquier valor que el
-# JSON traiga para ellos se ignora como entrada: sólo es un espejo.
-CAMPOS_OPERATIVOS = (
-    "estado",
-    "rama",
-    "worktree",
-    "intentos",
-    "max_intentos",
-    "trabajador_id",
-    "pid",
-    "iniciado_en",
-    "ultimo_latido",
-    "actualizado_en",
-    "ultima_falla",
-    "commit_inicial",
-)
-
 # Migraciones versionadas. Cada versión es una lista de sentencias que se
 # aplican dentro de una única transacción. Nunca se edita una versión ya
 # publicada: se añade la siguiente.
@@ -1116,7 +1099,14 @@ def diagnostico(raiz: Path) -> dict:
         informe["sin_importar"] = [ficha.id for ficha in fichas]
         return informe
 
-    informe["tamano_bytes"] = ruta.stat().st_size
+    try:
+        informe["tamano_bytes"] = ruta.stat().st_size
+    except OSError as error:
+        informe["detalle"] = (
+            "La base existía al comprobarla pero no se pudo consultar: "
+            + str(error)
+        )
+        return informe
 
     try:
         con = abrir(ruta, solo_lectura=True)

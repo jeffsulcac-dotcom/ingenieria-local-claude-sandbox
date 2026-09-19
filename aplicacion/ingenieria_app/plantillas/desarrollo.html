@@ -402,7 +402,7 @@ function dibujar(datos) {
 }
 
 function consultar() {
-    fetch("/api/desarrollo/estado", { cache: "no-store" })
+    fetch("/api/desarrollo/tareas", { cache: "no-store" })
         .then(function (respuesta) {
             if (!respuesta.ok) {
                 throw new Error("Respuesta " + respuesta.status);

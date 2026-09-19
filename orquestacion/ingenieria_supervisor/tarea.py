@@ -18,12 +18,17 @@ criterios, ámbito, pruebas requeridas y decisiones humanas declaradas
 (clave y descripción).
 
 El ESTADO OPERATIVO (estado, rama, worktree, intentos, trabajador, latido,
-fallas, resolución de decisiones, ejecuciones e historial) lo gobierna la
-base SQLite global (ver `estado_global.py`). Los campos operativos que siguen
-presentes en el JSON son un ESPEJO derivado: se regeneran a partir de SQLite
-después de cada operación, por compatibilidad con el Supervisor V1 y para
-que el commit automático de la ficha siga dejando rastro en Git. Nunca son
-entrada: al cargar una tarea, SQLite se superpone a lo que diga el JSON.
+fallas, resolución de decisiones y ejecuciones) lo gobierna la base SQLite
+global (ver `estado_global.py`). Esos campos siguen presentes en el JSON
+como ESPEJO derivado: se regeneran a partir de SQLite después de cada
+operación, por compatibilidad con el Supervisor V1 y para que el commit
+automático de la ficha siga dejando rastro en Git. Nunca son entrada: al
+cargar una tarea, SQLite se superpone a lo que diga el JSON.
+
+El `historial` del JSON es la excepción: no se reconstruye desde SQLite.
+Cada evento se registra a la vez en esta lista (recortada a los últimos
+MAXIMO_HISTORIAL) y en la tabla `eventos` de la base, que es el historial
+completo y global.
 """
 
 from __future__ import annotations

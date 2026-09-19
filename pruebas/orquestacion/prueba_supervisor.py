@@ -1264,18 +1264,8 @@ def prueba_commit_automatico_limitado():
     raiz = crear_repositorio()
 
     try:
-        if shutil.which("git") is None:
-            # Sin Git esta regla no puede comprobarse. Se dice en voz alta:
-            # una comprobación que se apaga en silencio miente.
-            print("      AVISO: Git no está disponible, comprobación OMITIDA")
-            return
-
-        inicio = _git(raiz, "init", "-b", "main")
-
-        assert inicio.returncode == 0, (
-            "No se pudo crear el repositorio de juguete: " + inicio.stderr
-        )
-
+        # La raíz ya es un repositorio: crear_repositorio() lo inicializa
+        # desde A2, porque sin Git no hay base global que ubicar.
         _git(raiz, "config", "user.name", "Prueba Supervisor")
         _git(raiz, "config", "user.email", "prueba@ingenieria.local")
         _git(raiz, "config", "commit.gpgsign", "false")
