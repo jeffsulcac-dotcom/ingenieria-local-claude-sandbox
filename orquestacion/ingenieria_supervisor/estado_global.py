@@ -215,6 +215,25 @@ class ErrorEstadoGlobal(Exception):
 # Ubicación
 # ----------------------------------------------------------------------
 
+# Directorio común de Git ya resuelto, por raíz. Ver `git_common_dir`.
+_COMUNES_RESUELTOS: dict = {}
+
+
+def olvidar_git_common_dir(raiz: Path | None = None) -> None:
+    """
+    Descarta lo memorizado por `git_common_dir`.
+
+    Sin argumento lo olvida todo. Existe para que una prueba pueda volver al
+    estado de partida sin depender del orden en que se ejecute.
+    """
+    if raiz is None:
+        _COMUNES_RESUELTOS.clear()
+
+        return
+
+    _COMUNES_RESUELTOS.pop(str(Path(raiz).resolve()), None)
+
+
 def git_common_dir(raiz: Path) -> Path:
     """
     Directorio común de Git del repositorio que contiene `raiz`.
@@ -222,8 +241,39 @@ def git_common_dir(raiz: Path) -> Path:
     Desde la rama principal Git responde `.git` (relativo a la raíz); desde un
     worktree enlazado responde la ruta absoluta del `.git` principal. En ambos
     casos el resultado es el MISMO directorio.
+
+    Por qué se memoriza (A3.2)
+    --------------------------
+    Cada operación del Supervisor necesita esta ruta para saber dónde está la
+    base global, así que una tanda de pruebas la pedía cientos de veces por
+    proceso. En Linux cuesta unos 2 ms y no se nota; en Windows, con Defender
+    vigilando la carpeta, cuesta entre 50 y 250 ms, y el límite de 120 s por
+    archivo del corredor único entraba en juego. A3.1 ya midió la mitigación
+    y la dejó anotada como lo primero que hacer si la corrida se acercaba al
+    límite; la batería de A3.2 es la que la acerca.
+
+    Es una memoria por PROCESO y por raíz, no una caché global persistente:
+    nada sobrevive a la salida del proceso, así que no hay estado compartido
+    que pueda quedar obsoleto entre ejecuciones.
+
+    Y dentro del proceso tampoco puede quedarse obsoleta en silencio: antes
+    de devolver lo memorizado se comprueba que el directorio siga existiendo.
+    Si el repositorio se movió o se borró —lo que pasa constantemente en las
+    pruebas, que crean y destruyen repositorios temporales— se vuelve a
+    preguntar a Git. Esa comprobación es una llamada al sistema de archivos,
+    no un proceso nuevo: es justo lo que se quería ahorrar.
     """
     raiz = Path(raiz)
+    clave = str(raiz.resolve())
+
+    memorizado = _COMUNES_RESUELTOS.get(clave)
+
+    if memorizado is not None:
+        if memorizado.is_dir():
+            return memorizado
+
+        # El repositorio ya no está donde estaba: lo memorizado no vale.
+        _COMUNES_RESUELTOS.pop(clave, None)
 
     try:
         resultado = subprocess.run(
@@ -259,7 +309,11 @@ def git_common_dir(raiz: Path) -> Path:
     if not comun.is_absolute():
         comun = raiz / comun
 
-    return comun.resolve()
+    comun = comun.resolve()
+
+    _COMUNES_RESUELTOS[clave] = comun
+
+    return comun
 
 
 def ruta_base(raiz: Path) -> Path:
