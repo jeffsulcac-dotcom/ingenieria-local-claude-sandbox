@@ -904,6 +904,13 @@ def resumen_de_corrida(corrida: dict | None) -> dict | None:
         "fecha": corrida.get("fecha"),
         "resultado": corrida.get("resultado"),
         "motivo": corrida.get("motivo"),
+        # A3.3 — DÓNDE se ejecutó. Sin esto, dos corridas idénticas de
+        # árboles distintos son indistinguibles en el historial y nadie
+        # puede auditar después si se verificó lo correcto.
+        "raiz": corrida.get("raiz"),
+        "es_worktree": corrida.get("es_worktree"),
+        "rama": corrida.get("rama"),
+        "commit": corrida.get("commit"),
         "total": corrida.get("total", 0),
         "ok": corrida.get("ok", 0),
         "fallidas": corrida.get("fallidas", 0),

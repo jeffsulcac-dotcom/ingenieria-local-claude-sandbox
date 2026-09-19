@@ -870,6 +870,100 @@ def _regenerar_espejo(raiz: Path, ficha: Ficha) -> None:
 # Git: commits automáticos estrictamente limitados
 # ----------------------------------------------------------------------
 
+class ErrorWorktree(ErrorSupervisor):
+    """
+    La ruta registrada como worktree de una tarea no se puede usar.
+
+    No existe, no es un directorio, o pertenece a otro repositorio. Es un
+    error propio y no genérico porque la respuesta del operador es distinta
+    en cada caso y porque una ruta ajena NUNCA debe ejecutarse por el
+    hecho de existir.
+    """
+
+
+def resolver_worktree(raiz: Path, declarado: str | None) -> Path:
+    """
+    Convierte la ruta registrada de un worktree en una raíz utilizable.
+
+    Devuelve `raiz` cuando la tarea no declara worktree: es el
+    comportamiento de siempre y el caso normal hoy.
+
+    Qué se comprueba, y por qué cada cosa
+    -------------------------------------
+    - Que exista y sea un DIRECTORIO. Un archivo con ese nombre, o una ruta
+      borrada, no es un árbol de trabajo.
+
+    - Que pertenezca AL MISMO repositorio, comparando el directorio común de
+      Git. Es la comprobación que impide ejecutar una ruta ajena: que un
+      directorio exista y hasta que sea un repositorio Git válido no
+      autoriza a correr sus pruebas. Un worktree registrado apuntando fuera
+      del proyecto —por error o a propósito— haría que `verificar` ejecutara
+      código de otro sitio y grabara su resultado como si fuera el de esta
+      tarea.
+
+    Sobre las rutas, que es donde se esconden los disgustos:
+
+    - Una ruta RELATIVA se interpreta contra `raiz`, nunca contra el
+      directorio desde el que se invocó el Supervisor, que puede ser
+      cualquiera.
+    - `expanduser` resuelve `~`; `resolve` normaliza `..`, los enlaces
+      simbólicos y las junctions de Windows, y en Windows además unifica la
+      letra de unidad y el caso del sistema de archivos. Por eso la
+      comparación se hace SIEMPRE entre rutas resueltas: comparar cadenas
+      dejaría pasar `C:\repo` frente a `c:\repo\` y dos formas del mismo
+      directorio parecerían sitios distintos.
+    - Los espacios no necesitan nada especial porque nunca se construye una
+      línea de órdenes de texto: `subprocess` recibe una lista.
+    """
+    if declarado is None or not str(declarado).strip():
+        return Path(raiz)
+
+    candidato = Path(str(declarado).strip()).expanduser()
+
+    if not candidato.is_absolute():
+        candidato = Path(raiz) / candidato
+
+    try:
+        candidato = candidato.resolve()
+    except OSError as error:
+        raise ErrorWorktree(
+            "No se pudo resolver la ruta del worktree '" + str(declarado)
+            + "': " + str(error)
+        ) from None
+
+    if not candidato.exists():
+        raise ErrorWorktree(
+            "El worktree registrado no existe: '" + str(candidato) + "'."
+        )
+
+    if not candidato.is_dir():
+        raise ErrorWorktree(
+            "El worktree registrado no es un directorio: '"
+            + str(candidato) + "'."
+        )
+
+    try:
+        comun_tarea = global_.git_common_dir(candidato)
+    except global_.ErrorEstadoGlobal as error:
+        raise ErrorWorktree(
+            "La ruta '" + str(candidato) + "' no pertenece a ningún "
+            "repositorio Git, así que no se puede verificar ahí: "
+            + str(error)
+        ) from None
+
+    comun_propio = global_.git_common_dir(Path(raiz))
+
+    if comun_tarea != comun_propio:
+        raise ErrorWorktree(
+            "El worktree '" + str(candidato) + "' pertenece a OTRO "
+            "repositorio (" + str(comun_tarea) + " en vez de "
+            + str(comun_propio) + "). No se ejecuta una ruta ajena por el "
+            "hecho de que exista."
+        )
+
+    return candidato
+
+
 class Git:
     """Acceso mínimo a Git, con los límites del Supervisor incorporados."""
 
@@ -1105,6 +1199,7 @@ def tomar(
     pid: int | None = None,
     ahora: datetime | None = None,
     git=None,
+    worktree: str | None = None,
 ) -> Ficha:
     """
     Reclama una tarea para trabajarla. Toma ATÓMICA desde A3.1.
@@ -1180,6 +1275,14 @@ def tomar(
             "El ámbito debe expresarse en rutas relativas a la raíz del "
             "repositorio. Patrones inválidos: " + ", ".join(invalidos) + "."
         )
+
+    # El worktree se valida ANTES de abrir la transacción, porque mirar el
+    # sistema de archivos y preguntarle a Git son esperas de disco y no
+    # deben hacerse con el bloqueo de escritura tomado. Si la ruta no vale,
+    # la toma ni se intenta.
+    arbol_declarado = (
+        str(resolver_worktree(raiz, worktree)) if worktree else ficha.worktree
+    )
 
     momento = (ahora or ahora_datetime()).isoformat(timespec="seconds")
 
@@ -1322,6 +1425,10 @@ def tomar(
                     # más ni menos: grabar otra cosa dejaría la fila
                     # diciendo algo que nadie comprobó.
                     "ambito_archivos": global_._a_json(ambito_reclamado),
+                    # El árbol donde esta ejecución va a trabajar, ya
+                    # validado. Queda grabado con la toma porque pertenece a
+                    # la ejecución, no a la definición de la tarea.
+                    "worktree": arbol_declarado,
                 },
             )
 
@@ -1502,7 +1609,27 @@ def verificar(
         ficha, "verificar", trabajador_id, generacion
     )
 
-    corrida = corredor.ejecutar_todas(raiz, tiempo_limite_s, ejecutable)
+    # A3.3 — LA RAÍZ DE EJECUCIÓN ES LA DE LA TAREA, NO LA DEL MANDATO.
+    #
+    # Si la tarea declara un worktree, las pruebas se corren AHÍ, venga el
+    # Supervisor invocado desde donde venga. Antes se corrían siempre sobre
+    # `raiz`, de modo que una tarea que vivía en el worktree X y se
+    # verificaba desde main ejecutaba las pruebas de main y grababa ese
+    # resultado como si fuera el suyo: un verde que no dice nada del
+    # trabajo que se estaba juzgando.
+    arbol = resolver_worktree(raiz, ficha.worktree)
+
+    testigo = Git(arbol)
+
+    corrida = corredor.ejecutar_todas(arbol, tiempo_limite_s, ejecutable)
+
+    # La evidencia de DÓNDE se ejecutó viaja con el resultado. Sin esto,
+    # dos corridas idénticas de árboles distintos son indistinguibles en el
+    # historial, y no se puede auditar después si se verificó lo correcto.
+    corrida["raiz"] = str(arbol)
+    corrida["es_worktree"] = arbol != Path(raiz).resolve()
+    corrida["rama"] = testigo.rama_actual()
+    corrida["commit"] = testigo.hash_actual()
 
     consume_intento = False
 
@@ -1636,6 +1763,10 @@ def verificar(
         "estado": str(ficha.estado),
         "motivo": motivo,
         "git": registro,
+        "raiz": str(arbol),
+        "es_worktree": corrida["es_worktree"],
+        "rama": corrida["rama"],
+        "commit": corrida["commit"],
     }
 
 

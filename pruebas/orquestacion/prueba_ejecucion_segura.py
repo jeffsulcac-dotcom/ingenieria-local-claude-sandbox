@@ -435,6 +435,296 @@ def prueba_c_los_intentos_los_cuenta_el_motor():
 
 
 # ----------------------------------------------------------------------
+# GRUPO 2 — verificar() ejecuta en el worktree de la tarea, no donde se le
+#           invocó
+# ----------------------------------------------------------------------
+
+def _prueba_con_marca(marca: str) -> str:
+    return "print('PRUEBA_" + marca + "=OK')\n"
+
+
+def montar_tres_arboles():
+    """
+    Repositorio con main y dos worktrees enlazados, cada uno distinguible.
+
+    Los tres tienen el MISMO archivo de prueba en la misma ruta, pero con
+    una marca distinta. Así, mirar qué marca quedó registrada dice sin
+    ambigüedad qué árbol se ejecutó: no hay que fiarse de rutas ni de
+    mensajes, lo dice el resultado.
+    """
+    principal = crear_repositorio("arboles_")
+    aparte = Path(tempfile.mkdtemp(prefix="arboles_wt_"))
+
+    demo = principal / "pruebas" / "demostracion"
+    (demo / "prueba_arbol.py").write_text(
+        _prueba_con_marca("ARBOL_MAIN"), encoding="utf-8"
+    )
+
+    _git(principal, "add", "-A")
+    hecho = _git(principal, "commit", "-q", "-m", "base")
+    assert hecho.returncode == 0, hecho.stderr
+
+    arboles = {"main": principal}
+
+    for nombre in ("A", "B"):
+        destino = aparte / nombre
+        creado = _git(
+            principal, "worktree", "add", "-q", str(destino),
+            "-b", "rama-" + nombre.lower(),
+        )
+        assert creado.returncode == 0, creado.stderr
+
+        (destino / "pruebas" / "demostracion" / "prueba_arbol.py").write_text(
+            _prueba_con_marca("ARBOL_" + nombre), encoding="utf-8"
+        )
+
+        _git(destino, "add", "-A")
+        hecho = _git(destino, "commit", "-q", "-m", "arbol " + nombre)
+        assert hecho.returncode == 0, hecho.stderr
+
+        arboles[nombre] = destino
+
+    return principal, aparte, arboles
+
+
+def _commit_de(raiz: Path) -> str:
+    resultado = _git(raiz, "rev-parse", "--short", "HEAD")
+    assert resultado.returncode == 0, resultado.stderr
+
+    return resultado.stdout.strip()
+
+
+def prueba_d_verificar_ejecuta_en_el_worktree_de_la_tarea():
+    """
+    Una tarea con worktree se verifica EN ese worktree, no donde se invocó.
+
+    Es el gate crítico de A3.3. Antes, `verificar` corría el corredor sobre
+    la raíz desde la que se llamó al Supervisor, así que una tarea que vivía
+    en el worktree A y se verificaba desde main ejecutaba las pruebas de
+    MAIN y grababa ese resultado como suyo. Un verde que no dice nada del
+    trabajo que se estaba juzgando, y que además habría dado por bueno un
+    árbol que nadie miró.
+
+    Los tres árboles tienen el mismo archivo de prueba con marcas distintas,
+    de modo que el resultado registrado identifica sin ambigüedad cuál se
+    ejecutó. Se comprueba por partida doble: la marca y el commit.
+    """
+    print("  4. verificar ejecuta en el worktree de la tarea:", end=" ")
+
+    principal, aparte, arboles = montar_tres_arboles()
+
+    try:
+        esperado = {
+            "A": ("PRUEBA_ARBOL_A", _commit_de(arboles["A"])),
+            "B": ("PRUEBA_ARBOL_B", _commit_de(arboles["B"])),
+        }
+        commit_main = _commit_de(principal)
+
+        for nombre in ("A", "B"):
+            identificador = "T-090" + ("1" if nombre == "A" else "2")
+
+            nucleo.crear(
+                principal,
+                identificador,
+                titulo="Tarea del árbol " + nombre,
+                ambito_archivos=["modulos/" + nombre.lower() + "/*.py"],
+                pruebas_requeridas=["pruebas/demostracion/prueba_arbol.py"],
+            )
+
+            # La toma declara el árbol: pertenece a la ejecución.
+            tomada = nucleo.tomar(
+                principal,
+                identificador,
+                trabajador_id="worker-" + nombre,
+                worktree=str(arboles[nombre]),
+            )
+            METRICAS["OPERACIONES"] += 1
+            METRICAS["ACEPTADAS"] += 1
+
+            assert tomada.worktree == str(arboles[nombre].resolve()), (
+                "La toma no registró el worktree: " + repr(tomada.worktree)
+            )
+
+            # Se verifica desde la raíz PRINCIPAL, a propósito.
+            informe = nucleo.verificar(
+                principal,
+                identificador,
+                trabajador_id="worker-" + nombre,
+                generacion=tomada.generacion,
+            )
+            METRICAS["OPERACIONES"] += 1
+            METRICAS["ACEPTADAS"] += 1
+
+            marca_esperada, commit_esperado = esperado[nombre]
+
+            marcas = {
+                una["marca"] for una in informe["corrida"]["detalle"]
+                if una["marca"]
+            }
+
+            if marca_esperada not in marcas:
+                METRICAS["VERIFICACIONES_EN_ARBOL_INCORRECTO"] += 1
+
+            assert marca_esperada in marcas, (
+                "No se ejecutó el árbol " + nombre + ". Marcas obtenidas: "
+                + repr(sorted(marcas))
+            )
+
+            for ajena in ("PRUEBA_ARBOL_MAIN", "PRUEBA_ARBOL_"
+                          + ("B" if nombre == "A" else "A")):
+                if ajena in marcas:
+                    METRICAS["VERIFICACIONES_EN_ARBOL_INCORRECTO"] += 1
+
+                assert ajena not in marcas, (
+                    "Se ejecutó el árbol equivocado (" + ajena + ") al "
+                    "verificar la tarea del árbol " + nombre + "."
+                )
+
+            assert informe["commit"] == commit_esperado, (
+                "El commit registrado no es el del árbol " + nombre + ": "
+                + repr(informe["commit"]) + " en vez de "
+                + repr(commit_esperado)
+            )
+            assert informe["commit"] != commit_main, (
+                "Se registró el commit de main."
+            )
+            assert informe["rama"] == "rama-" + nombre.lower(), (
+                "La rama registrada no es la del árbol: "
+                + repr(informe["rama"])
+            )
+            assert informe["es_worktree"] is True
+            assert Path(informe["raiz"]) == arboles[nombre].resolve()
+
+            # Y queda grabado en la base, no sólo devuelto.
+            grabado = fila_de(principal, identificador)["ultima_verificacion"]
+
+            assert grabado["commit"] == commit_esperado, (
+                "La verificación grabada no conserva el commit del árbol: "
+                + repr(grabado)
+            )
+            assert grabado["raiz"] == str(arboles[nombre].resolve())
+
+        comprobar_integridad(principal)
+    finally:
+        _git(principal, "worktree", "prune")
+        borrar(aparte)
+        borrar(principal)
+
+    print("OK")
+
+
+def prueba_e_una_ruta_ajena_no_se_ejecuta():
+    """
+    Una ruta que existe no es, por eso, una ruta que se pueda ejecutar.
+
+    Un worktree registrado apuntando fuera del proyecto —por error o a
+    propósito— haría que `verificar` corriera código de otro sitio y grabara
+    su resultado como si fuera el de esta tarea.
+    """
+    print("  5. una ruta ajena o rota no se verifica:", end=" ")
+
+    principal = crear_repositorio("ajena_")
+    ajeno = crear_repositorio("ajeno_otro_")
+
+    try:
+        for caso, ruta, fragmento in (
+            ("otro repositorio", str(ajeno), "OTRO"),
+            ("no existe", str(principal / "no_existe"), "no existe"),
+            (
+                "no es un directorio",
+                str(principal / "pruebas" / "demostracion" / "prueba_verde.py"),
+                "no es un directorio",
+            ),
+        ):
+            METRICAS["OPERACIONES"] += 1
+
+            try:
+                nucleo.resolver_worktree(principal, ruta)
+            except nucleo.ErrorWorktree as error:
+                METRICAS["RECHAZADAS"] += 1
+
+                assert fragmento in str(error), (
+                    "El rechazo de '" + caso + "' no explica el motivo: "
+                    + str(error)
+                )
+            else:
+                METRICAS["ACEPTADAS"] += 1
+                raise AssertionError(
+                    "Se aceptó una ruta que no debía: " + caso
+                )
+
+        # Sin worktree declarado se usa la raíz, que es el caso normal.
+        assert nucleo.resolver_worktree(principal, None) == principal
+        assert nucleo.resolver_worktree(principal, "  ") == principal
+
+        # Una ruta RELATIVA se interpreta contra la raíz, no contra el
+        # directorio desde el que se invocó el Supervisor.
+        subdirectorio = principal / "pruebas"
+
+        assert nucleo.resolver_worktree(principal, "pruebas") == (
+            subdirectorio.resolve()
+        ), "Una ruta relativa no se resolvió contra la raíz de la tarea."
+    finally:
+        borrar(ajeno)
+        borrar(principal)
+
+    print("OK")
+
+
+def prueba_f_el_worktree_se_valida_al_tomar():
+    """
+    La toma no concede una ejecución sobre un árbol que no vale.
+
+    Es el momento correcto para comprobarlo: si se dejara para `verificar`,
+    la tarea ya estaría tomada y el trabajador ya habría trabajado en algún
+    sitio antes de que nadie mirara si ese sitio era legítimo.
+    """
+    print("  6. la toma valida el worktree antes de conceder:", end=" ")
+
+    principal = crear_repositorio("valida_")
+    ajeno = crear_repositorio("valida_ajeno_")
+
+    try:
+        ficha_minima(principal, "T-0901")
+
+        METRICAS["OPERACIONES"] += 1
+
+        try:
+            nucleo.tomar(
+                principal,
+                "T-0901",
+                trabajador_id="worker-A",
+                worktree=str(ajeno),
+            )
+        except nucleo.ErrorWorktree:
+            METRICAS["RECHAZADAS"] += 1
+        else:
+            METRICAS["ACEPTADAS"] += 1
+            raise AssertionError(
+                "La toma concedió una ejecución sobre un repositorio ajeno."
+            )
+
+        # Y la tarea sigue libre: un rechazo no deja rastro.
+        fila = fila_de(principal, "T-0901")
+
+        assert fila["trabajador_id"] is None, (
+            "La toma rechazada dejó propietario: " + repr(fila["trabajador_id"])
+        )
+        assert fila["estado"] == str(Estado.NUEVO)
+        assert fila["generacion"] == 0, (
+            "La toma rechazada consumió una generación."
+        )
+        assert not fila["worktree"]
+
+        comprobar_integridad(principal)
+    finally:
+        borrar(ajeno)
+        borrar(principal)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
 # Corredor de este archivo
 # ----------------------------------------------------------------------
 
@@ -442,6 +732,9 @@ COMPROBACIONES = (
     prueba_a_dos_ordenes_validas_no_se_pisan,
     prueba_b_una_orden_no_escribe_columnas_ajenas,
     prueba_c_los_intentos_los_cuenta_el_motor,
+    prueba_d_verificar_ejecuta_en_el_worktree_de_la_tarea,
+    prueba_e_una_ruta_ajena_no_se_ejecuta,
+    prueba_f_el_worktree_se_valida_al_tomar,
 )
 
 
