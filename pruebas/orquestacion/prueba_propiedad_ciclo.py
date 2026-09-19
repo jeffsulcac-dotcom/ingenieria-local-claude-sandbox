@@ -81,6 +81,10 @@ REZAGADAS_POR_OMISION = 60
 # Procesos que arrancan a la vez contra una base nueva (sección 9).
 PROCESOS_BOOTSTRAP = 6
 
+# Emisores concurrentes de órdenes rezagadas y órdenes por emisor.
+EMISORES_POR_OMISION = 6
+ORDENES_POR_EMISOR = 15
+
 # Rondas de la carrera de bootstrap.
 RONDAS_BOOTSTRAP = 3
 
@@ -1394,6 +1398,199 @@ def prueba_o_estres_de_ordenes_rezagadas(rezagadas: int):
 
 
 # ----------------------------------------------------------------------
+# GRUPO 8 — Estrés CONCURRENTE: procesos reales contra la propiedad viva
+# ----------------------------------------------------------------------
+
+def _emisor_rezagado(ruta_raiz: str, tarea: str, credencial: dict,
+                     ordenes: int, barrera) -> dict:
+    """
+    Proceso que dispara órdenes rezagadas contra la tarea, sin descanso.
+
+    Lleva una credencial CONGELADA, la de una ejecución que ya terminó. No
+    relee quién es el dueño: eso es precisamente lo que la convierte en
+    rezagada y no en una suplantación.
+
+    Nunca lanza: devuelve el recuento para que lo juzgue quien coordina.
+    """
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    for sufijo in ("orquestacion", "nucleo"):
+        destino = str(_Path(__file__).resolve().parents[2] / sufijo)
+        if destino not in _sys.path:
+            _sys.path.insert(0, destino)
+
+    from ingenieria_supervisor import estado_global as global_
+
+    raiz = _Path(ruta_raiz)
+
+    recuento = {
+        "emitidas": 0,
+        "aceptadas": 0,
+        "rechazadas": 0,
+        "errores_sqlite": 0,
+        "inesperadas": 0,
+        "detalles": [],
+    }
+
+    try:
+        barrera.wait(timeout=ESPERA_BARRERA_S)
+    except Exception as error:
+        recuento["inesperadas"] += 1
+        recuento["detalles"].append("barrera: " + str(error))
+        return recuento
+
+    for numero in range(ordenes):
+        recuento["emitidas"] += 1
+
+        try:
+            con = global_.abrir(global_.ruta_base(raiz))
+
+            try:
+                with global_.transaccion(con):
+                    informe = global_.actualizar_si_propietario(
+                        con,
+                        tarea,
+                        {
+                            "ultimo_latido": "1999-01-01T00:00:0"
+                            + str(numero % 10) + "+00:00",
+                            "ultima_falla": None,
+                        },
+                        generacion=credencial["generacion"],
+                        momento="1999-01-01T00:00:00+00:00",
+                        trabajador_id=credencial["trabajador_id"],
+                        estados_admitidos=None,
+                    )
+            finally:
+                con.close()
+
+            if informe["resultado"] == global_.ESCRITURA_ACEPTADA:
+                recuento["aceptadas"] += 1
+                recuento["detalles"].append(
+                    "ACEPTADA la orden " + str(numero) + " con generación "
+                    + str(credencial["generacion"])
+                )
+            else:
+                recuento["rechazadas"] += 1
+        except sqlite3.Error as error:
+            recuento["errores_sqlite"] += 1
+            recuento["detalles"].append("sqlite: " + str(error))
+        except Exception as error:
+            recuento["inesperadas"] += 1
+            recuento["detalles"].append(
+                type(error).__name__ + ": " + str(error)
+            )
+
+    return recuento
+
+
+def prueba_p_estres_concurrente(emisores: int, ordenes: int):
+    """
+    Varios procesos disparan órdenes rezagadas mientras la propiedad cambia.
+
+    Lo que se mide no es que el sistema aguante, sino que NINGUNA de esas
+    órdenes entre. Una sola aceptada es un fallo, y se nombra cuál fue.
+    """
+    print(
+        " 16. estrés concurrente: " + str(emisores) + " procesos x "
+        + str(ordenes) + " órdenes rezagadas:",
+        end=" ",
+    )
+
+    contexto = multiprocessing.get_context("spawn")
+    raiz = crear_repositorio("estres_propiedad_")
+
+    try:
+        ficha_minima(raiz, "T-0901")
+
+        # La credencial que llevarán los emisores: una ejecución que ya
+        # habrá terminado cuando disparen.
+        primera = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-viejo")
+        METRICAS["CAMBIOS_DE_PROPIEDAD"] += 1
+
+        credencial = {
+            "trabajador_id": primera.trabajador_id,
+            "generacion": primera.generacion,
+        }
+
+        nucleo.devolver(raiz, "T-0901")
+
+        vigente = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-vigente")
+        METRICAS["CAMBIOS_DE_PROPIEDAD"] += 1
+
+        antes = testigo(raiz, "T-0901")
+
+        with contexto.Manager() as gestor:
+            barrera = gestor.Barrier(emisores)
+            reserva = gestor.Pool(processes=emisores)
+
+            try:
+                pendientes = [
+                    reserva.apply_async(
+                        _emisor_rezagado,
+                        (str(raiz), "T-0901", credencial, ordenes, barrera),
+                    )
+                    for _ in range(emisores)
+                ]
+
+                recuentos = [
+                    pendiente.get(timeout=ESPERA_PROCESO_S)
+                    for pendiente in pendientes
+                ]
+            finally:
+                reserva.close()
+                reserva.join()
+
+        emitidas = sum(uno["emitidas"] for uno in recuentos)
+        aceptadas = sum(uno["aceptadas"] for uno in recuentos)
+        rechazadas = sum(uno["rechazadas"] for uno in recuentos)
+        errores = sum(uno["errores_sqlite"] for uno in recuentos)
+        raras = sum(uno["inesperadas"] for uno in recuentos)
+
+        METRICAS["ORDENES_TOTALES"] += emitidas
+        METRICAS["ORDENES_ACEPTADAS"] += aceptadas
+        METRICAS["ORDENES_RECHAZADAS"] += rechazadas
+        METRICAS["ERRORES_SQLITE"] += errores
+        METRICAS["EXCEPCIONES_INESPERADAS"] += raras
+        METRICAS["ESCRITURAS_INDEBIDAS"] += aceptadas
+
+        detalles = [
+            texto for uno in recuentos for texto in uno["detalles"]
+        ][:5]
+
+        assert aceptadas == 0, (
+            "Entraron " + str(aceptadas) + " órdenes rezagadas de "
+            + str(emitidas) + ". Ejemplos: " + "; ".join(detalles)
+        )
+        assert errores == 0, (
+            "Hubo " + str(errores) + " errores de SQLite bajo concurrencia: "
+            + "; ".join(detalles)
+        )
+        assert raras == 0, (
+            "Hubo " + str(raras) + " excepciones inesperadas: "
+            + "; ".join(detalles)
+        )
+        assert emitidas == emisores * ordenes
+        assert rechazadas == emitidas
+
+        # El dueño vigente sobrevivió al bombardeo, entero.
+        exigir_intacto(raiz, "T-0901", antes, "estrés concurrente")
+
+        final = fila_de(raiz, "T-0901")
+        assert final["trabajador_id"] == "worker-vigente"
+        assert final["generacion"] == vigente.generacion
+
+        comprobar_integridad(raiz)
+
+        print(
+            "OK (" + str(emitidas) + " emitidas, " + str(rechazadas)
+            + " rechazadas, 0 aceptadas)"
+        )
+    finally:
+        borrar(raiz)
+
+
+# ----------------------------------------------------------------------
 # Corredor de este archivo
 # ----------------------------------------------------------------------
 
@@ -1438,7 +1635,11 @@ def imprimir_metricas() -> None:
     print("")
 
 
-def prueba_propiedad_ciclo(rezagadas: int = REZAGADAS_POR_OMISION) -> None:
+def prueba_propiedad_ciclo(
+    rezagadas: int = REZAGADAS_POR_OMISION,
+    emisores: int = EMISORES_POR_OMISION,
+    ordenes: int = ORDENES_POR_EMISOR,
+) -> None:
     print("")
     print("PRUEBA: propiedad efectiva durante el ciclo (A3.2)")
     print("")
@@ -1449,6 +1650,7 @@ def prueba_propiedad_ciclo(rezagadas: int = REZAGADAS_POR_OMISION) -> None:
         comprobacion()
 
     prueba_o_estres_de_ordenes_rezagadas(rezagadas)
+    prueba_p_estres_concurrente(emisores, ordenes)
 
     duracion = time.monotonic() - inicio
 
@@ -1483,9 +1685,24 @@ def principal() -> int:
         help="Órdenes rezagadas de la corrida de estrés.",
     )
 
+    analizador.add_argument(
+        "--emisores",
+        type=int,
+        default=EMISORES_POR_OMISION,
+        help="Procesos que disparan órdenes rezagadas a la vez.",
+    )
+    analizador.add_argument(
+        "--ordenes",
+        type=int,
+        default=ORDENES_POR_EMISOR,
+        help="Órdenes rezagadas que dispara cada emisor.",
+    )
+
     argumentos = analizador.parse_args()
 
-    prueba_propiedad_ciclo(argumentos.rezagadas)
+    prueba_propiedad_ciclo(
+        argumentos.rezagadas, argumentos.emisores, argumentos.ordenes
+    )
 
     return 0
 
