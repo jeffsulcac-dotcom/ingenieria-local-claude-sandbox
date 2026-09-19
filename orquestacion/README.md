@@ -590,12 +590,20 @@ el proceso padre: `prueba_propiedad_ciclo.py` pasa de 355 a 21
 invocaciones de `git rev-parse --git-common-dir`, y `prueba_toma_atomica.py`
 de unas 455 a 23 — una por repositorio temporal, el mínimo posible. No es
 una caché global ni persistente, y antes de devolver lo memorizado
-comprueba dos cosas: que el directorio siga existiendo y que la raíz siga
-perteneciendo al MISMO repositorio, comparando el inodo de su `.git`. Lo
-segundo detecta el caso que lo primero deja pasar —borrar una carpeta y
-volver a `git init` en ella—, que devolvía la base global equivocada. Sin
-mtime a propósito: cambia cada vez que se escribe dentro de `.git`, la
-propia base incluida, y con él la memoria no ahorraba nada.
+comprueba que el `.git` de esa raíz SIGA declarando ese mismo directorio
+común: si es un directorio, el común es él; si es un archivo —un worktree
+enlazado— se lee su `gitdir:`. Es una comprobación estructural, de un stat
+y como mucho la lectura de un archivo de pocos bytes, no una llamada a Git.
+
+Se intentó antes comparando metadatos y las dos variantes fallaron, cada
+una a su manera, y merece quedar escrito: con mtime la memoria se
+invalidaba casi en cada llamada —el mtime de `.git` cambia cada vez que se
+escribe dentro, la propia base incluida— y dejaba de ahorrar nada; con el
+inodo, el sistema de archivos los REUTILIZA, así que al borrar el `.git` de
+un worktree y hacer `git init` en su lugar el directorio nuevo recibía el
+mismo número y la memoria daba por bueno el común del repositorio anterior.
+Eso último está reproducido bajo carga en la comprobación 17, que es la que
+lo encontró.
 
 **Lo que NO cierra A3.2, dicho con precisión.** `persistir` reescribe las
 dieciséis columnas operativas con la foto que `cargar` leyó. Las tres

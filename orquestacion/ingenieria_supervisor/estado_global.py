@@ -233,36 +233,68 @@ class ErrorEstadoGlobal(Exception):
 
 # Directorio común de Git ya resuelto, por raíz. Ver `git_common_dir`.
 #
-# Cada entrada guarda la ruta resuelta Y la identidad del `.git` de esa raíz
-# en el momento de resolverla, para poder detectar que la raíz dejó de
-# pertenecer al mismo repositorio.
+# Cada entrada guarda sólo la ruta resuelta: lo que la valida después es
+# `_comun_declarado`, que vuelve a mirar qué directorio común declara el
+# `.git` de esa raíz.
 _COMUNES_RESUELTOS: dict = {}
 
 
-def _identidad_git(raiz: Path):
+def _comun_declarado(raiz: Path):
     """
-    Identidad del `.git` de una raíz: inodo y dispositivo.
+    Directorio común que la propia carpeta `.git` de la raíz declara.
 
-    Sirve para saber si la ruta sigue siendo el MISMO repositorio y no sólo
-    si sigue existiendo algo ahí. `.git` puede ser un directorio o, en un
-    worktree enlazado, un archivo; `stat` vale para los dos.
+    No lanza ningún proceso: mira el sistema de archivos y, si hace falta,
+    lee un archivo de pocos bytes. Sirve para COMPROBAR lo memorizado, no
+    para sustituir a Git.
 
-    Deliberadamente SIN mtime. Se probó con él y la memoria se invalidaba
-    casi en cada llamada, porque el mtime de `.git` cambia cada vez que se
-    escribe algo dentro —empezando por la propia base SQLite, que vive
-    ahí—: la memorización dejaba de ahorrar nada. El inodo identifica al
-    directorio, no a su contenido, que es justo lo que hace falta.
+    Dos formas, que son las dos que Git usa:
 
-    Devuelve None si no hay `.git` en esa raíz (por ejemplo, si `raiz` es un
-    subdirectorio del repositorio). En ese caso no se memoriza nada: mejor
-    pagar la llamada a Git que arriesgarse a devolver la base equivocada.
+    - `.git` es un directorio  ->  el común es ese mismo directorio.
+    - `.git` es un archivo (worktree enlazado)  ->  contiene
+      `gitdir: <ruta>/.git/worktrees/<nombre>`, y el común es el `.git`
+      del que cuelga ese `worktrees`.
+
+    Devuelve None cuando no puede decidir —no hay `.git`, el archivo no
+    tiene el formato esperado, la ruta no existe—, y entonces no se
+    memoriza nada: mejor pagar la llamada a Git que arriesgarse a devolver
+    la base equivocada.
+
+    Por qué no se comparan inodos, que es lo primero que se intentó: el
+    sistema de archivos los REUTILIZA. Al borrar el `.git` de un worktree y
+    hacer `git init` en su lugar, el directorio nuevo puede recibir el
+    mismo número de inodo que el archivo borrado, y entonces la memoria
+    daba por bueno el directorio común del repositorio anterior. Está
+    reproducido bajo carga en la comprobación 17.
     """
+    enlace = raiz / ".git"
+
     try:
-        datos = (raiz / ".git").stat()
+        if enlace.is_dir():
+            return enlace.resolve()
+
+        if not enlace.is_file():
+            return None
+
+        texto = enlace.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return None
 
-    return (datos.st_ino, datos.st_dev)
+    if not texto.startswith("gitdir:"):
+        return None
+
+    apuntado = Path(texto[len("gitdir:"):].strip())
+
+    if not apuntado.is_absolute():
+        apuntado = (raiz / apuntado)
+
+    # <comun>/worktrees/<nombre>  ->  <comun>
+    if apuntado.parent.name != "worktrees":
+        return None
+
+    try:
+        return apuntado.parent.parent.resolve()
+    except OSError:
+        return None
 
 
 def git_common_dir(raiz: Path) -> Path:
@@ -296,24 +328,18 @@ def git_common_dir(raiz: Path) -> Path:
     """
     raiz = Path(raiz)
     clave = str(raiz.resolve())
-    identidad = _identidad_git(raiz)
+    declarado = _comun_declarado(raiz)
 
     memorizado = _COMUNES_RESUELTOS.get(clave)
 
     if memorizado is not None:
-        comun_memorizado, identidad_memorizada = memorizado
-
-        # Dos condiciones, y las dos hacen falta. `is_dir` detecta que el
-        # repositorio desapareció; la identidad detecta algo más sutil y más
-        # peligroso: que en esa MISMA ruta hay ahora otro repositorio. Pasa
-        # de verdad —borrar una carpeta y volver a `git init` en ella—, y sin
-        # esta comprobación se devolvería la base global equivocada.
-        if (
-            identidad is not None
-            and identidad == identidad_memorizada
-            and comun_memorizado.is_dir()
-        ):
-            return comun_memorizado
+        # Lo memorizado vale si el propio `.git` de la raíz SIGUE
+        # declarando ese mismo directorio común. Es una comprobación
+        # estructural, no de metadatos: detecta que esa ruta pertenece
+        # ahora a otro repositorio aunque el sistema de archivos haya
+        # reutilizado el inodo, que es justo lo que pasaba antes.
+        if declarado is not None and declarado == memorizado:
+            return memorizado
 
         _COMUNES_RESUELTOS.pop(clave, None)
 
@@ -353,10 +379,11 @@ def git_common_dir(raiz: Path) -> Path:
 
     comun = comun.resolve()
 
-    # Sin `.git` en la raíz no hay con qué comprobar después que sigue
-    # siendo el mismo repositorio, así que no se memoriza.
-    if identidad is not None:
-        _COMUNES_RESUELTOS[clave] = (comun, identidad)
+    # Sólo se memoriza lo que después se podrá COMPROBAR sin lanzar Git, y
+    # sólo si Git y el sistema de archivos dicen lo mismo. Si no coinciden,
+    # manda Git: se devuelve su respuesta y no se guarda nada.
+    if declarado is not None and declarado == comun:
+        _COMUNES_RESUELTOS[clave] = comun
 
     return comun
 
