@@ -166,8 +166,18 @@ class Ficha:
     # A3.2 — generación de propiedad con la que se leyó esta ficha.
     #
     # Es el testigo que acompaña a cada orden del ciclo: viaja en el WHERE
-    # de la escritura y la invalida si entretanto hubo una toma nueva. Sólo
-    # la concede `estado_global.reclamar`; ninguna orden la fija a mano.
+    # de la escritura y la invalida si entretanto hubo una toma nueva.
+    #
+    # NO SE SERIALIZA. No aparece en `a_dict` ni se lee en `desde_dict`, y
+    # por tanto nunca llega al JSON versionado. La única forma de poblarla
+    # es `estado_global.aplicar_fila`, es decir, leyéndola de SQLite.
+    #
+    # La razón es que el JSON es un archivo del árbol de trabajo que
+    # cualquiera edita y que Git versiona. Si el testigo viajara ahí, se
+    # podría FIJAR a un valor cualquiera —o hacerlo RETROCEDER— y dos
+    # ejecuciones distintas volverían a ser indistinguibles: exactamente el
+    # problema ABA que esta columna existe para cerrar. Comprobado antes de
+    # cerrarlo: bastaba escribir "generacion": 999 en la ficha.
     generacion: int = 0
 
     ultima_falla: dict | None = None
@@ -178,6 +188,19 @@ class Ficha:
     # Eventos registrados en memoria y todavía no confirmados en SQLite.
     # No forman parte del JSON: `persistir()` los inserta y los vacía.
     eventos_pendientes: list[dict] = field(default_factory=list, repr=False)
+
+    # A3.2 — estado que tenía la fila cuando se leyó esta ficha.
+    #
+    # Igual que `generacion`, no se serializa: sólo lo pone `aplicar_fila`.
+    # Sirve para que la escritura pueda exigir que la tarea SIGA en el
+    # estado sobre el que la orden decidió. Sin eso, una orden lenta que
+    # decidió sobre una foto vieja revierte una transición ya confirmada:
+    # comprobado, una orden humana rezagada resucitaba a PROPUESTO una
+    # tarea que entretanto había quedado BLOQUEADA.
+    #
+    # `None` significa "ficha no leída de la base" (recién construida), y
+    # entonces no se exige ningún estado: es lo que hacía V1.
+    estado_leido: Estado | None = field(default=None, repr=False)
 
     # ------------------------------------------------------------------
     # Decisiones humanas
@@ -232,7 +255,6 @@ class Ficha:
             "pid": self.pid,
             "iniciado_en": self.iniciado_en,
             "ultimo_latido": self.ultimo_latido,
-            "generacion": self.generacion,
             "ultima_falla": self.ultima_falla,
             "ejecuciones": list(self.ejecuciones),
             "historial": list(self.historial),
@@ -279,7 +301,9 @@ class Ficha:
             estado=estado,
             rama=_texto(datos.get("rama"), "rama"),
             worktree=_texto(datos.get("worktree"), "worktree"),
-            generacion=_entero(datos.get("generacion", 0), "generacion"),
+            # `generacion` NO se lee del JSON a propósito: ver el campo.
+            # Un valor inyectado ahí se descarta en silencio, que es lo que
+            # debe pasar con un dato cuya autoridad es sólo SQLite.
             intentos=_entero(datos.get("intentos", 0), "intentos"),
             max_intentos=_entero(
                 datos.get("max_intentos", 3), "max_intentos", minimo=1

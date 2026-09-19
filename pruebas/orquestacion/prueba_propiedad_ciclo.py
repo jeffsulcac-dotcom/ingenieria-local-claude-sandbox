@@ -1456,7 +1456,7 @@ def prueba_n_reanudar_respeta_una_toma_reciente():
 
 def prueba_o_estres_de_ordenes_rezagadas(rezagadas: int):
     print(
-        " 16. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
+        " 19. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
         "dueño vigente:",
         end=" ",
     )
@@ -1517,6 +1517,221 @@ def prueba_o_estres_de_ordenes_rezagadas(rezagadas: int):
         )
         METRICAS["ORDENES_TOTALES"] += 1
         METRICAS["ORDENES_ACEPTADAS"] += 1
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
+# GRUPO 7b — El testigo de propiedad no se puede falsificar
+# ----------------------------------------------------------------------
+
+def prueba_r_la_generacion_no_sale_de_sqlite():
+    """
+    La generación no se puede fijar ni hacer retroceder desde fuera.
+
+    Encontrado por la auditoría adversarial de esta misma etapa, y era un
+    defecto INTRODUCIDO por A3.2: al añadir `generacion` al contrato de la
+    ficha, el testigo pasaba a escribirse en el JSON versionado, que es un
+    archivo del árbol de trabajo que cualquiera edita. Reproducido antes de
+    cerrarlo: escribir "generacion": 999 en la ficha y forzar su
+    reimportación dejaba la fila con esa generación.
+
+    Un testigo que el vigilado puede escribir no vigila nada: con él se
+    podía volver a hacer indistinguibles dos ejecuciones, que es justo el
+    problema ABA que la columna existe para cerrar.
+    """
+    print(" 16. la generación no se puede falsificar desde el JSON:", end=" ")
+
+    raiz = crear_repositorio()
+
+    try:
+        import json
+
+        ficha_minima(raiz, "T-0901")
+        tomada = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+
+        assert tomada.generacion >= 1
+
+        # (a) No viaja al espejo JSON.
+        espejo = json.loads(
+            fichas.ruta_ficha(raiz, "T-0901").read_text(encoding="utf-8")
+        )
+
+        assert "generacion" not in espejo, (
+            "El testigo de propiedad aparece en el JSON versionado, que es "
+            "editable por cualquiera: " + repr(espejo.get("generacion"))
+        )
+
+        # (b) Un valor inyectado en el JSON se descarta al leer la ficha.
+        ruta = fichas.ruta_ficha(raiz, "T-0901")
+        datos = json.loads(ruta.read_text(encoding="utf-8"))
+        datos["generacion"] = 999
+        ruta.write_text(
+            json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        leida = fichas.leer(raiz, "T-0901")
+
+        assert leida.generacion == 0, (
+            "`desde_dict` aceptó una generación del JSON: "
+            + repr(leida.generacion)
+        )
+
+        # (c) Y una fila importada desde ese JSON arranca su contador en 0,
+        #     no en el valor inyectado.
+        ficha_minima(raiz, "T-0902")
+        ruta2 = fichas.ruta_ficha(raiz, "T-0902")
+        datos2 = json.loads(ruta2.read_text(encoding="utf-8"))
+        datos2["generacion"] = 4242
+        ruta2.write_text(
+            json.dumps(datos2, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+        try:
+            with estado_global.transaccion(con):
+                con.execute("DELETE FROM eventos WHERE tarea_id = 'T-0902'")
+                con.execute("DELETE FROM tareas WHERE id = 'T-0902'")
+        finally:
+            con.close()
+
+        nucleo.cargar(raiz, "T-0902")
+
+        assert fila_de(raiz, "T-0902")["generacion"] == 0, (
+            "Una fila importada heredó la generación que decía el JSON."
+        )
+
+        # (d) `actualizar_tarea`, el último UPDATE incondicional que queda,
+        #     tampoco puede tocarla.
+        con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+        try:
+            with estado_global.transaccion(con):
+                estado_global.actualizar_tarea(
+                    con, "T-0901", {"generacion": 500}
+                )
+        except estado_global.ErrorEstadoGlobal:
+            pass
+        else:
+            raise AssertionError(
+                "`actualizar_tarea` fijó la generación con un UPDATE "
+                "incondicional."
+            )
+        finally:
+            con.close()
+
+        assert fila_de(raiz, "T-0901")["generacion"] == tomada.generacion
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+def prueba_s_orden_humana_rezagada_no_revierte_una_transicion():
+    """
+    Una orden humana lenta no deshace una transición ya confirmada.
+
+    También lo encontró la auditoría, y también era real: las transiciones
+    NO mueven la generación, así que dos órdenes separadas por varias de
+    ellas seguían llevando el mismo testigo y el predicado no las
+    distinguía. Reproducido: una orden humana compuesta cuando la tarea
+    estaba EN_EJECUCION la resucitaba a PROPUESTO después de que otra la
+    hubiera dejado BLOQUEADA, saltándose además la máquina de estados,
+    porque `transicionar` validó contra su propia foto vieja.
+
+    Lo cierra la tercera precondición: la escritura exige que la fila siga
+    en el estado que tenía cuando se leyó.
+    """
+    print(" 17. una orden humana rezagada no revierte el ciclo:", end=" ")
+
+    raiz = crear_repositorio()
+
+    try:
+        ficha_minima(raiz, "T-0901")
+        nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+
+        # La foto de la orden humana lenta.
+        vieja = nucleo.cargar(raiz, "T-0901")
+
+        assert vieja.estado == Estado.EN_EJECUCION
+
+        # Entretanto el ciclo avanza dos veces. Ninguna mueve la generación.
+        nucleo.devolver(raiz, "T-0901")
+        nucleo.bloquear(raiz, "T-0901", "Bloqueada mientras el humano decidía.")
+
+        antes = testigo(raiz, "T-0901")
+
+        assert antes["estado"] == str(Estado.BLOQUEADO)
+        assert antes["generacion"] == vieja.generacion, (
+            "El escenario exige que la generación NO haya cambiado; si "
+            "cambiara, la prueba pasaría por el motivo equivocado."
+        )
+
+        nucleo.transicionar(
+            vieja, Estado.PROPUESTO, "Orden humana rezagada.", nucleo.ORIGEN_HUMANO
+        )
+
+        informe = exigir_rechazo(
+            lambda: nucleo.persistir(raiz, vieja),
+            "orden humana rezagada",
+            estado_global.MOTIVO_ESTADO_INCOMPATIBLE,
+        )
+
+        assert informe["estado"] == str(Estado.BLOQUEADO)
+
+        exigir_intacto(raiz, "T-0901", antes, "orden humana rezagada")
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+def prueba_t_el_ambito_congelado_se_informa():
+    """
+    Un ámbito que no se aplicó no puede informarse como "sin cambios".
+
+    Si la sincronización dijera que no había nada que hacer, el usuario
+    creería que su edición entró. La regla 5 del proyecto pide que toda
+    función importante produzca un resultado visible y verificable, y un
+    cambio en espera es justo eso.
+    """
+    print(" 18. el ámbito congelado se informa, no se disimula:", end=" ")
+
+    raiz = crear_repositorio()
+
+    try:
+        ficha_minima(
+            raiz,
+            "T-0901",
+            ambito_archivos=["modulos/comun/uno.py", "modulos/comun/dos.py"],
+        )
+
+        nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+
+        _reescribir_ambito(raiz, "T-0901", ["modulos/comun/uno.py"])
+
+        informe = estado_global.sincronizar_definiciones(raiz)
+
+        congelados = informe.get("ambito_congelado") or []
+
+        assert [uno["id"] for uno in congelados] == ["T-0901"], (
+            "La sincronización no informó del ámbito congelado. Informe: "
+            + repr({k: v for k, v in informe.items() if k != "fecha"})
+        )
+        assert "T-0901" not in informe["sin_cambios"], (
+            "El ámbito congelado se informó como 'sin cambios', que le dice "
+            "al usuario justo lo contrario de lo que pasó."
+        )
+        assert congelados[0]["estado"] == str(Estado.EN_EJECUCION)
+        assert "no se aplica" in congelados[0]["detalle"]
 
         comprobar_integridad(raiz)
     finally:
@@ -1620,7 +1835,7 @@ def prueba_p_estres_concurrente(emisores: int, ordenes: int):
     órdenes entre. Una sola aceptada es un fallo, y se nombra cuál fue.
     """
     print(
-        " 17. estrés concurrente: " + str(emisores) + " procesos x "
+        " 20. estrés concurrente: " + str(emisores) + " procesos x "
         + str(ordenes) + " órdenes rezagadas:",
         end=" ",
     )
@@ -1738,6 +1953,9 @@ COMPROBACIONES = (
     prueba_l2_el_journal_no_se_reconvierte_en_cada_apertura,
     prueba_m_codigo_de_salida_por_propiedad,
     prueba_n_reanudar_respeta_una_toma_reciente,
+    prueba_r_la_generacion_no_sale_de_sqlite,
+    prueba_s_orden_humana_rezagada_no_revierte_una_transicion,
+    prueba_t_el_ambito_congelado_se_informa,
 )
 
 

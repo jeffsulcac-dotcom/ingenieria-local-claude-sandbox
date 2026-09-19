@@ -24,19 +24,26 @@ Reglas duras que este módulo hace cumplir:
    concede un UPDATE condicional resuelto por rowcount. Compitan los trabajadores que
    compitan por la misma tarea, la gana exactamente uno.
 
-   El alcance de esa garantía es la TOMA, no el ciclo de vida entero. Las
-   demás órdenes (`latido`, `devolver`, `verificar` y las humanas) siguen
-   escribiendo con `persistir`, cuyo UPDATE es incondicional: una de ellas
-   que llegue con una lectura vieja puede pisar al ganador de una toma
-   posterior. Corregirlo exige propiedad efectiva del claim, que es A3.2
-   (ver "Limitaciones conocidas de A3.1" en orquestacion/README.md).
+7. Desde A3.2 esa garantía alcanza al CICLO ENTERO. `persistir` escribe
+   con un UPDATE condicionado y una orden sólo entra si sigue siendo suya:
 
-Lo que NO hace este módulo (reservado para A3.2/B): propiedad efectiva del
-claim (que cada orden exija ser el propietario), latidos automáticos,
-expiración de trabajadores, detección automática de trabajadores muertos,
-recuperación automática de tareas abandonadas, cola o planificador de
-tareas, verificación dentro del worktree de la tarea, lanzamiento de
-trabajadores.
+   - la generación de propiedad con la que se leyó la ficha, siempre;
+   - la identidad, en `latido`, `devolver` y `verificar`;
+   - el estado que la fila tenía cuando se leyó, por omisión.
+
+   Las tres hacen falta. La generación sola no basta, porque las
+   transiciones no la mueven y una orden humana lenta revertía un cambio
+   ya confirmado. La identidad sola tampoco, porque no distingue dos
+   ejecuciones del mismo trabajador.
+
+   Un rechazo lanza `ErrorPropiedad` dentro de la transacción: nada se
+   escribe, ni el estado, ni los eventos, ni el espejo JSON.
+
+Lo que NO hace este módulo (reservado para A3.3/C): latidos automáticos,
+expiración temporal de trabajadores, detección automática de trabajadores
+muertos, recuperación automática de tareas abandonadas, cola o
+planificador de tareas, verificación dentro del worktree de la tarea,
+lanzamiento de trabajadores.
 
 Este módulo no realiza cálculos de ingeniería.
 """
@@ -593,10 +600,20 @@ def persistir(
     la exigen: sin ella, una orden emitida después de que su emisor soltara
     la tarea seguiría entrando mientras la generación no hubiera cambiado.
 
-    El estado compatible, cuando `estados_admitidos` lo indica. La
-    comprobación en Python que hacen las órdenes tras `cargar` explica el
-    error con precisión; ésta cierra la ventana entre aquella lectura y
-    esta escritura.
+    El ESTADO. Por omisión se exige que la fila siga en el estado que tenía
+    cuando se leyó (`ficha.estado_leido`). Ésta es la precondición que
+    faltaba, y sin ella la generación no bastaba: `devolver`, `bloquear`,
+    `aprobar` y las demás transiciones NO mueven la generación, así que dos
+    órdenes separadas por varias transiciones seguían teniendo el mismo
+    testigo. Comprobado: una orden humana lenta revertía a PROPUESTO una
+    tarea que entretanto había quedado BLOQUEADA, saltándose además la
+    máquina de estados, porque `transicionar` validó contra su foto vieja.
+
+    La comprobación en Python que hacen las órdenes tras `cargar` explica el
+    error con precisión; ésta cierra la ventana entre aquella lectura y esta
+    escritura. `estados_admitidos` permite ampliarlo o afinarlo; una ficha
+    que no venga de la base (`estado_leido` a None) no exige ninguno, que es
+    lo que hacía V1.
 
     Si la orden se rechaza
     ----------------------
@@ -622,6 +639,9 @@ def persistir(
     fila = global_.fila_desde_ficha(ficha, ficha.actualizado_en)
     campos = {columna: fila[columna] for columna in COLUMNAS_OPERATIVAS}
     eventos = list(ficha.eventos_pendientes)
+
+    if estados_admitidos is None and ficha.estado_leido is not None:
+        estados_admitidos = {ficha.estado_leido}
 
     try:
         with global_.conexion(raiz) as con:
@@ -653,6 +673,11 @@ def persistir(
         raise
 
     ficha.eventos_pendientes.clear()
+
+    # Lo que se acaba de confirmar es, a partir de ahora, lo leído: si la
+    # misma ficha se persiste otra vez, la precondición tiene que ser el
+    # estado nuevo y no el de antes de esta escritura.
+    ficha.estado_leido = ficha.estado
 
     _regenerar_espejo(raiz, ficha)
 
@@ -995,11 +1020,10 @@ def tomar(
     obtiene la toma; los demás reciben `ErrorToma`, que describe quién la
     tiene y en qué estado quedó. Dos tomas nunca se conceden a la vez.
 
-    Lo que esto NO promete: que el propietario resultante sobreviva a lo
-    que hagan después las demás órdenes. `latido`, `devolver` y `verificar`
-    escriben con `persistir`, cuyo UPDATE es incondicional, así que una de
-    ellas con una lectura vieja puede sobrescribir a quien acaba de ganar.
-    Eso lo resuelve la propiedad efectiva del claim, que es A3.2.
+    Desde A3.2 la toma además CONCEDE una generación de propiedad, que es
+    lo que permite que el propietario resultante sobreviva a lo que hagan
+    después las demás órdenes: todas escriben con `persistir`, cuyo UPDATE
+    lleva ahora la precondición en el WHERE.
 
     Aquí se aplica además la regla de un solo escritor: si otra tarea activa
     declara un ámbito que se solapa, la toma se rechaza.

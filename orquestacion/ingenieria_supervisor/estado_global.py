@@ -32,14 +32,23 @@ Desde A3.1 este módulo sí implementa la TOMA ATÓMICA de una tarea
 BEGIN IMMEDIATE, resuelto por `rowcount`, que garantiza un único ganador
 entre trabajadores concurrentes.
 
-Eso cubre la CONCESIÓN de la toma, no su propiedad posterior:
-`actualizar_tarea` sigue siendo un UPDATE incondicional y las demás
-operaciones del ciclo lo usan a través de `supervisor.persistir`. Una de
-ellas que llegue con una lectura vieja puede sobrescribir al ganador.
+Desde A3.2 ese primitivo tiene compañía: `actualizar_si_propietario` hace
+lo mismo para el RESTO del ciclo. Lleva la precondición —generación de
+propiedad, y según el caso identidad y estado— en el WHERE del UPDATE y
+decide por `rowcount`, de modo que una orden compuesta contra una lectura
+vieja ya no puede sobrescribir al propietario vigente. La generación la
+aporta la columna `tareas.generacion`, que sólo incrementa `reclamar` y
+que nunca sale de esta base: no se serializa al JSON, para que no se pueda
+fijar ni hacer retroceder editando un archivo del árbol de trabajo.
 
-Sigue sin implementar: propiedad efectiva del claim, latidos automáticos,
-expiración de trabajadores, detección de trabajadores muertos y
-recuperación automática de tareas abandonadas. Eso queda para A3.2/B.
+`actualizar_tarea` sigue existiendo y sigue siendo incondicional, pero ya
+no la usa ninguna orden del ciclo: `supervisor.persistir` pasa por la
+versión condicionada. Queda para la sincronización de definiciones, y
+tiene vetadas las columnas `id` y `generacion`.
+
+Sigue sin implementar: latidos automáticos, expiración temporal de
+trabajadores, detección de trabajadores muertos y recuperación automática
+de tareas abandonadas. Eso queda para A3.3/B.
 """
 
 from __future__ import annotations
@@ -826,7 +835,15 @@ def fila_desde_ficha(ficha: Ficha, ahora: str | None = None) -> dict:
         "definicion_ruta": ruta_relativa_ficha(ficha.id),
         "definicion_hash": hash_definicion(ficha),
         "definicion_sincronizada_en": ahora,
-        "generacion": int(ficha.generacion or 0),
+        # Cero SIEMPRE, y no `ficha.generacion`. Esta función alimenta a
+        # `insertar_tarea`, o sea al alta de una tarea que la base todavía
+        # no conocía: su contador de propiedad empieza de cero. Copiar aquí
+        # lo que trajera la ficha permitiría que una definición del árbol de
+        # trabajo fijara la generación de una fila nueva.
+        #
+        # `persistir` no se ve afectado: filtra por COLUMNAS_OPERATIVAS, y
+        # `generacion` no está ahí. La única que la mueve es `reclamar`.
+        "generacion": 0,
     }
 
 
@@ -854,6 +871,7 @@ def aplicar_fila(ficha: Ficha, fila: dict) -> Ficha:
     dijera sobre estos campos deja de contar.
     """
     ficha.estado = Estado(fila["estado"])
+    ficha.estado_leido = ficha.estado
     ficha.rama = fila.get("rama")
     ficha.worktree = fila.get("worktree")
     ficha.intentos = int(fila.get("intentos") or 0)
@@ -929,7 +947,11 @@ def actualizar_tarea(con: sqlite3.Connection, identificador: str, campos: dict) 
         return
 
     for columna in campos:
-        if columna not in COLUMNAS_TAREA or columna == "id":
+        # `generacion` queda fuera igual que `id`: era el último escritor
+        # del paquete capaz de fijar el testigo de propiedad a un valor
+        # arbitrario, y encima con un UPDATE sin más predicado que el id.
+        # La única que la mueve es `reclamar`, y sólo sumando uno.
+        if columna not in COLUMNAS_TAREA or columna in ("id", "generacion"):
             raise ErrorEstadoGlobal(
                 "Columna desconocida o no actualizable: '" + str(columna) + "'."
             )
@@ -1687,6 +1709,12 @@ def sincronizar_lista(
         "importadas": [],
         "actualizadas": [],
         "sin_cambios": [],
+        # A3.2: tareas cuyo cambio de ámbito NO se aplicó por estar vivas.
+        # Va en su propia cubeta y no en `sin_cambios` porque no es lo
+        # mismo: en `sin_cambios` no había nada que hacer, aquí sí lo hay y
+        # está esperando. Informarlo como "sin cambios" le diría al usuario
+        # que su edición se aplicó cuando no se aplicó.
+        "ambito_congelado": [],
     }
 
     if solo_importar:
@@ -1710,14 +1738,23 @@ def sincronizar_lista(
         for ficha in pendientes:
             resultado = sincronizar_ficha(con, ficha, ahora)
 
-            if resultado["accion"] == "importada":
+            if resultado["accion"] == ACCION_IMPORTADA:
                 informe["importadas"].append(ficha.id)
-            elif resultado["accion"] == "actualizada":
+            elif resultado["accion"] == ACCION_ACTUALIZADA:
                 informe["actualizadas"].append(ficha.id)
+            elif resultado["accion"] == ACCION_AMBITO_CONGELADO:
+                informe["ambito_congelado"].append(
+                    {
+                        "id": ficha.id,
+                        "estado": resultado["estado"],
+                        "detalle": resultado["detalle"],
+                    }
+                )
             else:
                 informe["sin_cambios"].append(ficha.id)
 
     informe["sin_cambios"].sort()
+    informe["ambito_congelado"].sort(key=lambda uno: uno["id"])
 
     return informe
 

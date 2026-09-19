@@ -437,6 +437,16 @@ def orden_sincronizar_definiciones(raiz: Path, argumentos) -> int:
     _linea("Actualizadas", ", ".join(informe["actualizadas"]) or "ninguna")
     _linea("Sin cambios", ", ".join(informe["sin_cambios"]) or "ninguna")
 
+    # A3.2: no se puede informar como "sin cambios" una edición que está
+    # esperando. El usuario editó el ámbito y tiene que saber que no se
+    # aplicó, por qué, y que se aplicará sola cuando la tarea se cierre.
+    if informe.get("ambito_congelado"):
+        print("")
+        print("  ÁMBITO NO APLICADO (tareas vivas):")
+        for uno in informe["ambito_congelado"]:
+            print("      · " + uno["id"] + " [" + str(uno["estado"]) + "]: "
+                  + uno["detalle"])
+
     if informe["fichas_ilegibles"]:
         print("")
         print("  FICHAS ILEGIBLES:")
@@ -680,6 +690,7 @@ def orden_reanudar(raiz: Path, argumentos) -> int:
         ("huerfanas", "HUÉRFANAS RECUPERADAS"),
         ("inconsistentes", "INCONSISTENTES RECUPERADAS"),
         ("sin_definicion", "SIN DEFINICIÓN EN ESTE ÁRBOL (no modificadas)"),
+        ("reclamadas_mientras_tanto", "RECLAMADAS DURANTE LA RECUPERACIÓN"),
     ):
         if informe[grupo]:
             print("")
