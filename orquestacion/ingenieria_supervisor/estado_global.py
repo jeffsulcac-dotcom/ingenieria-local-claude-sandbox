@@ -1616,6 +1616,28 @@ def ambito_congelado(existente: dict, ficha: Ficha) -> bool:
     return set(ficha.ambito_archivos) != set(existente["ambito_archivos"] or [])
 
 
+def informe_ambito_congelado(existente: dict, ficha: Ficha) -> dict:
+    """
+    El informe de un ámbito que NO se aplica, construido en un solo sitio.
+
+    Lo usan `sincronizar_ficha`, que decide dentro de su transacción, y
+    `asegurar_ficha`, que necesita devolverlo SIN abrir ninguna. Que salga
+    de aquí es lo que garantiza que las dos cuenten lo mismo.
+    """
+    return {
+        "id": ficha.id,
+        "accion": ACCION_AMBITO_CONGELADO,
+        "eventos": 0,
+        "estado": existente["estado"],
+        "ambito_grabado": list(existente["ambito_archivos"] or []),
+        "ambito_declarado": list(ficha.ambito_archivos),
+        "detalle": "La tarea '" + ficha.id + "' está en estado '"
+        + str(existente["estado"]) + "' y retiene su ámbito: no se "
+        "aplica el cambio de ámbito declarado en el JSON. Se "
+        "sincronizará sola cuando la tarea deje de estar viva.",
+    }
+
+
 def sincronizar_ficha(con: sqlite3.Connection, ficha: Ficha, ahora: str | None = None) -> dict:
     """
     Incorpora una ficha nueva o refresca su definición si cambió.
@@ -1659,21 +1681,7 @@ def sincronizar_ficha(con: sqlite3.Connection, ficha: Ficha, ahora: str | None =
         return {"id": ficha.id, "accion": ACCION_SIN_CAMBIOS, "eventos": 0}
 
     if ambito_congelado(existente, ficha):
-        ambito_nuevo = list(ficha.ambito_archivos)
-        ambito_grabado = list(existente["ambito_archivos"] or [])
-
-        return {
-            "id": ficha.id,
-            "accion": ACCION_AMBITO_CONGELADO,
-            "eventos": 0,
-            "estado": existente["estado"],
-            "ambito_grabado": ambito_grabado,
-            "ambito_declarado": ambito_nuevo,
-            "detalle": "La tarea '" + ficha.id + "' está en estado '"
-            + str(existente["estado"]) + "' y retiene su ámbito: no se "
-            "aplica el cambio de ámbito declarado en el JSON. Se "
-            "sincronizará sola cuando la tarea deje de estar viva.",
-        }
+        return informe_ambito_congelado(existente, ficha)
 
     fusionadas = fusionar_decisiones(
         ficha.requiere_decision_humana, existente["decisiones"]
@@ -1744,7 +1752,19 @@ def asegurar_ficha(con: sqlite3.Connection, ficha: Ficha, ahora: str | None = No
     # eso convierte un `ver` en una espera de 5 s que acaba en "database is
     # locked".
     if existente is not None and ambito_congelado(existente, ficha):
-        return sincronizar_ficha(con, ficha, ahora)
+        # Se DEVUELVE el informe, no se delega en `sincronizar_ficha`.
+        #
+        # Delegar era una regresión de esta misma etapa, encontrada por la
+        # ronda focalizada: esa función vuelve a leer la fila y a decidir
+        # por su cuenta, y como aquí no hay candado, si la tarea dejaba de
+        # estar viva entre las dos lecturas acababa ejecutando su UPDATE y
+        # su evento EN AUTOCOMMIT, fuera de toda transacción. Es decir, la
+        # salida que existe para NO escribir podía escribir, y encima sin
+        # protección.
+        #
+        # `sincronizar_ficha` exige transacción en su contrato y aquí no la
+        # hay: lo correcto es no llamarla.
+        return informe_ambito_congelado(existente, ficha)
 
     with transaccion(con):
         return sincronizar_ficha(con, ficha, ahora)

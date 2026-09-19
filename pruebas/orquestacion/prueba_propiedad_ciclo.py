@@ -1456,7 +1456,7 @@ def prueba_n_reanudar_respeta_una_toma_reciente():
 
 def prueba_o_estres_de_ordenes_rezagadas(rezagadas: int):
     print(
-        " 24. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
+        " 25. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
         "dueño vigente:",
         end=" ",
     )
@@ -1846,6 +1846,104 @@ def prueba_w_el_ambito_congelado_no_pide_el_bloqueo_de_escritura():
 # GRUPO 7b — El testigo de propiedad no se puede falsificar
 # ----------------------------------------------------------------------
 
+def prueba_w2_la_salida_rapida_nunca_escribe_fuera_de_transaccion():
+    """
+    La salida que existe para NO escribir no puede acabar escribiendo.
+
+    Regresión encontrada por la ronda focalizada. Al quitar el candado de
+    la ruta de sólo lectura, la salida rápida DELEGABA en
+    `sincronizar_ficha`, que vuelve a leer la fila y a decidir por su
+    cuenta. Como en esa ruta no hay transacción, si la tarea dejaba de
+    estar viva entre las dos lecturas se acababa ejecutando el UPDATE y su
+    evento EN AUTOCOMMIT, fuera de toda protección.
+
+    La carrera se reproduce aquí a propósito y de forma determinista: se
+    intercala una lectura que devuelve la tarea ya cerrada, que es justo
+    lo que vería el segundo vistazo si otro proceso la cerrara en medio.
+    """
+    print(" 21. la salida rápida no escribe fuera de transacción:", end=" ")
+
+    raiz = crear_repositorio()
+
+    try:
+        ficha_minima(
+            raiz,
+            "T-0901",
+            ambito_archivos=["modulos/comun/uno.py", "modulos/comun/dos.py"],
+        )
+        nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+
+        _reescribir_ambito(raiz, "T-0901", ["modulos/comun/uno.py"])
+
+        ficha = fichas.leer(raiz, "T-0901")
+
+        original = estado_global.obtener_tarea
+        vistas = {"n": 0}
+
+        def obtener_con_carrera(con, identificador):
+            fila = original(con, identificador)
+            vistas["n"] += 1
+
+            # `asegurar_ficha` lee dos veces: una en `necesita_sincronizacion`
+            # y otra para su propia comprobación. Las dos ven la tarea viva.
+            # La TERCERA sólo existe si delega en `sincronizar_ficha`, y es
+            # la que ve la tarea ya cerrada: es exactamente la carrera.
+            if vistas["n"] >= 3 and fila is not None:
+                fila = dict(fila)
+                fila["estado"] = str(Estado.BLOQUEADO)
+
+            return fila
+
+        sentencias = []
+        conectar = sqlite3.connect
+
+        def conectar_vigilado(*argumentos, **claves):
+            con_nueva = conectar(*argumentos, **claves)
+            con_nueva.set_trace_callback(
+                lambda sentencia: sentencias.append(str(sentencia))
+            )
+
+            return con_nueva
+
+        estado_global.obtener_tarea = obtener_con_carrera
+        sqlite3.connect = conectar_vigilado
+
+        try:
+            con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+            try:
+                resultado = estado_global.asegurar_ficha(con, ficha)
+            finally:
+                con.close()
+        finally:
+            estado_global.obtener_tarea = original
+            sqlite3.connect = conectar
+
+        assert resultado["accion"] == estado_global.ACCION_AMBITO_CONGELADO, (
+            "La salida rápida no devolvió el informe congelado: "
+            + repr(resultado.get("accion"))
+        )
+
+        escrituras = [
+            una for una in sentencias
+            if una.strip().upper().startswith(("UPDATE", "INSERT", "DELETE"))
+        ]
+
+        assert not escrituras, (
+            "La salida rápida escribió, y además fuera de transacción: "
+            + repr(escrituras[:3])
+        )
+
+        # Y la base quedó como estaba: el ámbito grabado es el de dos.
+        assert len(fila_de(raiz, "T-0901")["ambito_archivos"]) == 2
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
 def prueba_r_la_generacion_no_sale_de_sqlite():
     """
     La generación no se puede fijar ni hacer retroceder desde fuera.
@@ -1861,7 +1959,7 @@ def prueba_r_la_generacion_no_sale_de_sqlite():
     podía volver a hacer indistinguibles dos ejecuciones, que es justo el
     problema ABA que la columna existe para cerrar.
     """
-    print(" 21. la generación no se puede falsificar desde el JSON:", end=" ")
+    print(" 22. la generación no se puede falsificar desde el JSON:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2061,7 +2159,7 @@ def prueba_s_orden_humana_rezagada_no_revierte_una_transicion():
     Lo cierra la tercera precondición: la escritura exige que la fila siga
     en el estado que tenía cuando se leyó.
     """
-    print(" 22. una orden humana rezagada no revierte el ciclo:", end=" ")
+    print(" 23. una orden humana rezagada no revierte el ciclo:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2115,7 +2213,7 @@ def prueba_t_el_ambito_congelado_se_informa():
     función importante produzca un resultado visible y verificable, y un
     cambio en espera es justo eso.
     """
-    print(" 23. el ámbito congelado se informa, no se disimula:", end=" ")
+    print(" 24. el ámbito congelado se informa, no se disimula:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2247,7 +2345,7 @@ def prueba_p_estres_concurrente(emisores: int, ordenes: int):
     órdenes entre. Una sola aceptada es un fallo, y se nombra cuál fue.
     """
     print(
-        " 25. estrés concurrente: " + str(emisores) + " procesos x "
+        " 26. estrés concurrente: " + str(emisores) + " procesos x "
         + str(ordenes) + " órdenes rezagadas:",
         end=" ",
     )
@@ -2370,6 +2468,7 @@ COMPROBACIONES = (
     prueba_u2_el_ambito_vigente_no_miente_al_trabajador,
     prueba_v_reordenar_el_ambito_no_congela_nada,
     prueba_w_el_ambito_congelado_no_pide_el_bloqueo_de_escritura,
+    prueba_w2_la_salida_rapida_nunca_escribe_fuera_de_transaccion,
     prueba_r_la_generacion_no_sale_de_sqlite,
     prueba_s_orden_humana_rezagada_no_revierte_una_transicion,
     prueba_t_el_ambito_congelado_se_informa,
