@@ -86,3 +86,23 @@ PRUEBA_NUCLEO=OK
 
 Estado:
 NÚCLEO_BASE = APROBADO
+
+## Interfaz local
+
+Primera interfaz visual implementada y verificada en navegador.
+
+Características actuales:
+- interfaz 100 % en español
+- funcionamiento local
+- navegación por disciplinas
+- acceso a cálculo rápido
+- acceso a proyectos
+- espacio de trabajo preparado para modelo tipo cuaderno técnico
+
+Prueba:
+- GET / = 200
+- GET /salud = 200
+- CSS local = OK
+
+Estado:
+INTERFAZ_BASE = APROBADA

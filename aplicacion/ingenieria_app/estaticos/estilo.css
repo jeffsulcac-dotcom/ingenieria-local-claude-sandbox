@@ -1,0 +1,313 @@
+:root {
+    --fondo: #101112;
+    --panel: #151719;
+    --panel-secundario: #1b1d20;
+    --borde: #292c30;
+    --texto: #f4f4f4;
+    --texto-secundario: #969ba1;
+    --acento: #ffffff;
+    --correcto: #79c88a;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    font-family:
+        Inter,
+        "Segoe UI",
+        Arial,
+        sans-serif;
+
+    background: var(--fondo);
+    color: var(--texto);
+}
+
+
+.barra-superior {
+    height: 58px;
+
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    padding: 0 24px;
+
+    border-bottom: 1px solid var(--borde);
+    background: var(--panel);
+}
+
+
+.marca {
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+}
+
+
+.version {
+    margin-left: 14px;
+    font-size: 12px;
+    color: var(--texto-secundario);
+}
+
+
+.estado-local {
+    font-size: 12px;
+    color: var(--texto-secundario);
+
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+
+.punto {
+    width: 7px;
+    height: 7px;
+
+    border-radius: 50%;
+    background: var(--correcto);
+}
+
+
+.estructura {
+    min-height: calc(100vh - 94px);
+
+    display: grid;
+    grid-template-columns: 210px 1fr;
+}
+
+
+.lateral {
+    border-right: 1px solid var(--borde);
+    background: var(--panel);
+
+    padding: 20px 12px;
+}
+
+
+.grupo {
+    margin-bottom: 24px;
+}
+
+
+.titulo-grupo {
+    margin: 24px 10px 8px;
+
+    color: #61666c;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .12em;
+}
+
+
+.opcion {
+    padding: 9px 12px;
+    margin: 2px 0;
+
+    border-radius: 6px;
+
+    color: var(--texto-secundario);
+    font-size: 13px;
+
+    cursor: default;
+}
+
+
+.opcion.activa {
+    color: var(--texto);
+    background: var(--panel-secundario);
+}
+
+
+.contenido {
+    max-width: 1160px;
+    width: 100%;
+
+    margin: 0 auto;
+    padding: 56px 46px 100px;
+}
+
+
+.bienvenida {
+    margin-bottom: 36px;
+}
+
+
+.subtitulo {
+    color: #6f747a;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .14em;
+}
+
+
+h1 {
+    font-size: 34px;
+    font-weight: 600;
+    margin: 8px 0 10px;
+}
+
+
+.bienvenida p {
+    margin: 0;
+    color: var(--texto-secundario);
+}
+
+
+.acciones {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+
+    gap: 14px;
+
+    margin-bottom: 48px;
+}
+
+
+.tarjeta {
+    min-height: 155px;
+
+    padding: 20px;
+
+    border: 1px solid var(--borde);
+    border-radius: 10px;
+
+    background: var(--panel);
+
+    display: flex;
+    gap: 16px;
+
+    transition:
+        border-color .15s,
+        background .15s;
+}
+
+
+.tarjeta:hover {
+    border-color: #555a60;
+    background: #191b1e;
+}
+
+
+.tarjeta.destacada {
+    border-color: #44484d;
+}
+
+
+.icono {
+    font-size: 20px;
+    line-height: 1;
+}
+
+
+.tarjeta h2 {
+    margin: 0 0 10px;
+
+    font-size: 15px;
+    font-weight: 600;
+}
+
+
+.tarjeta p {
+    margin: 0;
+
+    color: var(--texto-secundario);
+    font-size: 13px;
+    line-height: 1.55;
+}
+
+
+.espacio {
+    border-top: 1px solid var(--borde);
+    padding-top: 28px;
+}
+
+
+.encabezado-espacio {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+
+.encabezado-espacio h3 {
+    margin: 7px 0 0;
+    font-size: 15px;
+    font-weight: 500;
+}
+
+
+button {
+    padding: 8px 13px;
+
+    border: 1px solid var(--borde);
+    border-radius: 6px;
+
+    background: var(--panel);
+    color: #666;
+
+    font-size: 12px;
+}
+
+
+.vacio {
+    margin-top: 22px;
+    min-height: 160px;
+
+    display: flex;
+    align-items: center;
+    justify-content: center;
+
+    text-align: center;
+
+    border: 1px dashed #292c30;
+    border-radius: 8px;
+
+    color: #676c72;
+    font-size: 13px;
+    line-height: 1.6;
+
+    padding: 40px;
+}
+
+
+footer {
+    height: 36px;
+
+    padding: 0 18px;
+
+    display: flex;
+    align-items: center;
+    gap: 9px;
+
+    border-top: 1px solid var(--borde);
+
+    background: var(--panel);
+
+    color: #74797f;
+    font-size: 11px;
+}
+
+
+@media (max-width: 850px) {
+
+    .estructura {
+        grid-template-columns: 1fr;
+    }
+
+    .lateral {
+        display: none;
+    }
+
+    .acciones {
+        grid-template-columns: 1fr;
+    }
+
+    .contenido {
+        padding: 32px 20px 80px;
+    }
+}
