@@ -163,6 +163,13 @@ class Ficha:
     iniciado_en: str | None = None
     ultimo_latido: str | None = None
 
+    # A3.2 — generación de propiedad con la que se leyó esta ficha.
+    #
+    # Es el testigo que acompaña a cada orden del ciclo: viaja en el WHERE
+    # de la escritura y la invalida si entretanto hubo una toma nueva. Sólo
+    # la concede `estado_global.reclamar`; ninguna orden la fija a mano.
+    generacion: int = 0
+
     ultima_falla: dict | None = None
 
     ejecuciones: list[dict] = field(default_factory=list)
@@ -225,6 +232,7 @@ class Ficha:
             "pid": self.pid,
             "iniciado_en": self.iniciado_en,
             "ultimo_latido": self.ultimo_latido,
+            "generacion": self.generacion,
             "ultima_falla": self.ultima_falla,
             "ejecuciones": list(self.ejecuciones),
             "historial": list(self.historial),
@@ -271,6 +279,7 @@ class Ficha:
             estado=estado,
             rama=_texto(datos.get("rama"), "rama"),
             worktree=_texto(datos.get("worktree"), "worktree"),
+            generacion=_entero(datos.get("generacion", 0), "generacion"),
             intentos=_entero(datos.get("intentos", 0), "intentos"),
             max_intentos=_entero(
                 datos.get("max_intentos", 3), "max_intentos", minimo=1

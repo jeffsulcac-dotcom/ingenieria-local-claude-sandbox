@@ -48,6 +48,7 @@ import hashlib
 import json
 import sqlite3
 import subprocess
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -63,10 +64,15 @@ from .tarea import (
 
 NOMBRE_BASE = "ingenieria-supervisor.sqlite3"
 
-VERSION_ESQUEMA = 1
+VERSION_ESQUEMA = 2
 
 # Milisegundos que una conexión espera si otra tiene la base ocupada.
 BUSY_TIMEOUT_MS = 5000
+
+# Reintentos para la conversión inicial a WAL, que el busy_timeout no cubre.
+INTENTOS_JOURNAL = 12
+ESPERA_JOURNAL_S = 0.02
+ESPERA_JOURNAL_MAXIMA_S = 0.25
 
 # WAL: lecturas que no bloquean escrituras, adecuado para uso local.
 # synchronous=FULL: un corte de energía no pierde transacciones confirmadas.
@@ -84,6 +90,29 @@ EVENTO_RECUPERACION = "recuperacion"
 
 ORIGEN_AUTOMATICO = "automático"
 
+# Estados en los que una tarea RETIENE su ámbito de archivos.
+#
+# No basta con EN_EJECUCION: una tarea que quedó en requiere_revision o en
+# propuesto conserva cambios sin confirmar en el árbol de trabajo, así que
+# sigue siendo la dueña de esos archivos hasta que un humano la cierre.
+#
+# Vive aquí, y no en `supervisor`, porque la guarda que impide cambiarle el
+# ámbito a una tarea viva está en `sincronizar_ficha`, que es de este
+# módulo. `supervisor` la reexporta para no romper a quien ya la importaba.
+ESTADOS_QUE_RETIENEN_AMBITO = frozenset(
+    {
+        str(Estado.EN_EJECUCION),
+        str(Estado.REQUIERE_REVISION),
+        str(Estado.PROPUESTO),
+    }
+)
+
+# Acciones que puede devolver la sincronización de una definición.
+ACCION_SIN_CAMBIOS = "sin_cambios"
+ACCION_ACTUALIZADA = "actualizada"
+ACCION_IMPORTADA = "importada"
+ACCION_AMBITO_CONGELADO = "ambito_congelado"
+
 # Resultados posibles de un intento de toma atómica (A3.1).
 CLAIM_OTORGADO = "otorgado"
 CLAIM_RECHAZADO = "rechazado"
@@ -92,6 +121,16 @@ CLAIM_RECHAZADO = "rechazado"
 MOTIVO_INEXISTENTE = "inexistente"
 MOTIVO_YA_RECLAMADA = "ya_reclamada"
 MOTIVO_ESTADO_NO_RECLAMABLE = "estado_no_reclamable"
+
+# Resultado de una escritura condicionada por propiedad (A3.2).
+ESCRITURA_ACEPTADA = "aceptada"
+ESCRITURA_RECHAZADA = "rechazada"
+
+# Motivos por los que se rechaza una orden del ciclo.
+MOTIVO_SIN_PROPIETARIO = "sin_propietario"
+MOTIVO_OTRO_PROPIETARIO = "otro_propietario"
+MOTIVO_GENERACION_VENCIDA = "generacion_vencida"
+MOTIVO_ESTADO_INCOMPATIBLE = "estado_incompatible"
 
 # Migraciones versionadas. Cada versión es una lista de sentencias que se
 # aplican dentro de una única transacción. Nunca se edita una versión ya
@@ -147,6 +186,23 @@ MIGRACIONES = {
         CREATE INDEX eventos_por_fecha
             ON eventos (fecha, id)
         """,
+    ],
+    2: [
+        # A3.2 — identificador de propiedad vigente.
+        #
+        # `generacion` distingue una ejecución de otra sobre la MISMA tarea.
+        # Sólo `reclamar` la incrementa, y lo hace dentro del mismo UPDATE
+        # condicional que concede la toma. Las órdenes posteriores viajan con
+        # la generación que leyeron: si entretanto hubo una toma nueva, su
+        # predicado ya no casa y la escritura se rechaza sin tocar nada.
+        #
+        # Un entero es suficiente y es lo más simple que funciona: no
+        # depende del reloj (dos tomas en el mismo segundo se distinguen),
+        # no depende del PID (el sistema los reutiliza) y no necesita
+        # criptografía para una sola PC.
+        #
+        # 0 = fila heredada de A2/A3.1 que nunca fue reclamada bajo A3.2.
+        "ALTER TABLE tareas ADD COLUMN generacion INTEGER NOT NULL DEFAULT 0",
     ],
 }
 
@@ -227,6 +283,73 @@ def ubicacion_resumida(ruta: Path) -> str:
 # Conexión, pragmas, transacciones
 # ----------------------------------------------------------------------
 
+def _activar_journal(con: sqlite3.Connection, ruta: Path) -> str:
+    """
+    Deja la base en `JOURNAL_MODE`, tolerando el arranque concurrente.
+
+    La conversión inicial delete -> wal necesita un bloqueo exclusivo
+    momentáneo, y para ESE cambio SQLite no llama al manejador de ocupado:
+    el `busy_timeout` no lo cubre y la orden falla en el acto con
+    "database is locked". Con varios procesos arrancando a la vez sobre una
+    base nueva, los perdedores morían ahí, antes incluso de llegar al
+    esquema.
+
+    Dos medidas, las dos mínimas:
+
+    1. No se pide el cambio si la base YA está en el modo deseado. Ése es el
+       caso normal a partir del segundo arranque, y así deja de haber
+       conversión que pueda chocar.
+
+    2. Si hay que convertir y otro proceso está haciéndolo, se reintenta un
+       número acotado de veces. Entre intento e intento se vuelve a LEER el
+       modo: lo más probable es que el otro ya terminara, y entonces no hay
+       nada que hacer.
+
+    El modo se devuelve para que quien llama compruebe el resultado real.
+    """
+    modo = con.execute("PRAGMA journal_mode").fetchone()[0]
+
+    if str(modo).lower() == JOURNAL_MODE:
+        return str(modo)
+
+    espera = ESPERA_JOURNAL_S
+    ultimo = None
+
+    for intento in range(INTENTOS_JOURNAL):
+        try:
+            modo = con.execute(
+                "PRAGMA journal_mode = " + JOURNAL_MODE
+            ).fetchone()[0]
+
+            if str(modo).lower() == JOURNAL_MODE:
+                return str(modo)
+
+            ultimo = "quedó en '" + str(modo) + "'"
+        except sqlite3.OperationalError as error:
+            # Sólo se reintenta el choque de la conversión. Cualquier otro
+            # error operativo es real y debe salir sin disfrazarse.
+            if "locked" not in str(error).lower() and "busy" not in str(error).lower():
+                raise
+
+            ultimo = str(error)
+
+        if intento + 1 < INTENTOS_JOURNAL:
+            time.sleep(espera)
+            espera = min(espera * 2, ESPERA_JOURNAL_MAXIMA_S)
+
+            # Puede que el otro proceso ya lo dejara listo.
+            modo = con.execute("PRAGMA journal_mode").fetchone()[0]
+
+            if str(modo).lower() == JOURNAL_MODE:
+                return str(modo)
+
+    raise ErrorEstadoGlobal(
+        "No se pudo poner la base '" + str(ruta) + "' en journal_mode="
+        + JOURNAL_MODE + " tras " + str(INTENTOS_JOURNAL)
+        + " intentos (" + str(ultimo) + "). ¿Hay otro proceso bloqueándola?"
+    )
+
+
 def abrir(ruta: Path, solo_lectura: bool = False) -> sqlite3.Connection:
     """
     Abre una conexión con los pragmas del Supervisor ya aplicados.
@@ -264,9 +387,7 @@ def abrir(ruta: Path, solo_lectura: bool = False) -> sqlite3.Connection:
         con.execute("PRAGMA busy_timeout = " + str(BUSY_TIMEOUT_MS))
 
         if not solo_lectura:
-            modo = con.execute(
-                "PRAGMA journal_mode = " + JOURNAL_MODE
-            ).fetchone()[0]
+            modo = _activar_journal(con, ruta)
 
             if str(modo).lower() != JOURNAL_MODE:
                 raise ErrorEstadoGlobal(
@@ -424,6 +545,21 @@ def inicializar(con: sqlite3.Connection) -> dict:
 
         try:
             with transaccion(con):
+                # La versión se RELEE aquí dentro, con el bloqueo de
+                # escritura ya tomado por BEGIN IMMEDIATE.
+                #
+                # La lectura de arriba se hizo en autocommit: entre aquella
+                # lectura y este punto, otro proceso pudo aplicar esta misma
+                # migración entera. Sin esta comprobación, el perdedor de esa
+                # carrera ejecutaba "CREATE TABLE tareas" sobre una base que
+                # ya la tenía y moría con "table tareas already exists".
+                #
+                # Añadir IF NOT EXISTS a los CREATE no bastaba: el error se
+                # desplazaba al INSERT de la versión, que choca contra la
+                # clave primaria de `esquema`.
+                if version_esquema(con) >= version:
+                    continue
+
                 for sentencia in sentencias:
                     con.execute(sentencia)
 
@@ -629,6 +765,7 @@ def fila_desde_ficha(ficha: Ficha, ahora: str | None = None) -> dict:
         "definicion_ruta": ruta_relativa_ficha(ficha.id),
         "definicion_hash": hash_definicion(ficha),
         "definicion_sincronizada_en": ahora,
+        "generacion": int(ficha.generacion or 0),
     }
 
 
@@ -668,6 +805,7 @@ def aplicar_fila(ficha: Ficha, fila: dict) -> Ficha:
     ficha.creado_en = fila.get("creado_en") or ficha.creado_en
     ficha.ultima_falla = fila.get("ultima_falla")
     ficha.commit_inicial = fila.get("commit_inicial")
+    ficha.generacion = int(fila.get("generacion") or 0)
     ficha.ejecuciones = list(fila.get("ejecuciones") or [])
 
     ficha.requiere_decision_humana = fusionar_decisiones(
@@ -688,7 +826,7 @@ COLUMNAS_TAREA = (
     "actualizado_en", "ultima_falla", "requiere_decision_humana",
     "decisiones", "ejecuciones", "ultima_verificacion", "commit_inicial",
     "ambito_archivos", "definicion_ruta", "definicion_hash",
-    "definicion_sincronizada_en",
+    "definicion_sincronizada_en", "generacion",
 )
 
 
@@ -833,13 +971,21 @@ def reclamar(
     }
 
     for columna, valor in (campos_extra or {}).items():
-        if columna not in COLUMNAS_TAREA or columna in ("id", "estado", "trabajador_id"):
+        if columna not in COLUMNAS_TAREA or columna in (
+            "id", "estado", "trabajador_id", "generacion",
+        ):
             raise ErrorEstadoGlobal(
                 "Columna que la toma no puede fijar: '" + str(columna) + "'."
             )
         campos[columna] = valor
 
+    # `generacion = generacion + 1` se calcula dentro del motor, sobre el
+    # valor REAL de la fila en el instante de escribir. Si se leyera antes y
+    # se escribiera el número ya resuelto, dos tomas separadas por un mismo
+    # valor leído podrían repetir generación: volvería el problema ABA que
+    # esta columna existe para cerrar.
     asignaciones = ", ".join(columna + " = ?" for columna in campos)
+    asignaciones += ", generacion = generacion + 1"
     marcas = ", ".join("?" for _ in estados)
 
     cursor = con.execute(
@@ -855,6 +1001,10 @@ def reclamar(
     # PRIMARY KEY. La unicidad la garantiza el esquema, no una comprobación
     # en tiempo de ejecución que nadie podría llegar a ejercitar.
     if cursor.rowcount == 1:
+        # La generación se relee DENTRO de la misma transacción: es el valor
+        # que el COMMIT confirmará, no una predicción hecha en Python.
+        concedida = obtener_tarea(con, identificador)
+
         return {
             "resultado": CLAIM_OTORGADO,
             "tarea": identificador,
@@ -863,8 +1013,10 @@ def reclamar(
             "propietario": trabajador_id,
             "propia": True,
             "pid": pid,
+            "generacion": int(concedida["generacion"]),
             "momento": momento,
-            "detalle": "Toma concedida a '" + trabajador_id + "'.",
+            "detalle": "Toma concedida a '" + trabajador_id + "' (generación "
+            + str(concedida["generacion"]) + ").",
         }
 
     # rowcount = 0: la fila no existe o ya no estaba en un estado reclamable.
@@ -912,6 +1064,7 @@ def rechazo(
             "propietario": None,
             "propia": False,
             "pid": None,
+            "generacion": None,
             "momento": momento,
             "detalle": "La tarea '" + str(identificador) + "' no existe en el "
             "estado global.",
@@ -951,9 +1104,222 @@ def rechazo(
         "propietario": propietario,
         "propia": propia,
         "pid": fila.get("pid"),
+        "generacion": fila.get("generacion"),
         "momento": momento,
         "detalle": detalle,
     }
+
+
+# ----------------------------------------------------------------------
+# Propiedad efectiva durante el ciclo (A3.2)
+# ----------------------------------------------------------------------
+
+def actualizar_si_propietario(
+    con: sqlite3.Connection,
+    identificador: str,
+    campos: dict,
+    generacion: int,
+    momento: str,
+    trabajador_id: str | None = None,
+    estados_admitidos=None,
+) -> dict:
+    """
+    Escritura CONDICIONADA a que quien ordena siga siendo el dueño vigente.
+
+    DEBE ejecutarse dentro de `transaccion(con)` (BEGIN IMMEDIATE).
+
+    Por qué una orden rezagada no puede colarse
+    -------------------------------------------
+    1. La precondición viaja en el WHERE del UPDATE, no en una lectura
+       previa. El motor la comprueba contra la fila REAL en el instante de
+       escribir: no queda ninguna ventana entre comprobar y escribir.
+
+    2. `generacion` cambia en cada toma concedida. Una orden emitida por la
+       ejecución anterior lleva la generación que leyó y ya no casa con la
+       de la fila, aunque el `trabajador_id` sea idéntico. Eso es lo que
+       distingue "trabajador A, ejecución vieja" de "trabajador A, ejecución
+       nueva": el nombre del trabajador solo nunca bastaría.
+
+    3. La decisión se toma con `rowcount`, no deduciéndola de una lectura
+       anterior hecha en Python.
+
+    Un rechazo NO es una excepción aquí: se devuelve descrito, igual que en
+    `reclamar`. Y no escribe nada: ni estado, ni intentos, ni marcas de
+    tiempo. Quien llama decide si lo convierte en error.
+    """
+    if not campos:
+        raise ErrorEstadoGlobal(
+            "Una escritura condicionada necesita al menos una columna."
+        )
+
+    for columna in campos:
+        if columna not in COLUMNAS_TAREA or columna in ("id", "generacion"):
+            raise ErrorEstadoGlobal(
+                "Columna desconocida o no actualizable por una orden del "
+                "ciclo: '" + str(columna) + "'."
+            )
+
+    if isinstance(generacion, bool) or not isinstance(generacion, int):
+        raise ErrorEstadoGlobal(
+            "La generación de propiedad debe ser un entero; se recibió: "
+            + repr(generacion)
+            + "."
+        )
+
+    condiciones = ["id = ?", "generacion = ?"]
+    parametros = list(campos.values()) + [identificador, generacion]
+
+    if trabajador_id is not None:
+        if not isinstance(trabajador_id, str) or not trabajador_id.strip():
+            raise ErrorEstadoGlobal(
+                "La identidad del propietario, si se exige, no puede estar "
+                "vacía."
+            )
+
+        trabajador_id = trabajador_id.strip()
+        condiciones.append("trabajador_id = ?")
+        parametros.append(trabajador_id)
+
+    estados = None
+
+    if estados_admitidos is not None:
+        estados = tuple(sorted({str(estado) for estado in estados_admitidos}))
+
+        if not estados:
+            raise ErrorEstadoGlobal(
+                "Si se exige un estado compatible, hay que indicar al menos "
+                "uno."
+            )
+
+        condiciones.append(
+            "estado IN (" + ", ".join("?" for _ in estados) + ")"
+        )
+        parametros.extend(estados)
+
+    asignaciones = ", ".join(columna + " = ?" for columna in campos)
+
+    cursor = con.execute(
+        "UPDATE tareas SET " + asignaciones + " WHERE " + " AND ".join(condiciones),
+        tuple(parametros),
+    )
+
+    if cursor.rowcount == 1:
+        return {
+            "resultado": ESCRITURA_ACEPTADA,
+            "tarea": identificador,
+            "motivo": None,
+            "propietario": trabajador_id,
+            "generacion": generacion,
+            "generacion_vigente": generacion,
+            "estado": None,
+            "momento": momento,
+            "detalle": "Escritura aceptada: la propiedad sigue vigente.",
+        }
+
+    # rowcount = 0: la fila no existe, cambió de dueño, cambió de generación
+    # o su estado ya no admite esta orden. El motivo se lee DENTRO de la
+    # misma transacción, así que describe la fila que rechazó esta orden.
+    return rechazo_propiedad(
+        obtener_tarea(con, identificador),
+        identificador,
+        trabajador_id,
+        generacion,
+        momento,
+        estados,
+    )
+
+
+def rechazo_propiedad(
+    fila: dict | None,
+    identificador: str,
+    trabajador_id: str | None,
+    generacion: int,
+    momento: str,
+    estados_admitidos=None,
+) -> dict:
+    """
+    Describe por qué se rechaza una orden del ciclo, con un formato único.
+
+    Distinguir el motivo importa: "otro propietario" y "generación vencida"
+    son fallos distintos. El segundo es el caso del MISMO trabajador que
+    vuelve a tomar la tarea, y es justo el que un control por identidad
+    dejaría pasar.
+    """
+    base = {
+        "resultado": ESCRITURA_RECHAZADA,
+        "tarea": identificador,
+        "propietario": trabajador_id,
+        "generacion": generacion,
+        "momento": momento,
+    }
+
+    if fila is None:
+        base.update(
+            {
+                "motivo": MOTIVO_INEXISTENTE,
+                "generacion_vigente": None,
+                "estado": None,
+                "propietario_vigente": None,
+                "detalle": "La tarea '" + str(identificador) + "' no existe "
+                "en el estado global.",
+            }
+        )
+
+        return base
+
+    vigente = int(fila.get("generacion") or 0)
+    dueno = fila.get("trabajador_id")
+
+    base.update(
+        {
+            "generacion_vigente": vigente,
+            "estado": fila["estado"],
+            "propietario_vigente": dueno,
+        }
+    )
+
+    if vigente != generacion:
+        base.update(
+            {
+                "motivo": MOTIVO_GENERACION_VENCIDA,
+                "detalle": "Orden rezagada sobre '" + str(identificador)
+                + "': se emitió para la generación " + str(generacion)
+                + " y la vigente es la " + str(vigente)
+                + " (propietario actual: " + str(dueno or "ninguno")
+                + "). No se modificó nada.",
+            }
+        )
+
+        return base
+
+    if trabajador_id is not None and dueno != trabajador_id:
+        base.update(
+            {
+                "motivo": MOTIVO_SIN_PROPIETARIO if not dueno
+                else MOTIVO_OTRO_PROPIETARIO,
+                "detalle": "La tarea '" + str(identificador) + "' ya no "
+                "pertenece a '" + str(trabajador_id) + "': su propietario "
+                "vigente es " + (("'" + str(dueno) + "'") if dueno else "ninguno")
+                + ". No se modificó nada.",
+            }
+        )
+
+        return base
+
+    base.update(
+        {
+            "motivo": MOTIVO_ESTADO_INCOMPATIBLE,
+            "detalle": "La tarea '" + str(identificador) + "' está en estado '"
+            + str(fila["estado"]) + "', que no admite esta orden"
+            + (
+                ". La admiten: " + ", ".join(estados_admitidos) + "."
+                if estados_admitidos
+                else "."
+            ),
+        }
+    )
+
+    return base
 
 
 def insertar_evento(con: sqlite3.Connection, tarea_id: str, evento: dict) -> int:
@@ -1110,16 +1476,38 @@ def importar_ficha(
         },
     )
 
-    return {"id": ficha.id, "accion": "importada", "eventos": importados + 1}
+    return {"id": ficha.id, "accion": ACCION_IMPORTADA, "eventos": importados + 1}
 
 
 def sincronizar_ficha(con: sqlite3.Connection, ficha: Ficha, ahora: str | None = None) -> dict:
     """
     Incorpora una ficha nueva o refresca su definición si cambió.
 
-    NUNCA toca el estado operativo de una tarea ya existente: sólo el título
-    y la huella de definición, e incorpora como pendientes las decisiones
-    humanas recién declaradas. Debe llamarse dentro de una transacción.
+    Nunca toca estado, intentos ni propietario. Sí reescribe el título, las
+    decisiones declaradas, la huella y —con la salvedad de abajo— el ámbito
+    de archivos. Debe llamarse dentro de una transacción.
+
+    Ámbito congelado mientras la tarea está viva (A3.2)
+    ---------------------------------------------------
+    La regla de un solo escritor se comprueba en `tomar` contra el ámbito
+    GRABADO. Si esta función lo reescribiera desde el JSON del árbol, una
+    tarea ya tomada podría quedar registrada con un ámbito más estrecho, la
+    siguiente toma no vería el solapamiento y dos trabajadores acabarían
+    escribiendo los mismos archivos.
+
+    No hacía falta ninguna orden peligrosa para provocarlo: `cargar` llama
+    aquí, y `cargar` encabeza casi todas las órdenes, incluidas las de sólo
+    lectura y las tomas que terminan rechazadas.
+
+    La política es la mínima que cierra el agujero: mientras el estado de la
+    tarea retenga su ámbito, un cambio de ámbito NO se aplica y la
+    sincronización entera se deja para después. La huella NO se avanza, así
+    que el refresco no se pierde: vuelve a intentarse solo en cuanto la
+    tarea deje de estar viva.
+
+    Un cambio declarativo inocuo —el título, una descripción de decisión—
+    sigue sincronizándose con normalidad: sólo se frena cuando lo que
+    cambia es el ámbito, que es lo único de lo que depende la garantía.
     """
     ahora = ahora or ahora_utc()
 
@@ -1131,7 +1519,27 @@ def sincronizar_ficha(con: sqlite3.Connection, ficha: Ficha, ahora: str | None =
     huella = hash_definicion(ficha)
 
     if existente["definicion_hash"] == huella:
-        return {"id": ficha.id, "accion": "sin_cambios", "eventos": 0}
+        return {"id": ficha.id, "accion": ACCION_SIN_CAMBIOS, "eventos": 0}
+
+    ambito_nuevo = list(ficha.ambito_archivos)
+    ambito_grabado = list(existente["ambito_archivos"] or [])
+
+    if (
+        ambito_nuevo != ambito_grabado
+        and str(existente["estado"]) in ESTADOS_QUE_RETIENEN_AMBITO
+    ):
+        return {
+            "id": ficha.id,
+            "accion": ACCION_AMBITO_CONGELADO,
+            "eventos": 0,
+            "estado": existente["estado"],
+            "ambito_grabado": ambito_grabado,
+            "ambito_declarado": ambito_nuevo,
+            "detalle": "La tarea '" + ficha.id + "' está en estado '"
+            + str(existente["estado"]) + "' y retiene su ámbito: no se "
+            "aplica el cambio de ámbito declarado en el JSON. Se "
+            "sincronizará sola cuando la tarea deje de estar viva.",
+        }
 
     fusionadas = fusionar_decisiones(
         ficha.requiere_decision_humana, existente["decisiones"]
@@ -1170,7 +1578,7 @@ def sincronizar_ficha(con: sqlite3.Connection, ficha: Ficha, ahora: str | None =
         },
     )
 
-    return {"id": ficha.id, "accion": "actualizada", "eventos": 1}
+    return {"id": ficha.id, "accion": ACCION_ACTUALIZADA, "eventos": 1}
 
 
 def necesita_sincronizacion(con: sqlite3.Connection, ficha: Ficha) -> bool:
@@ -1189,7 +1597,7 @@ def asegurar_ficha(con: sqlite3.Connection, ficha: Ficha, ahora: str | None = No
     día. Sólo abre una transacción de escritura si hace falta.
     """
     if not necesita_sincronizacion(con, ficha):
-        return {"id": ficha.id, "accion": "sin_cambios", "eventos": 0}
+        return {"id": ficha.id, "accion": ACCION_SIN_CAMBIOS, "eventos": 0}
 
     with transaccion(con):
         return sincronizar_ficha(con, ficha, ahora)

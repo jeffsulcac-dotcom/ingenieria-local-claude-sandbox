@@ -471,6 +471,17 @@ def orden_crear(raiz: Path, argumentos) -> int:
 # la orden (una persona, un guion o n8n) puede distinguirla de un error.
 CODIGO_TOMA_RECHAZADA = 3
 
+# Código propio de una orden rechazada por propiedad (A3.2): quien la emitió
+# ya no es el dueño vigente de la ejecución, o su generación quedó atrás.
+#
+# Tampoco es una avería: es el resultado normal de llegar tarde, y quien
+# invoque la orden necesita distinguirlo del error genérico (2), de la toma
+# perdida (3) y del "resultado no deseado" (1).
+#
+# Se elige el 4 porque 0, 1, 2 y 3 ya están tomados, y el 2 lo está dos
+# veces: también lo usa argparse ante un error de uso.
+CODIGO_PROPIEDAD_INVALIDA = 4
+
 
 def orden_tomar(raiz: Path, argumentos) -> int:
     try:
@@ -846,6 +857,24 @@ def principal(argumentos_crudos: list[str] | None = None) -> int:
 
     try:
         return argumentos.funcion(raiz, argumentos)
+    except nucleo.ErrorPropiedad as rechazo:
+        # Antes que el genérico: ErrorPropiedad hereda de ErrorSupervisor y
+        # si no se capturase aquí colapsaría en el código 2, indistinguible
+        # de una avería. Se atiende en un solo sitio para que TODAS las
+        # órdenes del ciclo den el mismo código, no sólo las que hoy existen.
+        print("")
+        print("  ORDEN RECHAZADA: " + str(rechazo))
+        print("")
+        _linea("Tarea", rechazo.tarea)
+        _linea("Motivo", rechazo.motivo)
+        _linea("Estado actual", rechazo.estado)
+        _linea("Propietario que ordenó", rechazo.propietario)
+        _linea("Propietario vigente", rechazo.propietario_vigente)
+        _linea("Generación de la orden", rechazo.generacion)
+        _linea("Generación vigente", rechazo.generacion_vigente)
+        print("")
+
+        return CODIGO_PROPIEDAD_INVALIDA
     except (
         nucleo.ErrorSupervisor,
         ErrorFicha,
