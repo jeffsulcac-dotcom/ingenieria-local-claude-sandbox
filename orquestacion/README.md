@@ -413,15 +413,32 @@ Por qué un contador y no otra cosa:
 - No hace falta criptografía: la base es local y de una sola PC. Un
   entero es lo más simple que funciona, y es determinista y comprobable.
 
+El testigo **no sale de SQLite**: no se serializa al JSON ni se lee de él, y
+`fila_desde_ficha` graba siempre 0 al importar. El JSON es un archivo del
+árbol de trabajo que cualquiera edita, y un testigo que el vigilado puede
+escribir no vigila nada: con él se podía fijar o hacer retroceder la
+generación y volver a hacer indistinguibles dos ejecuciones. `reclamar` es
+la única que la mueve, y sólo sumando uno.
+
 **Escrituras condicionadas.** `estado_global.actualizar_si_propietario`
 lleva la precondición en el WHERE del UPDATE y decide por `rowcount`, sin
 comprobación previa en Python. `supervisor.persistir` la usa siempre:
 
-| Precondición | Cuándo se exige |
-|---|---|
-| `generacion = ?` | SIEMPRE, con la generación con la que se leyó la ficha |
-| `trabajador_id = ?` | En `latido`, `devolver` y `verificar` |
-| `estado IN (...)` | Cuando la orden sólo vale desde ciertos estados |
+| Precondición | Cuándo se exige | Qué distingue |
+|---|---|---|
+| `generacion = ?` | SIEMPRE | dos EJECUCIONES de la misma tarea |
+| `trabajador_id = ?` | En `latido`, `devolver` y `verificar` | dos TRABAJADORES |
+| `estado IN (...)` | SIEMPRE, con el estado que se leyó | dos MOMENTOS del ciclo |
+
+Las tres hacen falta y ninguna sobra:
+
+- La generación sola no basta. Las transiciones NO la mueven, así que dos
+  órdenes separadas por varias de ellas llevan el mismo testigo. Comprobado:
+  una orden humana lenta revertía a PROPUESTO una tarea que entretanto había
+  quedado BLOQUEADA, saltándose además la máquina de estados porque
+  `transicionar` validó contra su foto vieja.
+- La identidad sola no basta: es justamente el problema ABA.
+- El estado solo no basta: no distingue quién ordena.
 
 La generación se exige también en las órdenes humanas, que no tienen
 propietario pero tampoco deben pisar una ejecución que empezó mientras su
@@ -464,6 +481,29 @@ la tarea deja de estar viva. Un cambio declarativo inocuo —el título, la
 descripción de una decisión— sigue sincronizándose con normalidad: sólo se
 frena lo que rompería la garantía.
 
+Tres detalles que costaron una ronda de auditoría cada uno:
+
+- El ámbito se compara por CONTENIDO, no por orden. `solapamientos` recorre
+  el producto cartesiano, así que `['a','b']` y `['b','a']` garantizan lo
+  mismo; comparar las listas tal cual congelaba toda la definición al
+  reordenar un patrón.
+- La TOMA graba el ámbito que acaba de validar. `requiere_revision` es el
+  único estado que está a la vez en ESTADOS_TOMABLES y en
+  ESTADOS_QUE_RETIENEN_AMBITO, así que una tarea podía tener el ámbito
+  congelado y ser tomable al mismo tiempo: la toma concedía la propiedad
+  sobre el ámbito declarado mientras la fila guardaba el viejo, y la
+  siguiente toma comprobaba el solapamiento contra un ámbito que ya no
+  usaba nadie. Grabarlo en la toma es coherente: ahí empieza otra
+  ejecución y el ámbito acaba de comprobarse dentro de esa transacción.
+- La ruta de sólo lectura no pide el bloqueo de escritura. Como la huella
+  no avanza a propósito, `necesita_sincronizacion` dice que sí para
+  siempre; sin un atajo, cada `cargar` —incluido el de un `ver`— abriría un
+  BEGIN IMMEDIATE para no escribir nada, y bajo concurrencia eso convierte
+  una consulta en "database is locked".
+
+Y el resultado se informa: un ámbito congelado NO se cuenta como "sin
+cambios", que le diría al usuario justo lo contrario de lo que pasó.
+
 **Bootstrap concurrente.** Dos carreras, las dos reproducidas y las dos
 corregidas:
 
@@ -473,11 +513,24 @@ corregidas:
   relee DENTRO de la transacción, con el bloqueo de escritura ya tomado.
   Añadir `IF NOT EXISTS` no bastaba: sólo desplazaba el error al INSERT
   contra la clave primaria de `esquema`.
-- La conversión inicial `delete` -> `wal` necesita un bloqueo exclusivo
-  momentáneo y SQLite no invoca el manejador de ocupado para ese cambio,
-  de modo que `busy_timeout` no lo cubría. Ahora sólo se pide el cambio si
-  la base no está ya en WAL, y si hay que convertir se reintenta de forma
-  acotada releyendo el modo entre intentos.
+- La conversión inicial `delete` -> `wal` es el único momento en que abrir
+  la base necesita un bloqueo exclusivo. Ahora no se pide el cambio si la
+  base ya está en WAL: a partir de la segunda apertura ningún proceso
+  compite por un bloqueo que no necesita. Se comprueba contando las
+  sentencias que llegan al motor, no midiendo tiempos.
+
+  Y si hay que convertir, se reintenta de forma acotada. Esto costó una
+  vuelta que merece quedar escrita. Primero se midió que la conversión SÍ
+  respeta el `busy_timeout` —con un lector abierto esperó los 5,007 s
+  completos antes de rendirse— y de ahí se concluyó que el reintento sobraba
+  y se retiró. La corrida completa del corredor lo desmintió en el acto:
+  con 6 procesos saliendo a la vez contra una base que no existe, 1 de 6
+  murió con "database is locked" SIN esperar nada.
+
+  Las dos observaciones son ciertas y no se contradicen: el temporizador
+  cubre el conflicto con un LECTOR, pero no el choque entre varios que
+  intentan CONVERTIR a la vez. Por eso el reintento es de pocos intentos y
+  siestas cortas: el fallo que absorbe es inmediato, no una espera larga.
 
 **Rendimiento.** Se aplicó la mitigación que A3.1 dejó medida y anotada:
 `git_common_dir` memoriza su resultado por raíz y por proceso. Medido, en
@@ -486,6 +539,14 @@ invocaciones de `git rev-parse --git-common-dir`, y `prueba_toma_atomica.py`
 de unas 455 a 23 — una por repositorio temporal, el mínimo posible. No es
 una caché global ni persistente, y antes de devolver lo memorizado
 comprueba que el directorio siga existiendo.
+
+**Lo que NO cierra A3.2, dicho con precisión.** `persistir` reescribe las
+dieciséis columnas operativas con la foto que `cargar` leyó. Las tres
+precondiciones deciden QUIÉN escribe y DESDE QUÉ momento, no QUÉ contenía
+cada columna: dos órdenes que compartan generación, identidad y estado
+—por ejemplo dos latidos del mismo propietario— siguen pudiendo pisarse
+campo a campo. Cerrarlo exige que cada orden escriba sólo lo suyo, que es
+un cambio en las nueve y pertenece a A3.3.
 
 **Limitaciones conocidas de A3.2 (por diseño).**
 
@@ -519,6 +580,13 @@ decide si los temporales se pueden borrar: la corrida con
 `python -X dev -W error::ResourceWarning` sale con código 0 sin emitir un
 solo aviso, y un detector que instrumenta `sqlite3.connect` cuenta 352
 conexiones abiertas durante la tanda y **0 vivas al terminar**.
+
+Sobre la conversión a WAL: el modo de fallo SÍ existe y se reprodujo en
+Linux, dentro de la corrida completa del corredor (1 de 6 procesos). El
+reintento que lo absorbe está puesto y verificado ahí. Lo que la prueba
+automática comprueba de forma determinista es la otra mitad —que una base
+ya en WAL no se reconvierte—, porque el choque en sí depende de la carga
+de la máquina y un gate no puede depender de eso.
 
 Sobre el cronómetro: el riesgo que A3.1 dejó anotado ya no aplica igual,
 porque A3.2 memoriza `git_common_dir`. Este archivo hace 105 invocaciones

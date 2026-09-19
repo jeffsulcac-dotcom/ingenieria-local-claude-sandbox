@@ -589,9 +589,29 @@ Evidencia medida en Linux (Python 3.11.15):
 - Estrés concurrente: 10 procesos disparando a la vez órdenes rezagadas
   contra el dueño vigente. 600 emitidas, 600 rechazadas, 0 aceptadas.
 - Bootstrap concurrente: 6 procesos por ronda, 3 rondas, 0 fallos.
-- Mutaciones: 5 de 5 detectadas por la batería. La del bootstrap reprodujo
-  el error original literal ("table tareas already exists" en 4 de 6
-  procesos).
+- Mutaciones: 11 de 11 detectadas por la batería. La del bootstrap
+  reprodujo el error original literal ("table tareas already exists").
+
+Auditoría adversarial: 8 revisores de sólo lectura sobre copias protegidas.
+Encontraron cuatro defectos REALES de esta misma etapa, todos corregidos y
+todos con prueba propia:
+
+- el testigo de propiedad se serializaba al JSON y por tanto era
+  falsificable (crítico);
+- la generación sola no cubría el avance del ciclo, y una orden humana
+  rezagada revertía una transición ya confirmada (crítico);
+- la toma no grababa el ámbito que acababa de validar, y por
+  `requiere_revision` volvían a quedar dos escritores (crítico);
+- la ruta de sólo lectura pedía el bloqueo de escritura de toda la base
+  para no escribir nada (medio).
+
+Falso positivo descartado ejecutándolo: `cargar` NO borra una decisión
+humana resuelta; `fusionar_decisiones` la conserva.
+
+Lo que A3.2 NO cierra, dicho con precisión: `persistir` escribe las
+dieciséis columnas operativas en bloque, así que dos órdenes con la misma
+generación, identidad y estado siguen pudiendo pisarse campo a campo.
+Pertenece a A3.3.
 
 Pendiente de ejecución en Windows: es el entorno final real y esta corrida
 fue en Linux. Los comandos están en orquestacion/README.md.

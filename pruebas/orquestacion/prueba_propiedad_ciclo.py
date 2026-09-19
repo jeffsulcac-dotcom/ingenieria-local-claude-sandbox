@@ -1251,12 +1251,12 @@ def prueba_l2_el_journal_no_se_reconvierte_en_cada_apertura():
     tiempo: un tiempo dependería de la máquina y no probaría nada.
 
     Lo que esta prueba NO cubre, y se dice aquí para no aparentar más de lo
-    que hay: el reintento acotado de `_activar_journal`. En Linux no se ha
-    conseguido reproducir un fallo de la conversión que el `busy_timeout`
-    no cubriera ya —medido: la conversión espera los 5 s completos antes de
-    rendirse—, así que ese reintento es una defensa declarada y NO
-    verificada. Si el modo de fallo existe, es en Windows donde aparecería,
-    y el gate de Windows es donde se sabrá.
+    que hay: el reintento acotado de `_activar_journal`. Ese modo de fallo
+    SÍ existe y se reprodujo —dentro de la corrida completa del corredor,
+    1 de 6 procesos murió con "database is locked"—, pero depende de la
+    carga de la máquina, y un gate que a veces se dispara y a veces no no
+    sirve de gate. Aquí se comprueba la mitad determinista; la otra la
+    respalda aquella observación, anotada en orquestacion/README.md.
     """
     print(" 13. una base ya en WAL no se reconvierte al abrirla:", end=" ")
 
@@ -1456,7 +1456,7 @@ def prueba_n_reanudar_respeta_una_toma_reciente():
 
 def prueba_o_estres_de_ordenes_rezagadas(rezagadas: int):
     print(
-        " 19. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
+        " 22. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
         "dueño vigente:",
         end=" ",
     )
@@ -1526,6 +1526,240 @@ def prueba_o_estres_de_ordenes_rezagadas(rezagadas: int):
 
 
 # ----------------------------------------------------------------------
+# GRUPO 3b — El ámbito congelado no puede colarse por la toma
+# ----------------------------------------------------------------------
+
+def _forzar_estado(raiz: Path, identificador: str, estado: Estado) -> None:
+    """
+    Coloca la tarea en un estado concreto, sólo para montar el escenario.
+
+    Se hace con SQL directo y no con las órdenes del Supervisor porque
+    llegar a `requiere_revision` por el camino normal exige correr la
+    batería entera dentro de la prueba. Lo que se comprueba después sí pasa
+    por las órdenes reales.
+    """
+    con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+    try:
+        with estado_global.transaccion(con):
+            estado_global.actualizar_tarea(
+                con, identificador, {"estado": str(estado)}
+            )
+    finally:
+        con.close()
+
+
+def prueba_u_la_toma_graba_el_ambito_que_valido():
+    """
+    Una tarea en `requiere_revision` no puede tomarse con un ámbito que la
+    base acaba de negarse a grabar.
+
+    `requiere_revision` es el ÚNICO estado que está a la vez en
+    ESTADOS_TOMABLES y en ESTADOS_QUE_RETIENEN_AMBITO. Eso abría una puerta
+    trasera a la guarda de A3.2, encontrada por la auditoría adversarial:
+    la toma concedía la propiedad sobre el ámbito DECLARADO mientras la
+    fila seguía guardando el viejo, y la siguiente toma comprobaba el
+    solapamiento contra un ámbito que ya no usaba nadie. Resultado: dos
+    escritores sobre los mismos archivos, que es exactamente lo que la
+    guarda existe para impedir.
+    """
+    print(" 16. la toma graba el ámbito que acaba de validar:", end=" ")
+
+    raiz = crear_repositorio()
+
+    try:
+        ficha_minima(
+            raiz,
+            "T-0901",
+            ambito_archivos=["modulos/comun/uno.py", "modulos/comun/dos.py"],
+        )
+        ficha_minima(raiz, "T-0902", ambito_archivos=["modulos/comun/tres.py"])
+
+        nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+        _forzar_estado(raiz, "T-0901", Estado.REQUIERE_REVISION)
+
+        # Se AMPLÍA el ámbito en el JSON mientras la tarea lo retiene.
+        _reescribir_ambito(
+            raiz,
+            "T-0901",
+            [
+                "modulos/comun/uno.py",
+                "modulos/comun/dos.py",
+                "modulos/comun/tres.py",
+            ],
+        )
+
+        # La guarda lo congela: la fila conserva el ámbito de dos.
+        nucleo.cargar(raiz, "T-0901")
+
+        assert len(fila_de(raiz, "T-0901")["ambito_archivos"]) == 2
+
+        # Y ahora se vuelve a tomar, que es legítimo: está en un estado
+        # tomable. La toma valida el ámbito DECLARADO —el de tres— contra
+        # las demás tareas y, si lo concede, tiene que grabarlo.
+        nucleo.tomar(raiz, "T-0901", trabajador_id="worker-B")
+
+        grabado = fila_de(raiz, "T-0901")["ambito_archivos"]
+
+        assert sorted(grabado) == [
+            "modulos/comun/dos.py",
+            "modulos/comun/tres.py",
+            "modulos/comun/uno.py",
+        ], (
+            "La toma concedió la propiedad sobre un ámbito que no grabó. La "
+            "fila quedó con: " + repr(grabado)
+        )
+
+        # La consecuencia que importa: T-0902 declara 'tres.py' y ahora sí
+        # se ve el solapamiento.
+        METRICAS["ORDENES_TOTALES"] += 1
+
+        try:
+            nucleo.tomar(raiz, "T-0902", trabajador_id="worker-C")
+        except nucleo.ErrorSolapamiento:
+            METRICAS["ORDENES_RECHAZADAS"] += 1
+        else:
+            METRICAS["ORDENES_ACEPTADAS"] += 1
+            METRICAS["ESCRITURAS_INDEBIDAS"] += 1
+            raise AssertionError(
+                "Dos escritores sobre 'modulos/comun/tres.py': el ámbito "
+                "congelado se coló por la puerta de la toma."
+            )
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+def prueba_v_reordenar_el_ambito_no_congela_nada():
+    """
+    Reordenar los patrones no es cambiar el ámbito.
+
+    `supervisor.solapamientos` recorre el producto cartesiano de los dos
+    ámbitos, así que ['a','b'] y ['b','a'] garantizan lo mismo. Si la
+    guarda comparase las listas tal cual, reordenar sin mover un archivo
+    congelaría toda la definición y bloquearía de paso cualquier arreglo
+    que viajara en la misma edición.
+    """
+    print(" 17. reordenar el ámbito no congela la definición:", end=" ")
+
+    raiz = crear_repositorio()
+
+    try:
+        import json
+
+        ficha_minima(
+            raiz,
+            "T-0901",
+            ambito_archivos=["modulos/comun/uno.py", "modulos/comun/dos.py"],
+        )
+        nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+
+        ruta = fichas.ruta_ficha(raiz, "T-0901")
+        datos = json.loads(ruta.read_text(encoding="utf-8"))
+        datos["ambito_archivos"] = [
+            "modulos/comun/dos.py",
+            "modulos/comun/uno.py",
+        ]
+        datos["titulo"] = "Título corregido en la misma edición"
+        ruta.write_text(
+            json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        nucleo.cargar(raiz, "T-0901")
+
+        fila = fila_de(raiz, "T-0901")
+
+        assert fila["titulo"] == "Título corregido en la misma edición", (
+            "Reordenar el ámbito congeló una corrección de título que no "
+            "tenía nada que ver."
+        )
+        assert sorted(fila["ambito_archivos"]) == [
+            "modulos/comun/dos.py",
+            "modulos/comun/uno.py",
+        ]
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+def prueba_w_el_ambito_congelado_no_pide_el_bloqueo_de_escritura():
+    """
+    Una orden de sólo lectura sobre una tarea congelada no escribe ni pide
+    el candado.
+
+    La huella NO avanza mientras el ámbito está congelado —es el propio
+    diseño de la guarda—, así que `necesita_sincronizacion` dice que sí
+    para siempre. Si `asegurar_ficha` abriera igualmente su transacción,
+    cada `cargar`, incluido el de un `ver`, pediría el bloqueo de escritura
+    de toda la base para no escribir nada; bajo concurrencia eso convierte
+    una consulta en una espera que acaba en "database is locked".
+    """
+    print(" 18. una consulta sobre tarea congelada no pide el candado:", end=" ")
+
+    raiz = crear_repositorio()
+
+    try:
+        ficha_minima(
+            raiz,
+            "T-0901",
+            ambito_archivos=["modulos/comun/uno.py", "modulos/comun/dos.py"],
+        )
+        nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+
+        _reescribir_ambito(raiz, "T-0901", ["modulos/comun/uno.py"])
+
+        sentencias = []
+        conectar = sqlite3.connect
+
+        def conectar_vigilado(*argumentos, **claves):
+            con_nueva = conectar(*argumentos, **claves)
+            con_nueva.set_trace_callback(
+                lambda sentencia: sentencias.append(str(sentencia))
+            )
+
+            return con_nueva
+
+        sqlite3.connect = conectar_vigilado
+
+        try:
+            for _ in range(3):
+                nucleo.cargar(raiz, "T-0901")
+        finally:
+            sqlite3.connect = conectar
+
+        candados = [
+            una for una in sentencias if "BEGIN IMMEDIATE" in una.upper()
+        ]
+
+        assert not candados, (
+            "Una orden de sólo lectura pidió el bloqueo de escritura "
+            + str(len(candados)) + " vez/veces sobre una tarea cuyo ámbito "
+            "está congelado y que por tanto no se va a escribir."
+        )
+
+        escrituras = [
+            una for una in sentencias
+            if una.strip().upper().startswith(("UPDATE", "INSERT", "DELETE"))
+        ]
+
+        assert not escrituras, (
+            "La ruta de sólo lectura escribió: " + repr(escrituras[:3])
+        )
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
 # GRUPO 7b — El testigo de propiedad no se puede falsificar
 # ----------------------------------------------------------------------
 
@@ -1544,7 +1778,7 @@ def prueba_r_la_generacion_no_sale_de_sqlite():
     podía volver a hacer indistinguibles dos ejecuciones, que es justo el
     problema ABA que la columna existe para cerrar.
     """
-    print(" 16. la generación no se puede falsificar desde el JSON:", end=" ")
+    print(" 19. la generación no se puede falsificar desde el JSON:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1649,7 +1883,7 @@ def prueba_s_orden_humana_rezagada_no_revierte_una_transicion():
     Lo cierra la tercera precondición: la escritura exige que la fila siga
     en el estado que tenía cuando se leyó.
     """
-    print(" 17. una orden humana rezagada no revierte el ciclo:", end=" ")
+    print(" 20. una orden humana rezagada no revierte el ciclo:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1703,7 +1937,7 @@ def prueba_t_el_ambito_congelado_se_informa():
     función importante produzca un resultado visible y verificable, y un
     cambio en espera es justo eso.
     """
-    print(" 18. el ámbito congelado se informa, no se disimula:", end=" ")
+    print(" 21. el ámbito congelado se informa, no se disimula:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1835,7 +2069,7 @@ def prueba_p_estres_concurrente(emisores: int, ordenes: int):
     órdenes entre. Una sola aceptada es un fallo, y se nombra cuál fue.
     """
     print(
-        " 20. estrés concurrente: " + str(emisores) + " procesos x "
+        " 23. estrés concurrente: " + str(emisores) + " procesos x "
         + str(ordenes) + " órdenes rezagadas:",
         end=" ",
     )
@@ -1953,6 +2187,9 @@ COMPROBACIONES = (
     prueba_l2_el_journal_no_se_reconvierte_en_cada_apertura,
     prueba_m_codigo_de_salida_por_propiedad,
     prueba_n_reanudar_respeta_una_toma_reciente,
+    prueba_u_la_toma_graba_el_ambito_que_valido,
+    prueba_v_reordenar_el_ambito_no_congela_nada,
+    prueba_w_el_ambito_congelado_no_pide_el_bloqueo_de_escritura,
     prueba_r_la_generacion_no_sale_de_sqlite,
     prueba_s_orden_humana_rezagada_no_revierte_una_transicion,
     prueba_t_el_ambito_congelado_se_informa,

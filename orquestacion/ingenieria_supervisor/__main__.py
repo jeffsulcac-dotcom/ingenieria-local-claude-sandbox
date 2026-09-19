@@ -295,6 +295,12 @@ def mostrar_ficha(raiz: Path, identificador: str) -> int:
     _linea("Creada", ficha.creado_en)
     _linea("Actualizada", ficha.actualizado_en)
     _linea("Trabajador", ficha.trabajador_id)
+    # La generación se muestra aquí porque es la credencial con la que una
+    # orden se acredita, y hasta ahora sólo la imprimía `tomar`. Si esa
+    # salida se perdía —consola cerrada, guion que no la capturó, retoma
+    # tras un apagón— no había forma de recuperarla, y la vía declarada,
+    # que es la única que detiene a una orden rezagada, quedaba inservible.
+    _linea("Generación", ficha.generacion)
     _linea("PID", ficha.pid)
     _linea("Último latido", ficha.ultimo_latido)
 

@@ -78,15 +78,11 @@ VERSION_ESQUEMA = 2
 # Milisegundos que una conexión espera si otra tiene la base ocupada.
 BUSY_TIMEOUT_MS = 5000
 
-# Reintentos cortos para la conversión inicial a WAL.
-#
-# Medido: en este SQLite la conversión SÍ respeta el busy_timeout —esperó
-# los 5 s completos antes de rendirse—, así que la espera larga ya la cubre
-# BUSY_TIMEOUT_MS. Esto es sólo un cinturón breve (unos 0,3 s en total) por
-# si algún sistema devuelve SQLITE_BUSY en el acto sin esperar. No se alarga
-# más a propósito: encadenar otros 5 s detrás de los 5 s del busy_timeout
-# convertiría una contención pasajera en una espera de diez segundos.
-INTENTOS_JOURNAL = 4
+# Reintentos de la conversión inicial a WAL. Ver `_activar_journal`: el
+# fallo que absorben es INMEDIATO (varios procesos convirtiendo a la vez una
+# base nueva), no una espera larga, así que bastan pocos intentos con
+# siestas cortas. Suman poco más de un segundo de espera en total.
+INTENTOS_JOURNAL = 8
 ESPERA_JOURNAL_S = 0.02
 ESPERA_JOURNAL_MAXIMA_S = 0.25
 
@@ -357,23 +353,34 @@ def _activar_journal(con: sqlite3.Connection, ruta: Path) -> str:
     """
     Deja la base en `JOURNAL_MODE`, tolerando el arranque concurrente.
 
-    La conversión inicial delete -> wal necesita un bloqueo exclusivo
-    momentáneo, y para ESE cambio SQLite no llama al manejador de ocupado:
-    el `busy_timeout` no lo cubre y la orden falla en el acto con
-    "database is locked". Con varios procesos arrancando a la vez sobre una
-    base nueva, los perdedores morían ahí, antes incluso de llegar al
-    esquema.
+    Dos medidas, y las dos hicieron falta de verdad.
 
-    Dos medidas, las dos mínimas:
+    1. No se pide el cambio si la base YA está en el modo deseado. La
+       conversión `delete` -> `wal` es el único momento en que abrir la base
+       necesita un bloqueo exclusivo; a partir de la segunda apertura no hay
+       nada que convertir. Si cada proceso emitiera igualmente la sentencia,
+       todos competirían por un bloqueo que ninguno necesita.
 
-    1. No se pide el cambio si la base YA está en el modo deseado. Ése es el
-       caso normal a partir del segundo arranque, y así deja de haber
-       conversión que pueda chocar.
+    2. Si hay que convertir, se reintenta de forma acotada.
 
-    2. Si hay que convertir y otro proceso está haciéndolo, se reintenta un
-       número acotado de veces. Entre intento e intento se vuelve a LEER el
-       modo: lo más probable es que el otro ya terminara, y entonces no hay
-       nada que hacer.
+    Sobre (2) conviene dejar escrito lo que costó, porque el camino tuvo una
+    vuelta. Primero se midió que la conversión SÍ respeta el `busy_timeout`
+    —con un lector abierto esperó los 5,007 s completos antes de rendirse—,
+    y de ahí se concluyó que el reintento sobraba y se retiró. La corrida
+    completa del corredor lo desmintió en el acto: con 6 procesos saliendo a
+    la vez contra una base que no existe, 1 de 6 muere con "database is
+    locked" SIN esperar nada. Las dos observaciones son ciertas y no se
+    contradicen: el temporizador cubre el conflicto con un lector, pero no
+    el choque entre varios que intentan convertir a la vez.
+
+    Por eso la espera es corta y el número de intentos pequeño: el fallo que
+    hay que absorber es inmediato, no una espera larga. Entre intento e
+    intento se vuelve a LEER el modo, porque lo más probable es que otro ya
+    terminara y entonces no haya nada que hacer.
+
+    La lectura del modo va DENTRO del bucle, no antes: leer de una base que
+    otro tiene tomada en exclusiva falla igual, y dejarla fuera hacía morir
+    sin reintentar nada al primero que llegara mientras otro convierte.
 
     El modo se devuelve para que quien llama compruebe el resultado real.
     """
@@ -382,12 +389,6 @@ def _activar_journal(con: sqlite3.Connection, ruta: Path) -> str:
 
     for intento in range(INTENTOS_JOURNAL):
         try:
-            # La LECTURA va dentro del reintento, no antes. Leer
-            # `journal_mode` de una base que otro tiene tomada en exclusiva
-            # también falla con "database is locked": si esta consulta
-            # quedara fuera del bucle, el primer proceso que llegase
-            # mientras otro convierte moriría sin haber reintentado nada, y
-            # la protección no serviría para el caso que existe para cubrir.
             modo = con.execute("PRAGMA journal_mode").fetchone()[0]
 
             if str(modo).lower() == JOURNAL_MODE:
@@ -627,7 +628,23 @@ def inicializar(con: sqlite3.Connection) -> dict:
                 # Añadir IF NOT EXISTS a los CREATE no bastaba: el error se
                 # desplazaba al INSERT de la versión, que choca contra la
                 # clave primaria de `esquema`.
-                if version_esquema(con) >= version:
+                actual = version_esquema(con)
+
+                if actual > VERSION_ESQUEMA:
+                    # La misma guarda que arriba, reevaluada con el bloqueo
+                    # tomado. La de fuera se evalúa en autocommit, así que
+                    # otro proceso puede migrar a una versión más nueva
+                    # entremedias y esta build seguiría adelante sobre un
+                    # esquema que no entiende.
+                    raise ErrorEstadoGlobal(
+                        "La base global está en la versión de esquema "
+                        + str(actual)
+                        + ", más nueva que la que entiende este Supervisor ("
+                        + str(VERSION_ESQUEMA)
+                        + ")."
+                    )
+
+                if actual >= version:
                     continue
 
                 for sentencia in sentencias:
@@ -637,7 +654,13 @@ def inicializar(con: sqlite3.Connection) -> dict:
                     "INSERT INTO esquema (version, aplicado_en) VALUES (?, ?)",
                     (version, ahora_utc()),
                 )
-        except sqlite3.Error as error:
+        except ErrorEstadoGlobal as error:
+            # `transaccion` ya convirtió cualquier sqlite3.Error en
+            # ErrorEstadoGlobal, así que capturar sqlite3.Error aquí era
+            # código muerto y el número de migración se perdía.
+            if "versión de esquema" in str(error):
+                raise
+
             raise ErrorEstadoGlobal(
                 "Falló la migración de esquema número "
                 + str(version)
@@ -1562,6 +1585,23 @@ def importar_ficha(
     return {"id": ficha.id, "accion": ACCION_IMPORTADA, "eventos": importados + 1}
 
 
+def ambito_congelado(existente: dict, ficha: Ficha) -> bool:
+    """
+    ¿Hay que dejar el ámbito como está porque la tarea lo retiene?
+
+    Se compara por CONTENIDO y no por orden. La garantía que esto protege
+    —`supervisor.solapamientos`— recorre el producto cartesiano de los dos
+    ámbitos, así que ['a','b'] y ['b','a'] garantizan exactamente lo mismo.
+    Comparar las listas tal cual haría que reordenar un patrón, sin mover un
+    solo archivo, congelara toda la definición y bloqueara de paso un
+    arreglo de título que viajara en la misma edición.
+    """
+    if str(existente["estado"]) not in ESTADOS_QUE_RETIENEN_AMBITO:
+        return False
+
+    return set(ficha.ambito_archivos) != set(existente["ambito_archivos"] or [])
+
+
 def sincronizar_ficha(con: sqlite3.Connection, ficha: Ficha, ahora: str | None = None) -> dict:
     """
     Incorpora una ficha nueva o refresca su definición si cambió.
@@ -1604,13 +1644,10 @@ def sincronizar_ficha(con: sqlite3.Connection, ficha: Ficha, ahora: str | None =
     if existente["definicion_hash"] == huella:
         return {"id": ficha.id, "accion": ACCION_SIN_CAMBIOS, "eventos": 0}
 
-    ambito_nuevo = list(ficha.ambito_archivos)
-    ambito_grabado = list(existente["ambito_archivos"] or [])
+    if ambito_congelado(existente, ficha):
+        ambito_nuevo = list(ficha.ambito_archivos)
+        ambito_grabado = list(existente["ambito_archivos"] or [])
 
-    if (
-        ambito_nuevo != ambito_grabado
-        and str(existente["estado"]) in ESTADOS_QUE_RETIENEN_AMBITO
-    ):
         return {
             "id": ficha.id,
             "accion": ACCION_AMBITO_CONGELADO,
@@ -1681,6 +1718,19 @@ def asegurar_ficha(con: sqlite3.Connection, ficha: Ficha, ahora: str | None = No
     """
     if not necesita_sincronizacion(con, ficha):
         return {"id": ficha.id, "accion": ACCION_SIN_CAMBIOS, "eventos": 0}
+
+    existente = obtener_tarea(con, ficha.id)
+
+    # Atajo imprescindible, no una optimización. Mientras el ámbito está
+    # congelado la huella NO avanza a propósito, así que
+    # `necesita_sincronizacion` dice que sí para siempre. Sin esta salida,
+    # cada orden —incluidas las de SÓLO LECTURA, porque `cargar` pasa por
+    # aquí— abriría un BEGIN IMMEDIATE, es decir pediría el bloqueo de
+    # escritura de toda la base, para no escribir nada. Bajo concurrencia
+    # eso convierte un `ver` en una espera de 5 s que acaba en "database is
+    # locked".
+    if existente is not None and ambito_congelado(existente, ficha):
+        return sincronizar_ficha(con, ficha, ahora)
 
     with transaccion(con):
         return sincronizar_ficha(con, ficha, ahora)

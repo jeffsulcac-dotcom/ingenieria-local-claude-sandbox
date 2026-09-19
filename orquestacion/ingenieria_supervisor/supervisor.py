@@ -1179,6 +1179,28 @@ def tomar(
                     "rama": rama,
                     "commit_inicial": commit_inicial,
                     "actualizado_en": ahora_utc(),
+                    # El ámbito que esta misma transacción acaba de validar
+                    # contra todas las demás tareas activas.
+                    #
+                    # Hace falta porque `requiere_revision` es el único
+                    # estado que está a la vez en ESTADOS_TOMABLES y en
+                    # ESTADOS_QUE_RETIENEN_AMBITO: una tarea ahí puede tener
+                    # el ámbito CONGELADO —la definición del árbol dice una
+                    # cosa y la fila otra— y ser tomable al mismo tiempo. Sin
+                    # esta línea, la toma concedía la propiedad sobre el
+                    # ámbito declarado mientras la base seguía guardando el
+                    # viejo, y la siguiente toma comprobaba el solapamiento
+                    # contra un ámbito que ya no era el que nadie usaba:
+                    # dos escritores sobre los mismos archivos.
+                    #
+                    # Grabarlo aquí es coherente con la guarda: congelar
+                    # protege a una ejecución VIVA de que le cambien el
+                    # terreno debajo; una toma nueva es justamente el momento
+                    # en que empieza otra ejecución, y su ámbito acaba de
+                    # comprobarse dentro de esta transacción.
+                    "ambito_archivos": global_.fila_desde_ficha(ficha)[
+                        "ambito_archivos"
+                    ],
                 },
             )
 
