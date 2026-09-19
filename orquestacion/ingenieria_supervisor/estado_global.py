@@ -69,8 +69,15 @@ VERSION_ESQUEMA = 2
 # Milisegundos que una conexión espera si otra tiene la base ocupada.
 BUSY_TIMEOUT_MS = 5000
 
-# Reintentos para la conversión inicial a WAL, que el busy_timeout no cubre.
-INTENTOS_JOURNAL = 12
+# Reintentos cortos para la conversión inicial a WAL.
+#
+# Medido: en este SQLite la conversión SÍ respeta el busy_timeout —esperó
+# los 5 s completos antes de rendirse—, así que la espera larga ya la cubre
+# BUSY_TIMEOUT_MS. Esto es sólo un cinturón breve (unos 0,3 s en total) por
+# si algún sistema devuelve SQLITE_BUSY en el acto sin esperar. No se alarga
+# más a propósito: encadenar otros 5 s detrás de los 5 s del busy_timeout
+# convertiría una contención pasajera en una espera de diez segundos.
+INTENTOS_JOURNAL = 4
 ESPERA_JOURNAL_S = 0.02
 ESPERA_JOURNAL_MAXIMA_S = 0.25
 
@@ -361,16 +368,22 @@ def _activar_journal(con: sqlite3.Connection, ruta: Path) -> str:
 
     El modo se devuelve para que quien llama compruebe el resultado real.
     """
-    modo = con.execute("PRAGMA journal_mode").fetchone()[0]
-
-    if str(modo).lower() == JOURNAL_MODE:
-        return str(modo)
-
     espera = ESPERA_JOURNAL_S
     ultimo = None
 
     for intento in range(INTENTOS_JOURNAL):
         try:
+            # La LECTURA va dentro del reintento, no antes. Leer
+            # `journal_mode` de una base que otro tiene tomada en exclusiva
+            # también falla con "database is locked": si esta consulta
+            # quedara fuera del bucle, el primer proceso que llegase
+            # mientras otro convierte moriría sin haber reintentado nada, y
+            # la protección no serviría para el caso que existe para cubrir.
+            modo = con.execute("PRAGMA journal_mode").fetchone()[0]
+
+            if str(modo).lower() == JOURNAL_MODE:
+                return str(modo)
+
             modo = con.execute(
                 "PRAGMA journal_mode = " + JOURNAL_MODE
             ).fetchone()[0]
@@ -380,8 +393,8 @@ def _activar_journal(con: sqlite3.Connection, ruta: Path) -> str:
 
             ultimo = "quedó en '" + str(modo) + "'"
         except sqlite3.OperationalError as error:
-            # Sólo se reintenta el choque de la conversión. Cualquier otro
-            # error operativo es real y debe salir sin disfrazarse.
+            # Sólo se reintenta el choque con otro que tiene la base.
+            # Cualquier otro error operativo es real y sale sin disfrazarse.
             if "locked" not in str(error).lower() and "busy" not in str(error).lower():
                 raise
 
@@ -390,12 +403,6 @@ def _activar_journal(con: sqlite3.Connection, ruta: Path) -> str:
         if intento + 1 < INTENTOS_JOURNAL:
             time.sleep(espera)
             espera = min(espera * 2, ESPERA_JOURNAL_MAXIMA_S)
-
-            # Puede que el otro proceso ya lo dejara listo.
-            modo = con.execute("PRAGMA journal_mode").fetchone()[0]
-
-            if str(modo).lower() == JOURNAL_MODE:
-                return str(modo)
 
     raise ErrorEstadoGlobal(
         "No se pudo poner la base '" + str(ruta) + "' en journal_mode="

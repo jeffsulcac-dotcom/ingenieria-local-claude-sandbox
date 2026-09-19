@@ -56,6 +56,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -285,6 +286,26 @@ def exigir_intacto(raiz: Path, identificador: str, antes: dict, etiqueta: str):
     assert not diferencias, (
         etiqueta + ": una orden rechazada modificó el estado del propietario "
         "vigente. Cambios: " + "; ".join(diferencias)
+    )
+
+
+def exigir_ficha_sin_marcas_falsas(ficha, antes_actualizado, antes_creado,
+                                   etiqueta: str):
+    """
+    Tras un rechazo, la ficha en memoria tampoco debe parecer escrita.
+
+    Si `persistir` dejase puesto el `actualizado_en` que calculó antes de
+    intentar la escritura, la ficha diría que se actualizó cuando no se
+    actualizó nada. Quien la tuviera en la mano —o quien la volcara a un
+    JSON— estaría propagando una marca de tiempo falsa.
+    """
+    assert ficha.actualizado_en == antes_actualizado, (
+        etiqueta + ": la ficha rechazada quedó con `actualizado_en` nuevo ("
+        + repr(antes_actualizado) + " -> " + repr(ficha.actualizado_en)
+        + "), como si la orden hubiera entrado."
+    )
+    assert ficha.creado_en == antes_creado, (
+        etiqueta + ": la ficha rechazada quedó con `creado_en` cambiado."
     )
 
 
@@ -567,10 +588,35 @@ def prueba_c_el_espejo_json_no_se_regenera_en_un_rechazo():
         antes_json = ruta_json.read_text(encoding="utf-8")
         antes = testigo(raiz, "T-0901")
 
+        # Se emite con una ficha concreta para poder mirarla DESPUÉS: no
+        # basta con que la base quede intacta, la ficha en memoria tampoco
+        # puede quedar con marcas de tiempo que sugieran que la orden entró.
+        rezagada = copy.deepcopy(vieja)
+        rezagada.ultimo_latido = "2020-01-01T00:00:00+00:00"
+
+        # Centinela inconfundible. `ahora_utc()` se trunca a segundos, así
+        # que comparar contra la marca real de la ficha no valdría: en una
+        # prueba rápida las dos caerían en el mismo segundo y una
+        # sobrescritura pasaría por idéntica.
+        rezagada.actualizado_en = "2020-01-01T00:00:00+00:00"
+        rezagada.creado_en = "2019-01-01T00:00:00+00:00"
+        marca_actualizado = rezagada.actualizado_en
+        marca_creado = rezagada.creado_en
+
         exigir_rechazo(
-            lambda: latido_rezagado(raiz, vieja),
+            lambda: nucleo.persistir(
+                raiz,
+                rezagada,
+                exigir_propietario=vieja.trabajador_id,
+                estados_admitidos={Estado.EN_EJECUCION},
+                exigir_generacion=vieja.generacion,
+            ),
             "latido rezagado",
             estado_global.MOTIVO_GENERACION_VENCIDA,
+        )
+
+        exigir_ficha_sin_marcas_falsas(
+            rezagada, marca_actualizado, marca_creado, "latido rezagado"
         )
 
         assert ruta_json.read_text(encoding="utf-8") == antes_json, (
@@ -1191,8 +1237,90 @@ def _cli(raiz: Path, *argumentos) -> subprocess.CompletedProcess:
     )
 
 
+def prueba_l2_el_journal_no_se_reconvierte_en_cada_apertura():
+    """
+    Abrir una base que YA está en WAL no vuelve a pedir la conversión.
+
+    Ésa es la mitigación que de verdad importa del arranque concurrente: la
+    conversión `delete` -> `wal` es el único momento en que una apertura
+    necesita un bloqueo exclusivo, y a partir de la segunda apertura no
+    hace ninguna falta. Si se pidiera igualmente, cada proceso que arranca
+    competiría por un bloqueo que no necesita.
+
+    Lo que se mide es el número de veces que se emite la sentencia, no un
+    tiempo: un tiempo dependería de la máquina y no probaría nada.
+
+    Lo que esta prueba NO cubre, y se dice aquí para no aparentar más de lo
+    que hay: el reintento acotado de `_activar_journal`. En Linux no se ha
+    conseguido reproducir un fallo de la conversión que el `busy_timeout`
+    no cubriera ya —medido: la conversión espera los 5 s completos antes de
+    rendirse—, así que ese reintento es una defensa declarada y NO
+    verificada. Si el modo de fallo existe, es en Windows donde aparecería,
+    y el gate de Windows es donde se sabrá.
+    """
+    print(" 13. una base ya en WAL no se reconvierte al abrirla:", end=" ")
+
+    raiz = crear_repositorio("wal_")
+
+    try:
+        # Primera apertura: la base no existe, hay que convertirla.
+        estado_global.inicializar_base(raiz)
+
+        ruta = estado_global.ruta_base(raiz)
+
+        con = estado_global.abrir(ruta)
+
+        try:
+            modo = str(con.execute("PRAGMA journal_mode").fetchone()[0])
+        finally:
+            con.close()
+
+        assert modo.lower() == estado_global.JOURNAL_MODE, (
+            "La base no quedó en WAL: '" + modo + "'."
+        )
+
+        # Aperturas siguientes: se cuentan las conversiones solicitadas.
+        #
+        # Se usa el rastreador de SQLite y no un parche sobre `execute`,
+        # porque `sqlite3.Connection` es un tipo inmutable de C. El
+        # rastreador ve la sentencia tal y como llega al motor.
+        conversiones = []
+        conectar = sqlite3.connect
+
+        def conectar_vigilado(*argumentos, **claves):
+            con_nueva = conectar(*argumentos, **claves)
+            con_nueva.set_trace_callback(
+                lambda sentencia: conversiones.append(str(sentencia))
+                if "journal_mode" in str(sentencia).lower()
+                and "=" in str(sentencia)
+                else None
+            )
+
+            return con_nueva
+
+        sqlite3.connect = conectar_vigilado
+
+        try:
+            for _ in range(5):
+                estado_global.abrir(ruta).close()
+        finally:
+            sqlite3.connect = conectar
+
+        assert not conversiones, (
+            "Una base que ya está en WAL pidió la conversión "
+            + str(len(conversiones)) + " vez/veces: " + repr(conversiones)
+            + ". Cada una compite por un bloqueo exclusivo que no hace falta."
+        )
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
 def prueba_m_codigo_de_salida_por_propiedad():
-    print(" 13. la CLI devuelve 4 al rechazar por propiedad:", end=" ")
+    print(" 14. la CLI devuelve 4 al rechazar por propiedad:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1269,7 +1397,7 @@ def prueba_m_codigo_de_salida_por_propiedad():
 # ----------------------------------------------------------------------
 
 def prueba_n_reanudar_respeta_una_toma_reciente():
-    print(" 14. `reanudar` no arrebata una tarea recién tomada:", end=" ")
+    print(" 15. `reanudar` no arrebata una tarea recién tomada:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1328,7 +1456,7 @@ def prueba_n_reanudar_respeta_una_toma_reciente():
 
 def prueba_o_estres_de_ordenes_rezagadas(rezagadas: int):
     print(
-        " 15. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
+        " 16. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
         "dueño vigente:",
         end=" ",
     )
@@ -1492,7 +1620,7 @@ def prueba_p_estres_concurrente(emisores: int, ordenes: int):
     órdenes entre. Una sola aceptada es un fallo, y se nombra cuál fue.
     """
     print(
-        " 16. estrés concurrente: " + str(emisores) + " procesos x "
+        " 17. estrés concurrente: " + str(emisores) + " procesos x "
         + str(ordenes) + " órdenes rezagadas:",
         end=" ",
     )
@@ -1607,6 +1735,7 @@ COMPROBACIONES = (
     prueba_j_una_sincronizacion_inocua_no_rompe_una_tarea_viva,
     prueba_k_el_ambito_se_refresca_cuando_la_tarea_deja_de_estar_viva,
     prueba_l_bootstrap_concurrente,
+    prueba_l2_el_journal_no_se_reconvierte_en_cada_apertura,
     prueba_m_codigo_de_salida_por_propiedad,
     prueba_n_reanudar_respeta_una_toma_reciente,
 )
