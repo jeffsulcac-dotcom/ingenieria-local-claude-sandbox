@@ -155,3 +155,86 @@ Pruebas:
 
 Estado:
 PREDIMENSIONAMIENTO_VIGA_RAPIDA = APROBADO
+
+## Predimensionamiento rápido — Columnas
+
+NO INTEGRADO. Trabajo preservado, no terminado.
+
+El módulo de columnas existía sin commit y sin integración. Se guardó tal
+cual, antes de iniciar el Supervisor, en la rama:
+
+wip/columnas-pre-supervisor
+
+Commit:
+12f2b41 - Preservar predimensionamiento de columnas antes del Supervisor
+
+Contenido exacto del commit:
+- modulos/predimensionamiento/columnas.py
+- pruebas/predimensionamiento/prueba_columna_rapida.py
+
+Lo que NO tiene:
+- ruta en la API
+- acceso desde la interfaz
+- pruebas de API
+
+La rama main no contiene ningún archivo de columnas.
+
+Su integración formal está registrada como tarea T-0002 y todavía no se
+ha ejecutado.
+
+Estado:
+PREDIMENSIONAMIENTO_COLUMNA = PRESERVADO_SIN_INTEGRAR
+
+## Supervisor de Desarrollo V1
+
+Primer componente de orquestación implementado.
+
+Permite que el desarrollo se ejecute de forma autónoma, trazable y
+reanudable, con Claude Code como trabajador, Git como estado y las pruebas
+como filtro.
+
+Componentes:
+- orquestacion/ingenieria_supervisor/tarea.py
+- orquestacion/ingenieria_supervisor/pruebas.py
+- orquestacion/ingenieria_supervisor/supervisor.py
+- orquestacion/ingenieria_supervisor/__main__.py
+- orquestacion/tareas/ (una ficha JSON por tarea, versionada en Git)
+- aplicacion/ingenieria_app/plantillas/desarrollo.html
+
+Características verificadas:
+- ficha de tarea autosuficiente: no depende del historial de ninguna sesión
+- escritura atómica de fichas: temporal, validación, reemplazo
+- corredor único de pruebas con subproceso aislado, tiempo límite y
+  PYTHONPATH controlado
+- una prueba se aprueba sólo con código de salida 0 Y marca PRUEBA_XXXX=OK
+- código de salida 0 sin marca se registra como INDETERMINADO, no aprobado
+- el Supervisor llega automáticamente como máximo a PROPUESTO
+- APROBADO exige siempre acción humana explícita
+- una decisión humana pendiente impide llegar a PROPUESTO
+- detección de solapamiento de ámbitos: un solo escritor por archivo
+- límite de intentos y bloqueo automático al agotarlos
+- recuperación tras cierre o apagón sin perder tareas ni historial
+- commit automático limitado a la ficha, dentro de la rama de la tarea,
+  nunca en main
+- tablero web de sólo lectura en /desarrollo
+
+Pruebas:
+- PRUEBA_SUPERVISOR=OK   (31 comprobaciones)
+- PRUEBA_API=OK          (12 comprobaciones)
+- PRUEBA_NUCLEO=OK
+- PRUEBA_VIGA_RAPIDA=OK
+
+Corredor único: 4 de 4 pruebas en OK.
+
+Verificación visual:
+- GET /desarrollo = 200
+- GET /api/desarrollo/tareas = 200
+- tablero sin ningún recurso externo ni CDN
+
+Fichas creadas, ambas en estado NUEVO y sin ejecutar:
+- T-0001 Auditoría y corrección normativa del predimensionamiento de vigas
+  (3 decisiones humanas registradas como pendientes)
+- T-0002 Integración del predimensionamiento rápido de columnas
+
+Estado:
+SUPERVISOR_V1 = IMPLEMENTADO_PENDIENTE_DE_REVISION

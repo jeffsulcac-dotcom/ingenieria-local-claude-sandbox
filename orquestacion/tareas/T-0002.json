@@ -1,0 +1,50 @@
+{
+  "id": "T-0002",
+  "titulo": "Integración del predimensionamiento rápido de columnas",
+  "objetivo": "Tomar el trabajo preservado en la rama wip/columnas-pre-supervisor y completar su integración formal utilizando el ciclo del Supervisor.",
+  "criterios_aceptacion": [
+    "Se preserva la lógica ya validada de columnas.py sin reescribirla sin motivo.",
+    "La API expone el cálculo de columna igual que el de viga.",
+    "La interfaz local permite acceder al cálculo de columna.",
+    "Se añaden pruebas de API para las rutas nuevas de columna.",
+    "prueba_columna_rapida.py pasa.",
+    "El predimensionamiento de vigas no se rompe: prueba_viga_rapida.py sigue pasando.",
+    "Todas las pruebas del repositorio quedan en OK.",
+    "ESTADO.md sólo se actualiza cuando la tarea quede aprobada."
+  ],
+  "ambito_archivos": [
+    "modulos/predimensionamiento/columnas.py",
+    "pruebas/predimensionamiento/prueba_columna_rapida.py",
+    "aplicacion/ingenieria_app/servidor.py",
+    "aplicacion/ingenieria_app/plantillas/*",
+    "pruebas/aplicacion/prueba_api.py"
+  ],
+  "pruebas_requeridas": [
+    "pruebas/predimensionamiento/prueba_columna_rapida.py",
+    "pruebas/aplicacion/prueba_api.py"
+  ],
+  "estado": "nuevo",
+  "rama": "tarea/T-0002",
+  "worktree": null,
+  "intentos": 0,
+  "max_intentos": 3,
+  "commit_inicial": "d0139ef",
+  "creado_en": "2026-09-19T02:12:23+00:00",
+  "actualizado_en": "2026-09-19T02:12:23+00:00",
+  "requiere_decision_humana": [],
+  "trabajador_id": null,
+  "pid": null,
+  "iniciado_en": null,
+  "ultimo_latido": null,
+  "ultima_falla": null,
+  "ejecuciones": [],
+  "historial": [
+    {
+      "fecha": "2026-09-19T02:12:23+00:00",
+      "estado_anterior": null,
+      "estado_nuevo": "nuevo",
+      "motivo": "Ficha creada.",
+      "origen": "humano"
+    }
+  ]
+}

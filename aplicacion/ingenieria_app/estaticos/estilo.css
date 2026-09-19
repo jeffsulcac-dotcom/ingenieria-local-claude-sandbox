@@ -572,3 +572,242 @@ select:focus {
     }
 
 }
+
+/* ==========================================================
+   SUPERVISOR DE DESARROLLO
+   ========================================================== */
+
+.panel-resumen {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+
+    gap: 10px;
+
+    margin-bottom: 40px;
+}
+
+.dato {
+    padding: 14px;
+
+    border: 1px solid var(--borde);
+    border-radius: 8px;
+
+    background: var(--panel);
+
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.dato-etiqueta {
+    color: var(--texto-secundario);
+    font-size: 10px;
+    letter-spacing: .06em;
+}
+
+.dato strong {
+    font-size: 24px;
+    font-weight: 500;
+}
+
+.marca-actualizacion {
+    color: #676c72;
+    font-size: 11px;
+}
+
+.lista-tareas {
+    margin-top: 20px;
+
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.tarea {
+    border: 1px solid var(--borde);
+    border-radius: 9px;
+
+    background: var(--panel);
+
+    padding: 18px 20px;
+}
+
+.tarea-cabecera {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+
+    gap: 14px;
+
+    margin-bottom: 16px;
+}
+
+.tarea-id {
+    margin-right: 12px;
+
+    color: #7d838a;
+    font-family: Consolas, monospace;
+    font-size: 12px;
+}
+
+.tarea-titulo {
+    font-size: 15px;
+    font-weight: 500;
+}
+
+.insignia {
+    padding: 4px 10px;
+
+    border: 1px solid var(--borde);
+    border-radius: 20px;
+
+    background: var(--panel-secundario);
+
+    color: var(--texto-secundario);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .08em;
+
+    white-space: nowrap;
+}
+
+.insignia-en_ejecucion {
+    border-color: #4a5a6d;
+    color: #8fb6db;
+}
+
+.insignia-propuesto {
+    border-color: #31583a;
+    color: #83c58e;
+}
+
+.insignia-requiere_revision {
+    border-color: #66572f;
+    color: #d7bc69;
+}
+
+.insignia-bloqueado {
+    border-color: #6b3a3a;
+    color: #d78d8d;
+}
+
+.insignia-aprobado {
+    border-color: #3f7a4d;
+    background: #152019;
+    color: #9bd8a6;
+}
+
+.tarea-datos {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+
+    gap: 2px 28px;
+}
+
+.fila-dato {
+    display: flex;
+    justify-content: space-between;
+    gap: 14px;
+
+    padding: 6px 0;
+
+    border-bottom: 1px solid #1f2225;
+
+    font-size: 12px;
+}
+
+.fila-dato > span:first-child {
+    color: var(--texto-secundario);
+}
+
+.fila-dato > span:last-child {
+    font-family: Consolas, monospace;
+    text-align: right;
+    word-break: break-all;
+}
+
+.pendiente {
+    color: #d7bc69;
+    font-weight: 600;
+}
+
+.bloque-decisiones,
+.bloque-falla {
+    margin-top: 16px;
+    padding-top: 14px;
+
+    border-top: 1px solid var(--borde);
+
+    color: var(--texto-secundario);
+    font-size: 12px;
+}
+
+.bloque-decisiones ul,
+.bloque-falla ul {
+    margin: 8px 0 0;
+    padding-left: 18px;
+
+    line-height: 1.65;
+}
+
+.bloque-falla {
+    color: #b4907f;
+}
+
+.actividad {
+    margin-top: 18px;
+
+    display: flex;
+    flex-direction: column;
+}
+
+.evento {
+    display: grid;
+    grid-template-columns: 170px 70px 230px 1fr;
+
+    gap: 14px;
+
+    padding: 9px 0;
+
+    border-bottom: 1px solid #1f2225;
+
+    color: var(--texto-secundario);
+    font-size: 11px;
+}
+
+.evento-fecha,
+.evento-tarea,
+.evento-cambio {
+    font-family: Consolas, monospace;
+}
+
+.evento-tarea {
+    color: var(--texto);
+}
+
+.evento-motivo {
+    color: #7d838a;
+}
+
+.evento-origen {
+    color: #5e636a;
+    font-family: Consolas, monospace;
+}
+
+
+@media (max-width: 1080px) {
+
+    .panel-resumen {
+        grid-template-columns: repeat(3, 1fr);
+    }
+
+    .tarea-datos {
+        grid-template-columns: 1fr;
+    }
+
+    .evento {
+        grid-template-columns: 1fr;
+        gap: 4px;
+    }
+
+}

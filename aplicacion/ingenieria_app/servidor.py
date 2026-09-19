@@ -11,8 +11,13 @@ from modulos.predimensionamiento.vigas import (
     predimensionar_viga_rapida,
 )
 
+from orquestacion.ingenieria_supervisor import supervisor as supervisor_desarrollo
+
 
 BASE = Path(__file__).resolve().parent
+
+# Raíz del repositorio, donde vive el estado del Supervisor.
+RAIZ = BASE.parents[1]
 
 app = FastAPI(
     title="Ingeniería Local",
@@ -91,6 +96,26 @@ async def api_predimensionamiento_viga(
         "advertencia":
             resultado.advertencia,
     }
+
+
+@app.get("/desarrollo", response_class=HTMLResponse)
+async def pagina_desarrollo(request: Request):
+    """Tablero de sólo lectura del Supervisor de Desarrollo."""
+    return plantillas.TemplateResponse(
+        request=request,
+        name="desarrollo.html",
+        context={},
+    )
+
+
+@app.get("/api/desarrollo/tareas")
+async def api_desarrollo_tareas():
+    """
+    Estado del Supervisor leído directamente de las fichas JSON.
+
+    No consulta PostgreSQL ni Redis: el estado vive en Git.
+    """
+    return supervisor_desarrollo.tablero(RAIZ)
 
 
 @app.get("/salud")

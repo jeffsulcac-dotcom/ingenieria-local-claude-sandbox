@@ -1,0 +1,66 @@
+{
+  "id": "T-0001",
+  "titulo": "Auditoría y corrección normativa del predimensionamiento rápido de vigas",
+  "objetivo": "Auditar el módulo actual de vigas contra el texto oficial aplicable de la RNE E.060 y corregir los supuestos que correspondan, antes de continuar usándolo como base del resto del sistema.",
+  "criterios_aceptacion": [
+    "Cada supuesto normativo del módulo queda contrastado contra el texto oficial de la RNE E.060, citando artículo y tabla.",
+    "Las tres decisiones humanas registradas quedan resueltas de forma explícita antes de proponer la tarea.",
+    "Si un supuesto resulta incorrecto, se corrige el módulo y se actualiza la prueba con los valores correctos.",
+    "prueba_viga_rapida.py pasa con los valores que la auditoría confirme como correctos.",
+    "Ninguna prueba existente del repositorio se rompe.",
+    "ESTADO.md sólo se actualiza cuando la tarea quede aprobada."
+  ],
+  "ambito_archivos": [
+    "modulos/predimensionamiento/vigas.py",
+    "pruebas/predimensionamiento/prueba_viga_rapida.py"
+  ],
+  "pruebas_requeridas": [
+    "pruebas/predimensionamiento/prueba_viga_rapida.py"
+  ],
+  "estado": "nuevo",
+  "rama": "tarea/T-0001",
+  "worktree": null,
+  "intentos": 0,
+  "max_intentos": 3,
+  "commit_inicial": "d0139ef",
+  "creado_en": "2026-09-19T02:12:23+00:00",
+  "actualizado_en": "2026-09-19T02:12:23+00:00",
+  "requiere_decision_humana": [
+    {
+      "clave": "D-1",
+      "descripcion": "El ancho mínimo sísmico se calcula hoy como max(0.25, 0.25*h). Debe verificarse contra el requisito real de la E.060 sobre ancho mínimo y sobre la relación ancho/peralte, que no coinciden necesariamente con ese cálculo.",
+      "resuelta": false,
+      "resolucion": null,
+      "resuelta_en": null
+    },
+    {
+      "clave": "D-2",
+      "descripcion": "cumple_relacion_luz_peralte compara hoy la luz contra 4 veces el peralte TOTAL. Debe verificarse cuál es la magnitud normativa correcta (luz libre y peralte efectivo, o peralte total).",
+      "resuelta": false,
+      "resolucion": null,
+      "resuelta_en": null
+    },
+    {
+      "clave": "D-3",
+      "descripcion": "El factor (0.4 + fy/700) se aplica hoy de forma general. Debe verificarse exactamente cuándo corresponde según la Tabla 9.1 de la E.060 y sus condiciones de aplicación.",
+      "resuelta": false,
+      "resolucion": null,
+      "resuelta_en": null
+    }
+  ],
+  "trabajador_id": null,
+  "pid": null,
+  "iniciado_en": null,
+  "ultimo_latido": null,
+  "ultima_falla": null,
+  "ejecuciones": [],
+  "historial": [
+    {
+      "fecha": "2026-09-19T02:12:23+00:00",
+      "estado_anterior": null,
+      "estado_nuevo": "nuevo",
+      "motivo": "Ficha creada.",
+      "origen": "humano"
+    }
+  ]
+}

@@ -13,3 +13,9 @@ starlette==1.6.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 uvicorn==0.53.0
+
+# Sólo para ejecutar las pruebas de la API.
+# El producto final no las necesita en tiempo de ejecución.
+certifi==2026.7.22
+httpcore==1.0.9
+httpx==0.28.1

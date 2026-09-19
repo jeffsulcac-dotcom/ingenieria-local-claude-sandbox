@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Desarrollo — Ingeniería Local</title>
+
+    <link
+        rel="stylesheet"
+        href="/estaticos/estilo.css"
+    >
+</head>
+
+<body>
+
+<header class="barra-superior">
+    <div>
+        <a class="enlace-marca" href="/">
+            <span class="marca">INGENIERÍA LOCAL</span>
+        </a>
+        <span class="version">supervisor de desarrollo</span>
+    </div>
+
+    <div class="estado-local">
+        <span class="punto"></span>
+        Modo local
+    </div>
+</header>
+
+
+<div class="estructura">
+
+    <aside class="lateral">
+
+        <div class="grupo">
+            <a class="opcion enlace-opcion" href="/">
+                Inicio
+            </a>
+        </div>
+
+        <div class="titulo-grupo">
+            DESARROLLO
+        </div>
+
+        <div class="opcion activa">
+            Supervisor
+        </div>
+
+        <div class="opcion deshabilitada">
+            Agentes
+        </div>
+
+        <div class="opcion deshabilitada">
+            Worktrees
+        </div>
+
+    </aside>
+
+
+    <main class="contenido">
+
+        <section class="bienvenida">
+
+            <div class="subtitulo">
+                DESARROLLO
+            </div>
+
+            <h1>
+                Supervisor de Desarrollo
+            </h1>
+
+            <p>
+                Estado real de las tareas, leído de las fichas versionadas
+                en Git. Este tablero es de sólo lectura.
+            </p>
+
+        </section>
+
+
+        <section class="panel-resumen" id="resumen">
+
+            <div class="dato">
+                <span class="dato-etiqueta">Agentes activos</span>
+                <strong id="dato-agentes">—</strong>
+            </div>
+
+            <div class="dato">
+                <span class="dato-etiqueta">Tareas totales</span>
+                <strong id="dato-totales">—</strong>
+            </div>
+
+            <div class="dato">
+                <span class="dato-etiqueta">En ejecución</span>
+                <strong id="dato-ejecucion">—</strong>
+            </div>
+
+            <div class="dato">
+                <span class="dato-etiqueta">Propuestas</span>
+                <strong id="dato-propuestas">—</strong>
+            </div>
+
+            <div class="dato">
+                <span class="dato-etiqueta">Requieren revisión</span>
+                <strong id="dato-revision">—</strong>
+            </div>
+
+            <div class="dato">
+                <span class="dato-etiqueta">Bloqueadas</span>
+                <strong id="dato-bloqueadas">—</strong>
+            </div>
+
+            <div class="dato">
+                <span class="dato-etiqueta">Aprobadas</span>
+                <strong id="dato-aprobadas">—</strong>
+            </div>
+
+        </section>
+
+
+        <section class="espacio-superior">
+
+            <div class="encabezado-espacio">
+                <div>
+                    <div class="subtitulo">TAREAS</div>
+                    <h3 id="titulo-tareas">Cargando…</h3>
+                </div>
+
+                <span class="marca-actualizacion" id="actualizado">—</span>
+            </div>
+
+            <div class="lista-tareas" id="tareas"></div>
+
+        </section>
+
+
+        <section class="espacio">
+
+            <div class="subtitulo">ACTIVIDAD RECIENTE</div>
+
+            <div class="actividad" id="actividad"></div>
+
+        </section>
+
+    </main>
+
+</div>
+
+
+<footer>
+
+    <span>Motor local activo</span>
+
+    <span>•</span>
+
+    <span>Estado en Git</span>
+
+    <span>•</span>
+
+    <span>Español</span>
+
+</footer>
+
+
+<script>
+/* Tablero de sólo lectura. Sin dependencias externas ni Internet. */
+
+const INTERVALO_MS = 5000;
+
+const ETIQUETAS_ESTADO = {
+    "nuevo": "NUEVO",
+    "en_ejecucion": "EN EJECUCIÓN",
+    "propuesto": "PROPUESTO",
+    "requiere_revision": "REQUIERE REVISIÓN",
+    "bloqueado": "BLOQUEADO",
+    "reabierto": "REABIERTO",
+    "aprobado": "APROBADO",
+    "rechazado": "RECHAZADO"
+};
+
+function escapar(valor) {
+    if (valor === null || valor === undefined || valor === "") {
+        return "—";
+    }
+
+    return String(valor)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+}
+
+function fecha(texto) {
+    if (!texto) {
+        return "—";
+    }
+
+    const valor = new Date(texto);
+
+    if (isNaN(valor.getTime())) {
+        return escapar(texto);
+    }
+
+    return valor.toLocaleString("es-PE");
+}
+
+function fila(etiqueta, valor) {
+    return '<div class="fila-dato">'
+        + '<span>' + etiqueta + '</span>'
+        + '<span>' + valor + '</span>'
+        + '</div>';
+}
+
+function dibujarTarea(tarea) {
+    const estado = ETIQUETAS_ESTADO[tarea.estado] || tarea.estado.toUpperCase();
+
+    let bloque = '<article class="tarea" data-estado="' + escapar(tarea.estado) + '">';
+
+    bloque += '<div class="tarea-cabecera">'
+        + '<div>'
+        + '<span class="tarea-id">' + escapar(tarea.id) + '</span>'
+        + '<span class="tarea-titulo">' + escapar(tarea.titulo) + '</span>'
+        + '</div>'
+        + '<span class="insignia insignia-' + escapar(tarea.estado) + '">'
+        + escapar(estado) + '</span>'
+        + '</div>';
+
+    bloque += '<div class="tarea-datos">';
+
+    bloque += fila("Rama", escapar(tarea.rama));
+    bloque += fila("Worktree", escapar(tarea.worktree));
+    bloque += fila(
+        "Intentos",
+        escapar(tarea.intentos) + " / " + escapar(tarea.max_intentos)
+    );
+    bloque += fila(
+        "Pruebas",
+        escapar(tarea.pruebas_ok) + " / " + escapar(tarea.pruebas_total)
+    );
+    bloque += fila("Última actualización", fecha(tarea.actualizado_en));
+    bloque += fila("Trabajador", escapar(tarea.trabajador_id));
+    bloque += fila("PID", escapar(tarea.pid));
+    bloque += fila("Último latido", fecha(tarea.ultimo_latido));
+
+    const pendientes = tarea.decisiones_pendientes || [];
+
+    bloque += fila(
+        "Decisión humana",
+        pendientes.length > 0
+            ? '<span class="pendiente">PENDIENTE (' + pendientes.length + ')</span>'
+            : (tarea.decisiones_totales > 0 ? "resueltas" : "—")
+    );
+
+    bloque += '</div>';
+
+    if (pendientes.length > 0) {
+        bloque += '<div class="bloque-decisiones"><ul>';
+
+        pendientes.forEach(function (decision) {
+            bloque += '<li><strong>' + escapar(decision.clave) + '</strong> · '
+                + escapar(decision.descripcion) + '</li>';
+        });
+
+        bloque += '</ul></div>';
+    }
+
+    if (tarea.ultima_falla) {
+        bloque += '<div class="bloque-falla">'
+            + '<div class="subtitulo">ÚLTIMA FALLA · '
+            + fecha(tarea.ultima_falla.fecha) + '</div><ul>';
+
+        (tarea.ultima_falla.problemas || []).forEach(function (problema) {
+            bloque += '<li>' + escapar(problema) + '</li>';
+        });
+
+        bloque += '</ul></div>';
+    }
+
+    bloque += '</article>';
+
+    return bloque;
+}
+
+function dibujar(datos) {
+    const resumen = datos.resumen;
+
+    document.getElementById("dato-agentes").textContent = resumen.agentes_activos;
+    document.getElementById("dato-totales").textContent = resumen.totales;
+    document.getElementById("dato-ejecucion").textContent = resumen.en_ejecucion;
+    document.getElementById("dato-propuestas").textContent = resumen.propuestas;
+    document.getElementById("dato-revision").textContent = resumen.requieren_revision;
+    document.getElementById("dato-bloqueadas").textContent = resumen.bloqueadas;
+    document.getElementById("dato-aprobadas").textContent = resumen.aprobadas;
+
+    const titulo = document.getElementById("titulo-tareas");
+
+    titulo.textContent = resumen.totales === 0
+        ? "Todavía no hay ninguna ficha de tarea"
+        : resumen.totales + (resumen.totales === 1 ? " tarea registrada" : " tareas registradas");
+
+    document.getElementById("actualizado").textContent =
+        "Actualizado: " + fecha(datos.generado_en);
+
+    const contenedor = document.getElementById("tareas");
+
+    if (datos.tareas.length === 0) {
+        contenedor.innerHTML = '<div class="vacio">'
+            + 'Las fichas de tarea viven en orquestacion/tareas y se '
+            + 'versionan en Git.</div>';
+    } else {
+        contenedor.innerHTML = datos.tareas.map(dibujarTarea).join("");
+    }
+
+    const actividad = document.getElementById("actividad");
+
+    if (!datos.actividad || datos.actividad.length === 0) {
+        actividad.innerHTML = '<div class="vacio">Sin actividad registrada.</div>';
+    } else {
+        actividad.innerHTML = datos.actividad.map(function (evento) {
+            return '<div class="evento">'
+                + '<span class="evento-fecha">' + fecha(evento.fecha) + '</span>'
+                + '<span class="evento-tarea">' + escapar(evento.tarea) + '</span>'
+                + '<span class="evento-cambio">'
+                + escapar(evento.estado_anterior) + ' → '
+                + escapar(evento.estado_nuevo) + '</span>'
+                + '<span class="evento-motivo">'
+                + '<span class="evento-origen">[' + escapar(evento.origen)
+                + ']</span> ' + escapar(evento.motivo) + '</span>'
+                + '</div>';
+        }).join("");
+    }
+
+    if (datos.fichas_ilegibles && datos.fichas_ilegibles.length > 0) {
+        const aviso = datos.fichas_ilegibles.map(function (error) {
+            return escapar(error.archivo) + ": " + escapar(error.motivo);
+        }).join("<br>");
+
+        contenedor.innerHTML =
+            '<div class="mensaje-tecnico aviso">Fichas ilegibles<br>'
+            + aviso + '</div>' + contenedor.innerHTML;
+    }
+}
+
+function consultar() {
+    fetch("/api/desarrollo/tareas", { cache: "no-store" })
+        .then(function (respuesta) {
+            if (!respuesta.ok) {
+                throw new Error("Respuesta " + respuesta.status);
+            }
+            return respuesta.json();
+        })
+        .then(dibujar)
+        .catch(function (error) {
+            document.getElementById("actualizado").textContent =
+                "Sin conexión con el motor local: " + error.message;
+        });
+}
+
+consultar();
+setInterval(consultar, INTERVALO_MS);
+</script>
+
+
+</body>
+</html>
