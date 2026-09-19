@@ -32,9 +32,14 @@ Desde A3.1 este módulo sí implementa la TOMA ATÓMICA de una tarea
 BEGIN IMMEDIATE, resuelto por `rowcount`, que garantiza un único ganador
 entre trabajadores concurrentes.
 
-Sigue sin implementar: latidos automáticos, expiración de trabajadores,
-detección de trabajadores muertos y recuperación automática de tareas
-abandonadas. Eso queda para A3.2/B.
+Eso cubre la CONCESIÓN de la toma, no su propiedad posterior:
+`actualizar_tarea` sigue siendo un UPDATE incondicional y las demás
+operaciones del ciclo lo usan a través de `supervisor.persistir`. Una de
+ellas que llegue con una lectura vieja puede sobrescribir al ganador.
+
+Sigue sin implementar: propiedad efectiva del claim, latidos automáticos,
+expiración de trabajadores, detección de trabajadores muertos y
+recuperación automática de tareas abandonadas. Eso queda para A3.2/B.
 """
 
 from __future__ import annotations

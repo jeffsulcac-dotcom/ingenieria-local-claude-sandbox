@@ -30,7 +30,12 @@ nada. Por eso:
    Si el arnés no produjera dobles tomas con esa implementación, el verde
    de las demás comprobaciones no significaría nada.
 
-Todas las esperas llevan tiempo límite. Ningún bucle es infinito.
+Todas las esperas de esta prueba llevan tiempo límite, y todas quedan muy
+por debajo del que el corredor único concede al archivo, para que un
+cuelgue lo diagnostique la propia prueba en lugar de morir sin explicación.
+Ningún bucle es infinito. (Las órdenes de Git que el Supervisor lanza por
+su cuenta, dentro de `estado_global`, no llevan tiempo límite: eso viene
+de A2 y no lo cambia esta prueba.)
 
 Ejecución por omisión: pensada para terminar muy por debajo del tiempo
 límite del corredor único (120 s). Para la corrida de estrés:
@@ -79,10 +84,16 @@ RONDAS_HILOS = 60
 # Contendientes de la carrera entre conexiones.
 HILOS_EN_CARRERA = 8
 
-# Ninguna espera es indefinida.
-ESPERA_BARRERA_S = 60
-ESPERA_RESULTADO_S = 120
-ESPERA_CIERRE_S = 20
+# Ninguna espera es indefinida, y todas quedan MUY por debajo del tiempo
+# límite del corredor único (120 s). Si igualaran ese límite, un cuelgue
+# lo mataría el corredor sin decir dónde: así lo diagnostica la propia
+# prueba, nombrando la ronda y el contendiente que faltaron. Los tiempos
+# medidos son de milisegundos, así que el margen es enorme.
+ESPERA_BARRERA_S = 20
+ESPERA_RESULTADO_S = 30
+ESPERA_CIERRE_S = 15
+ESPERA_SUBPROCESO_S = 30
+ESPERA_GIT_S = 30
 
 # Ventana que la toma ingenua deja abierta entre leer y escribir.
 VENTANA_INGENUA_S = 0.01
@@ -138,6 +149,7 @@ def _git(raiz: Path, *argumentos: str) -> subprocess.CompletedProcess:
         text=True,
         encoding="utf-8",
         errors="replace",
+        timeout=ESPERA_GIT_S,
     )
 
 
@@ -518,9 +530,13 @@ def prueba_a_toma_normal():
         assert fila["trabajador_id"] == "equipo/solo/1", fila
         assert fila["pid"] == os.getpid(), fila["pid"]
 
-        # Lo que `tomar` devuelve es exactamente lo que la transacción
-        # confirmó, no una relectura posterior que otro pudiera haber
-        # cambiado: la ficha y la fila dicen lo mismo, campo por campo.
+        # La ficha devuelta y la fila de la base dicen lo mismo, campo por
+        # campo. Sin competencia esto sólo comprueba coherencia, no de
+        # dónde salió la lectura: que `tomar` lea la fila DENTRO de su
+        # transacción, y no después, es una propiedad que sólo se distingue
+        # con otro proceso escribiendo en medio, y provocar esa ventana
+        # exigiría instrumentar el código de producción. Queda comprobado
+        # lo que aquí se puede comprobar, ni una palabra más.
         for columna in ("estado", "trabajador_id", "pid", "iniciado_en",
                         "ultimo_latido", "rama", "commit_inicial"):
             devuelto = getattr(ficha, columna)
@@ -1248,7 +1264,7 @@ def prueba_h_proceso_nuevo_lee_al_propietario():
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=60,
+            timeout=ESPERA_SUBPROCESO_S,
         )
 
         assert lectura.returncode == 0, lectura.stderr
@@ -1349,7 +1365,7 @@ def prueba_i_la_toma_sobrevive_al_apagon():
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=120,
+            timeout=ESPERA_SUBPROCESO_S,
         )
 
         assert muerte.returncode == 9, (
@@ -1409,7 +1425,7 @@ def _cli(raiz: Path, *argumentos) -> subprocess.CompletedProcess:
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=120,
+        timeout=ESPERA_SUBPROCESO_S,
     )
 
 
@@ -1482,6 +1498,10 @@ def prueba_j_integridad_sqlite():
     ejecutaron sobre SUS bases antes de borrarlas. En ese orden la
     comprobación vale igual ejecutada sola que dentro de la tanda completa.
     """
+    # Cuántas bases ajenas se habían revisado antes de entrar aquí: es lo
+    # que permite exigir un piso que no dependa de la propia comprobación.
+    ajenas = METRICAS["INTEGRITY_CHECKS"]
+
     raiz = crear_repositorio()
 
     try:
@@ -1522,10 +1542,19 @@ def prueba_j_integridad_sqlite():
         borrar(raiz)
 
     # Y ninguna de las bases que esta ejecución sometió a carreras quedó
-    # dañada. La de aquí arriba ya cuenta, así que el mínimo se cumple
-    # aunque esta comprobación se ejecute sola.
-    assert METRICAS["INTEGRITY_CHECKS"] > 0, (
-        "No se comprobó la integridad de ninguna base."
+    # dañada. Cuando se corre la tanda entera, los bloques de carrera
+    # anteriores tienen que haber dejado sus propias comprobaciones: si no
+    # las dejaron, es que no llegaron a ejecutarse y este cero no valdría
+    # nada. Ejecutada sola, no hay bloques anteriores que exigir.
+    if INFORMES:
+        assert ajenas >= len(INFORMES), (
+            "Hubo " + str(len(INFORMES)) + " bloques de carrera pero sólo "
+            + str(ajenas) + " bases revisadas: alguno no comprobó su "
+            "integridad."
+        )
+
+    assert METRICAS["INTEGRITY_CHECKS"] > ajenas, (
+        "Esta comprobación no revisó ninguna base."
     )
     assert METRICAS["INTEGRITY_FAILURES"] == 0, METRICAS
 
