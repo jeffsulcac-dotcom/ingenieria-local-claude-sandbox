@@ -1456,7 +1456,7 @@ def prueba_n_reanudar_respeta_una_toma_reciente():
 
 def prueba_o_estres_de_ordenes_rezagadas(rezagadas: int):
     print(
-        " 22. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
+        " 23. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
         "dueño vigente:",
         end=" ",
     )
@@ -1633,6 +1633,89 @@ def prueba_u_la_toma_graba_el_ambito_que_valido():
     print("OK")
 
 
+def prueba_u2_el_ambito_vigente_no_miente_al_trabajador():
+    """
+    Un trabajador nunca cree poseer lo que la base no le concedió.
+
+    La guarda de ámbito sólo estaba a medias, y lo encontró la auditoría:
+    la base se negaba a grabar el ámbito nuevo de una tarea viva —correcto—
+    pero `cargar` seguía devolviendo el del JSON. Reproducido: se ensanchaba
+    el ámbito de la tarea viva, el trabajador veía el ámbito ancho, la base
+    seguía con el estrecho, y otra tarea tomaba legítimamente la parte
+    nueva. Dos escritores sobre el mismo archivo.
+
+    La ficha lleva ahora los dos datos por separado, y cada uno dice la
+    verdad de lo suyo: `ambito_archivos` es lo DECLARADO y se aplicará
+    cuando la tarea deje de estar viva; `ambito_vigente` es lo CONCEDIDO y
+    es lo único que cuenta para la regla de un solo escritor.
+
+    Que estén separados no es un capricho: pisar el declarado con el
+    vigente hacía que `persistir`, al regenerar el espejo, borrara del JSON
+    la declaración que una persona acababa de escribir. Se comprobó
+    rompiéndolo.
+    """
+    print(" 17. el ámbito vigente no le miente al trabajador:", end=" ")
+
+    raiz = crear_repositorio()
+
+    try:
+        ficha_minima(raiz, "T-0901", ambito_archivos=["modulos/comun/uno.py"])
+        ficha_minima(raiz, "T-0902", ambito_archivos=["modulos/comun/dos.py"])
+
+        nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+
+        # Se ENSANCHA el ámbito de la tarea viva para invadir a la otra.
+        _reescribir_ambito(
+            raiz, "T-0901", ["modulos/comun/uno.py", "modulos/comun/dos.py"]
+        )
+
+        ficha = nucleo.cargar(raiz, "T-0901")
+
+        assert ficha.ambito_vigente == ["modulos/comun/uno.py"], (
+            "La ficha no informa del ámbito realmente concedido: "
+            + repr(ficha.ambito_vigente)
+        )
+        assert set(ficha.ambito_archivos) == {
+            "modulos/comun/uno.py",
+            "modulos/comun/dos.py",
+        }, "La declaración del JSON tiene que conservarse, no borrarse."
+
+        # El espejo JSON conserva lo que la persona escribió.
+        import json
+
+        espejo = json.loads(
+            fichas.ruta_ficha(raiz, "T-0901").read_text(encoding="utf-8")
+        )
+
+        assert set(espejo["ambito_archivos"]) == {
+            "modulos/comun/uno.py",
+            "modulos/comun/dos.py",
+        }, "Una operación posterior borró del JSON la declaración pendiente."
+
+        # T-0902 conserva lo suyo: T-0901 nunca llegó a poseerlo.
+        nucleo.tomar(raiz, "T-0902", trabajador_id="worker-B")
+
+        assert fila_de(raiz, "T-0902")["trabajador_id"] == "worker-B"
+        assert fila_de(raiz, "T-0901")["ambito_archivos"] == [
+            "modulos/comun/uno.py"
+        ]
+
+        # Y la CLI lo avisa, en vez de dejar que alguien lo descubra solo.
+        salida = _cli(raiz, "ver", "T-0901")
+
+        assert salida.returncode == 0, salida.stdout + salida.stderr
+        assert "ámbito distinto del vigente" in salida.stdout, (
+            "`ver` no avisa de que la ficha declara un ámbito que no está "
+            "en vigor:\n" + salida.stdout
+        )
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
 def prueba_v_reordenar_el_ambito_no_congela_nada():
     """
     Reordenar los patrones no es cambiar el ámbito.
@@ -1643,7 +1726,7 @@ def prueba_v_reordenar_el_ambito_no_congela_nada():
     congelaría toda la definición y bloquearía de paso cualquier arreglo
     que viajara en la misma edición.
     """
-    print(" 17. reordenar el ámbito no congela la definición:", end=" ")
+    print(" 18. reordenar el ámbito no congela la definición:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1700,7 +1783,7 @@ def prueba_w_el_ambito_congelado_no_pide_el_bloqueo_de_escritura():
     de toda la base para no escribir nada; bajo concurrencia eso convierte
     una consulta en una espera que acaba en "database is locked".
     """
-    print(" 18. una consulta sobre tarea congelada no pide el candado:", end=" ")
+    print(" 19. una consulta sobre tarea congelada no pide el candado:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1778,7 +1861,7 @@ def prueba_r_la_generacion_no_sale_de_sqlite():
     podía volver a hacer indistinguibles dos ejecuciones, que es justo el
     problema ABA que la columna existe para cerrar.
     """
-    print(" 19. la generación no se puede falsificar desde el JSON:", end=" ")
+    print(" 20. la generación no se puede falsificar desde el JSON:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1883,7 +1966,7 @@ def prueba_s_orden_humana_rezagada_no_revierte_una_transicion():
     Lo cierra la tercera precondición: la escritura exige que la fila siga
     en el estado que tenía cuando se leyó.
     """
-    print(" 20. una orden humana rezagada no revierte el ciclo:", end=" ")
+    print(" 21. una orden humana rezagada no revierte el ciclo:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1937,7 +2020,7 @@ def prueba_t_el_ambito_congelado_se_informa():
     función importante produzca un resultado visible y verificable, y un
     cambio en espera es justo eso.
     """
-    print(" 21. el ámbito congelado se informa, no se disimula:", end=" ")
+    print(" 22. el ámbito congelado se informa, no se disimula:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2069,7 +2152,7 @@ def prueba_p_estres_concurrente(emisores: int, ordenes: int):
     órdenes entre. Una sola aceptada es un fallo, y se nombra cuál fue.
     """
     print(
-        " 23. estrés concurrente: " + str(emisores) + " procesos x "
+        " 24. estrés concurrente: " + str(emisores) + " procesos x "
         + str(ordenes) + " órdenes rezagadas:",
         end=" ",
     )
@@ -2188,6 +2271,7 @@ COMPROBACIONES = (
     prueba_m_codigo_de_salida_por_propiedad,
     prueba_n_reanudar_respeta_una_toma_reciente,
     prueba_u_la_toma_graba_el_ambito_que_valido,
+    prueba_u2_el_ambito_vigente_no_miente_al_trabajador,
     prueba_v_reordenar_el_ambito_no_congela_nada,
     prueba_w_el_ambito_congelado_no_pide_el_bloqueo_de_escritura,
     prueba_r_la_generacion_no_sale_de_sqlite,

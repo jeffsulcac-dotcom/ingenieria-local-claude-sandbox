@@ -304,6 +304,24 @@ def mostrar_ficha(raiz: Path, identificador: str) -> int:
     _linea("PID", ficha.pid)
     _linea("Último latido", ficha.ultimo_latido)
 
+    # Si la ficha declara un ámbito que la base no aplicó por estar la tarea
+    # viva, hay que decirlo aquí: quien trabaje la tarea posee lo que la
+    # base concedió, no lo que diga el archivo que acaba de editar.
+    if (
+        ficha.ambito_vigente is not None
+        and set(ficha.ambito_vigente) != set(ficha.ambito_archivos)
+    ):
+        print("")
+        print("  AVISO: la ficha declara un ámbito distinto del vigente.")
+        print("      Vigente (lo que la base concedió y lo único que cuenta")
+        print("      para la regla de un solo escritor):")
+        for patron in ficha.ambito_vigente:
+            print("          · " + patron)
+        print("      Declarado en el JSON, en espera de que la tarea deje de")
+        print("      estar viva:")
+        for patron in ficha.ambito_archivos:
+            print("          · " + patron)
+
     print("")
     print("  Objetivo:")
     print("      " + (ficha.objetivo or "—"))

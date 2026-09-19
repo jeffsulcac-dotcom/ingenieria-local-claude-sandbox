@@ -202,6 +202,17 @@ class Ficha:
     # entonces no se exige ningún estado: es lo que hacía V1.
     estado_leido: Estado | None = field(default=None, repr=False)
 
+    # A3.2 — ámbito que la base tiene CONCEDIDO a esta tarea.
+    #
+    # Tampoco se serializa. Normalmente coincide con `ambito_archivos`; si
+    # difieren, es que la ficha declara un ámbito que la base se negó a
+    # aplicar por estar la tarea viva. El que manda para la regla de un solo
+    # escritor es éste: se posee lo que la base concedió, no lo que un
+    # archivo del árbol de trabajo diga.
+    #
+    # `None` significa "ficha no leída de la base".
+    ambito_vigente: list[str] | None = field(default=None, repr=False)
+
     # ------------------------------------------------------------------
     # Decisiones humanas
     # ------------------------------------------------------------------

@@ -504,6 +504,25 @@ Tres detalles que costaron una ronda de auditoría cada uno:
 Y el resultado se informa: un ámbito congelado NO se cuenta como "sin
 cambios", que le diría al usuario justo lo contrario de lo que pasó.
 
+**Declarado y vigente son dos cosas distintas.** La ficha lleva los dos:
+
+- `ambito_archivos` es lo que el JSON DECLARA. Se conserva tal cual y se
+  aplicará cuando la tarea deje de estar viva.
+- `ambito_vigente` es lo que la base CONCEDIÓ. Es lo único que cuenta para
+  la regla de un solo escritor, y `ver` avisa cuando difieren.
+
+Hacía falta separarlos porque la guarda estaba a medias: la base se negaba
+a grabar el ámbito nuevo de una tarea viva, pero `cargar` seguía
+devolviendo el del JSON, así que el trabajador creía poseer archivos que
+nadie le había concedido. Reproducido: se ensanchaba el ámbito de la tarea
+viva, otra tarea tomaba legítimamente la parte nueva, y quedaban dos
+escritores sobre el mismo archivo.
+
+Y hacía falta que fueran DOS campos, no uno pisando al otro: pisar el
+declarado con el vigente hacía que `persistir`, al regenerar el espejo,
+borrara del JSON la declaración que una persona acababa de escribir. El
+cambio no quedaba en espera, desaparecía. Se comprobó rompiéndolo.
+
 **Bootstrap concurrente.** Dos carreras, las dos reproducidas y las dos
 corregidas:
 

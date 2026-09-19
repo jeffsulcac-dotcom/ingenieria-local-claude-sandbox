@@ -908,6 +908,20 @@ def aplicar_fila(ficha: Ficha, fila: dict) -> Ficha:
     ficha.ultima_falla = fila.get("ultima_falla")
     ficha.commit_inicial = fila.get("commit_inicial")
     ficha.generacion = int(fila.get("generacion") or 0)
+
+    # El ámbito VIGENTE, que es el grabado, viaja aparte del DECLARADO (A3.2).
+    #
+    # No se pisa `ambito_archivos` con el valor de la base, y el motivo se
+    # descubrió rompiéndolo: `persistir` regenera el espejo JSON a partir de
+    # la ficha, así que pisarlo hacía que la primera orden posterior borrara
+    # del archivo la declaración que una persona acababa de escribir. El
+    # cambio no quedaba en espera: desaparecía.
+    #
+    # Con los dos campos separados, cada uno dice la verdad de lo suyo:
+    # `ambito_archivos` es lo que la ficha DECLARA y lo que se sincronizará
+    # cuando la tarea deje de estar viva; `ambito_vigente` es lo que la base
+    # CONCEDIÓ y lo único que la regla de un solo escritor reconoce.
+    ficha.ambito_vigente = list(fila.get("ambito_archivos") or [])
     ficha.ejecuciones = list(fila.get("ejecuciones") or [])
 
     ficha.requiere_decision_humana = fusionar_decisiones(
