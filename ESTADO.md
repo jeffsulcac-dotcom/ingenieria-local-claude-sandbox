@@ -596,7 +596,7 @@ Evidencia medida en Linux (Python 3.11.15):
 - Coste en Git: 105 invocaciones en el proceso padre, 21 de ellas
   `rev-parse --git-common-dir` (una por repositorio temporal), frente a las
   439 y 355 de antes de memorizarlo.
-- Mutaciones: 23 de 23 detectadas por la batería. La del bootstrap
+- Mutaciones: 25 de 25 detectadas por la batería. La del bootstrap
   reprodujo el error original literal ("table tareas already exists").
 
 Auditoría adversarial: 8 revisores de sólo lectura sobre copias protegidas.
@@ -638,7 +638,13 @@ introducidas por las propias correcciones, y también están cerradas:
 - la generación no tenía salida legible por máquina (bajo);
 - borrar del JSON una decisión humana PENDIENTE le quitaba el freno a una
   tarea viva, desde una orden de sólo lectura: la misma clase que el
-  ámbito, en otro campo (medio).
+  ámbito, en otro campo (medio);
+- `diagnostico` metía en la misma lista una definición que todavía no se ha
+  aplicado y otra que NO SE VA A aplicar mientras la tarea siga viva, lo
+  que deja al operador esperando un refresco que no va a llegar (bajo);
+- la cuarta puerta del testigo de propiedad, el veto de
+  `actualizar_si_propietario`, era la única sin prueba: estaba puesta, pero
+  la batería no se enteraba si alguien la quitaba (bajo).
 
 Y una equivocación propia, corregida con la medición delante: se retiró el
 reintento de la conversión a WAL por considerarlo no verificado, y la

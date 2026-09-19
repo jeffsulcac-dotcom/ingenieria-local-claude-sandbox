@@ -2534,6 +2534,30 @@ def prueba_r_la_generacion_no_sale_de_sqlite():
             "ciclo podría reescribirla con lo que trajera su ficha."
         )
 
+        # (h) Tampoco la escritura condicionada del ciclo, que es la última
+        #     de las cuatro puertas y la que quedaba sin red.
+        con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+        try:
+            with estado_global.transaccion(con):
+                estado_global.actualizar_si_propietario(
+                    con,
+                    "T-0901",
+                    {"generacion": 321},
+                    generacion=tomada.generacion,
+                    momento="2030-01-01T00:00:00+00:00",
+                )
+        except estado_global.ErrorEstadoGlobal:
+            pass
+        else:
+            raise AssertionError(
+                "`actualizar_si_propietario` aceptó escribir la generación."
+            )
+        finally:
+            con.close()
+
+        assert fila_de(raiz, "T-0901")["generacion"] == tomada.generacion
+
         comprobar_integridad(raiz)
     finally:
         borrar(raiz)
@@ -2723,6 +2747,22 @@ def prueba_t_el_ambito_congelado_se_informa():
         )
         assert congelados[0]["estado"] == str(Estado.EN_EJECUCION)
         assert "no se aplica" in congelados[0]["detalle"]
+
+        # Y el diagnóstico tampoco puede confundir las dos cosas: una
+        # definición que todavía no se ha aplicado y una que NO SE VA A
+        # aplicar hasta que la tarea deje de estar viva son distintas, y
+        # meterlas en la misma lista deja al operador esperando un refresco
+        # que no va a llegar.
+        parte = estado_global.diagnostico(raiz)
+
+        assert parte["congeladas"] == ["T-0901"], (
+            "El diagnóstico no señala la definición congelada: "
+            + repr(parte.get("congeladas"))
+        )
+        assert "T-0901" not in parte["desactualizadas"], (
+            "Una definición congelada se informa como simplemente "
+            "desactualizada, que sugiere que se aplicará sola enseguida."
+        )
 
         comprobar_integridad(raiz)
     finally:

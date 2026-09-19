@@ -267,6 +267,10 @@ def mostrar_diagnostico(raiz: Path) -> int:
         if informe["desactualizadas"]
         else "ninguna",
     )
+    _linea(
+        "Definición congelada (tarea viva)",
+        ", ".join(informe.get("congeladas") or []) or "ninguna",
+    )
 
     if informe["fichas_ilegibles"]:
         print("")

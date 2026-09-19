@@ -2116,6 +2116,8 @@ def diagnostico(raiz: Path) -> dict:
         "fichas_ilegibles": [],
         "sin_importar": [],
         "desactualizadas": [],
+        # Definiciones que NO se aplicarán mientras la tarea siga viva.
+        "congeladas": [],
     }
 
     try:
@@ -2203,11 +2205,26 @@ def diagnostico(raiz: Path) -> dict:
         informe["sin_importar"] = [
             ficha.id for ficha in fichas if ficha.id not in registradas
         ]
-        informe["desactualizadas"] = [
-            ficha.id
+        # Una definición que no se ha aplicado y una que NO SE VA A aplicar
+        # hasta que la tarea deje de estar viva no son lo mismo, y meterlas
+        # en la misma lista dejaba al operador esperando un refresco que no
+        # iba a llegar. Se separan.
+        pendientes = [
+            ficha
             for ficha in fichas
             if ficha.id in registradas
             and registradas[ficha.id]["definicion_hash"] != hash_definicion(ficha)
+        ]
+
+        informe["congeladas"] = [
+            ficha.id
+            for ficha in pendientes
+            if ambito_congelado(registradas[ficha.id], ficha)
+        ]
+        informe["desactualizadas"] = [
+            ficha.id
+            for ficha in pendientes
+            if ficha.id not in informe["congeladas"]
         ]
 
         if informe["integridad"] != "ok":
