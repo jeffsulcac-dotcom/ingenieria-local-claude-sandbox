@@ -423,6 +423,12 @@ Pruebas ejecutadas (Python 3.11.15, Linux):
 prueba_toma_atomica tarda unos 7 s, muy por debajo del límite de 120 s que
 el corredor único concede a cada archivo.
 
+Repetido con Python 3.12, que es la versión de esta PC: regresión completa
+6 de 6 en OK y estrés con los mismos 360 / 360 / 1520 / 0. También pasa con
+3.13. Importa porque `borrar()` usa `shutil.rmtree(onexc=...)` desde 3.12 y
+`onerror` antes: hasta ahora sólo se había ejercitado la rama de 3.11, y es
+la de 3.12 la que correrá en Windows.
+
 NO implementado en A3.1 (reservado a A3.2/B): latidos automáticos,
 expiración de trabajadores, detección de trabajadores muertos, recuperación
 automática de tareas abandonadas, cola o planificador, lanzamiento
@@ -507,7 +513,19 @@ Deuda conocida de A3.1, no corregida por quedar fuera de su alcance:
 - La deuda de A2 sigue vigente salvo la atomicidad de `tomar`, ya resuelta.
 
 Pendiente de ejecución en Windows: es el entorno final real y esta corrida
-fue en Linux. Ver los comandos de verificación en orquestacion/README.md.
+fue en Linux. Los comandos y el criterio de decisión están en
+orquestacion/README.md.
+
+Riesgo identificado y medido para esa ejecución: la tanda lanza unas 550
+invocaciones de `git` sólo en el proceso padre (455 de ellas son el
+`git rev-parse --git-common-dir` que cada operación del Supervisor repite),
+más las de los procesos hijos. En Linux cuestan unos 2 ms cada una y no se
+notan; en Windows, con Defender vigilando la carpeta, cuestan entre 50 y
+250 ms, así que el límite de 120 s del corredor único entra en juego. La
+mitigación está identificada y medida —memorizar `git_common_dir` por raíz
+baja las invocaciones de unas 830 a unas 147— pero NO se aplicó: esa
+función es de A2 y cambiarla excede el alcance de A3.1. Es lo primero que
+hay que hacer si mañana la corrida se acerca al límite.
 
 T-0001 y T-0002 siguen sin ejecutar. wip/columnas-pre-supervisor intacta.
 

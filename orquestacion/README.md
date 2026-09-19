@@ -298,7 +298,18 @@ cuatro cosas que pueden comportarse distinto: `multiprocessing` sólo tiene
 `spawn` (la prueba ya lo fuerza en Linux, así que ejercita el mismo
 camino), el bloqueo de SQLite usa otra API del sistema, un archivo abierto
 no se puede borrar mientras alguna conexión siga viva, y arrancar procesos
-es bastante más lento. Desde `C:\INGENIERIA_LOCAL\motor`, en PowerShell:
+es bastante más lento.
+
+Lo que sí se pudo descartar aquí: la prueba pasa con Python 3.11, 3.12 y
+3.13, así que la rama de limpieza propia de 3.12 (`shutil.rmtree` con
+`onexc`, que es la que usará esta PC) está ejercitada y no es una
+incógnita. Tampoco quedan recursos sin cerrar: la corrida en modo
+desarrollo (`python -X dev -W error::ResourceWarning`) no emite ni un
+aviso, y un detector que instrumenta `sqlite3.connect` da cero conexiones
+vivas al terminar las 23 comprobaciones. Es la condición que en Windows
+decide si los temporales se pueden borrar.
+
+Desde `C:\INGENIERIA_LOCAL\motor`, en PowerShell:
 
     $env:PYTHONPATH = "$PWD;$PWD\nucleo;$PWD\orquestacion"
     $env:PYTHONUTF8 = "1"
@@ -316,21 +327,57 @@ es bastante más lento. Desde `C:\INGENIERIA_LOCAL\motor`, en PowerShell:
     # 3. Regresión completa por el corredor único.
     python -m orquestacion.ingenieria_supervisor pruebas --detalle
 
-    # 4. Que no quedaron temporales sin borrar (Windows no borra archivos
-    #    abiertos: si aparece alguno, alguna conexión quedó viva).
+    # 4. Que no quedaron temporales ni procesos huérfanos (Windows no borra
+    #    archivos abiertos: si aparece alguno, algo quedó vivo).
     Get-ChildItem $env:TEMP -Directory -Filter "toma_atomica_*"
+    Get-Process git, python -ErrorAction SilentlyContinue |
+        Where-Object { $_.StartTime -gt (Get-Date).AddMinutes(-5) }
 
-La corrida (1) debe terminar muy por debajo de los 120 s del corredor
-único, imprimir `PRUEBA_TOMA_ATOMICA=OK` y reportar 0 dobles tomas.
-La (4) no debe devolver nada.
+PowerShell no se detiene cuando una orden nativa falla, así que después de
+cada ejecución hay que mirar el código de salida; si no, una prueba que
+muere con un error se ve igual que una que pasó:
 
-**Qué esperar del cronómetro.** En Linux la corrida por omisión tarda unos
-7 s y arranca 22 procesos con `spawn`, a 23-44 ms cada uno (medido). En
-Windows crear un proceso es bastante más caro y un antivirus lo empeora,
-así que lo razonable es entre 15 y 50 s. Sigue habiendo margen frente a los
-120 s, pero es la cifra que hay que mirar primero: si se acercara al
-límite, el remedio no es bajar `--carreras` (las carreras casi no cuestan;
-lo caro es arrancar los procesos) sino reducir el número de contendientes.
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "FALLO: codigo $LASTEXITCODE" -ForegroundColor Red
+    }
+
+Criterio para decidir que Windows pasó, los cuatro a la vez:
+
+1. La corrida (1) imprime `PRUEBA_TOMA_ATOMICA=OK`, sale con código 0 y
+   reporta 0 dobles tomas.
+2. Tarda claramente por debajo de los 120 s (ver el apartado anterior).
+3. La (3) da 6 de 6 archivos de prueba en OK.
+4. La (4) no devuelve nada: ni temporales ni procesos huérfanos.
+
+**Qué esperar del cronómetro, y qué mirar si se agota.** Ésta es la parte
+con riesgo real, y conviene contarla con las cifras medidas, no con la
+intuición.
+
+En Linux la corrida por omisión tarda unos 7 s. Los 22 procesos que arranca
+`multiprocessing` no son el coste dominante: lo es **Git**. Cada operación
+del Supervisor resuelve la ubicación de la base con
+`git rev-parse --git-common-dir`, así que la tanda completa lanza unas 550
+invocaciones de `git` sólo en el proceso padre (455 de ellas son ese mismo
+`rev-parse`), más las de los procesos hijos. En Linux cada una cuesta unos
+2 ms y no se nota. En Windows, arrancar `git.exe` con Defender vigilando la
+carpeta del repositorio cuesta entre 50 y 250 ms, de modo que el
+presupuesto pasa a medirse en decenas de segundos y **el límite de 120 s
+del corredor único entra genuinamente en juego**.
+
+Por eso el paso 1 de la comprobación es cronometrar. Si la corrida se
+acerca al límite:
+
+- Bajar `--carreras` ayuda, pero sólo hasta cierto punto: cada unidad de
+  `--carreras` cuesta unas 38 invocaciones de `git` sobre un suelo fijo de
+  unas 525 que no se toca reduciéndolas.
+- El remedio que de verdad lo resuelve es memorizar el resultado de
+  `git rev-parse --git-common-dir` por raíz dentro de
+  `estado_global.git_common_dir`. Medido en una copia: las invocaciones de
+  `git` bajan de unas 830 a unas 147, un 82 % menos, con la tanda igual de
+  verde. No se ha aplicado porque `git_common_dir` es código de A2 y
+  cambiarlo excede el alcance de A3.1; queda anotado como lo primero que
+  hay que hacer si Windows se acerca al límite, y como mejora evidente
+  para todo el Supervisor, no sólo para la prueba.
 
 ### Implementado y probado
 

@@ -90,6 +90,7 @@ HILOS_EN_CARRERA = 8
 # prueba, nombrando la ronda y el contendiente que faltaron. Los tiempos
 # medidos son de milisegundos, así que el margen es enorme.
 ESPERA_BARRERA_S = 20
+ESPERA_ARRANQUE_S = 60
 ESPERA_RESULTADO_S = 30
 ESPERA_CIERRE_S = 15
 ESPERA_SUBPROCESO_S = 30
@@ -185,12 +186,42 @@ def _quitar_solo_lectura(funcion, ruta, _excepcion):
 
 
 def borrar(raiz: Path) -> None:
+    """
+    Borra el repositorio temporal sin lanzar NUNCA.
+
+    Se llama desde un `finally`, así que si lanzara sustituiría al error
+    que la comprobación estaba reportando: se perdería el diagnóstico
+    bueno y quedaría uno sobre una carpeta de /tmp.
+
+    En Windows eso no es hipotético. Allí un archivo abierto no se puede
+    borrar, y `os.chmod` —que resuelve el caso de Linux, los objetos de
+    Git marcados de sólo lectura— no libera un manejador. De ahí los
+    reintentos: dan tiempo a que el sistema suelte lo que quede, y si aun
+    así no se puede, se avisa y se sigue.
+    """
     # `onexc` existe desde Python 3.12; `onerror` es la vía equivalente en
     # 3.11 y anteriores. La función de limpieza es la misma en ambos casos.
-    if sys.version_info >= (3, 12):
-        shutil.rmtree(raiz, onexc=_quitar_solo_lectura, ignore_errors=False)
-    else:
-        shutil.rmtree(raiz, onerror=_quitar_solo_lectura, ignore_errors=False)
+    clave = "onexc" if sys.version_info >= (3, 12) else "onerror"
+
+    for intento in range(3):
+        try:
+            shutil.rmtree(
+                raiz, ignore_errors=False, **{clave: _quitar_solo_lectura}
+            )
+            return
+        except OSError:
+            if intento == 2:
+                break
+
+            time.sleep(0.2)
+
+    shutil.rmtree(raiz, ignore_errors=True)
+
+    if Path(raiz).exists():
+        print(
+            "  Aviso: no se pudo borrar el temporal " + str(raiz)
+            + "; comprueba si quedó algún proceso vivo."
+        )
 
 
 def ficha_minima(raiz: Path, identificador="T-0901", **extras):
@@ -341,6 +372,11 @@ def _trabajador_de_carrera(entrada, salida, barrera) -> None:
         if orden.get("orden") == "fin":
             return
 
+        if orden.get("orden") == "listo":
+            # Calentamiento: el hijo ya importó todo y está a la espera.
+            salida.put({"listo": orden["trabajador"]})
+            continue
+
         informe = {
             "ronda": orden["ronda"],
             "trabajador": orden["trabajador"],
@@ -405,6 +441,29 @@ class Arnes:
 
         for proceso in self.procesos:
             proceso.start()
+
+        self._esperar_a_que_esten_listos()
+
+    def _esperar_a_que_esten_listos(self) -> None:
+        """
+        Que la barrera mida la CARRERA, no el arranque.
+
+        Un hijo "spawn" reimporta el módulo entero antes de poder esperar
+        en la barrera. Si la primera carrera se lanzara sin más, la ventana
+        de la barrera tendría que cubrir esa dispersión de arranque, que en
+        Windows con un antivirus mirando puede ser de segundos. Una barrera
+        rota por arranque lento se reportaría como "la carrera no ocurrió",
+        que es justo el diagnóstico equivocado.
+        """
+        for indice, entrada in enumerate(self.entradas):
+            entrada.put({"orden": "listo", "trabajador": "t" + str(indice)})
+
+        for _ in range(self.contendientes):
+            respuesta = self.salida.get(timeout=ESPERA_ARRANQUE_S)
+
+            assert respuesta.get("listo"), (
+                "Un contendiente no llegó a arrancar: " + repr(respuesta)
+            )
 
     def __enter__(self):
         return self
