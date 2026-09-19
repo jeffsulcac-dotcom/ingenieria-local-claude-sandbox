@@ -270,8 +270,16 @@ es bastante más lento. Desde `C:\INGENIERIA_LOCAL\motor`, en PowerShell:
     Get-ChildItem $env:TEMP -Directory -Filter "toma_atomica_*"
 
 La corrida (1) debe terminar muy por debajo de los 120 s del corredor
-único, imprimir `PRUEBA_TOMA_ATOMICA=OK` y reportar `DOUBLE_CLAIM_EVENTS = 0`.
+único, imprimir `PRUEBA_TOMA_ATOMICA=OK` y reportar 0 dobles tomas.
 La (4) no debe devolver nada.
+
+**Qué esperar del cronómetro.** En Linux la corrida por omisión tarda unos
+7 s y arranca 22 procesos con `spawn`, a 23-44 ms cada uno (medido). En
+Windows crear un proceso es bastante más caro y un antivirus lo empeora,
+así que lo razonable es entre 15 y 50 s. Sigue habiendo margen frente a los
+120 s, pero es la cifra que hay que mirar primero: si se acercara al
+límite, el remedio no es bajar `--carreras` (las carreras casi no cuestan;
+lo caro es arrancar los procesos) sino reducir el número de contendientes.
 
 ### Implementado y probado
 

@@ -366,13 +366,13 @@ Evidencia de concurrencia REAL (no "PASS"). Corrida de estrés, medida con:
 
     python pruebas/orquestacion/prueba_toma_atomica.py --carreras 100
 
-- RACE_RUNS = 360 carreras con barrera de sincronización
-  (100 con 2 procesos + 100 con 10 procesos + 100 de ámbitos cruzados
-   + 60 entre conexiones; el bloque de control no suma)
-- CLAIMS_SUCCESS = 360 (exactamente una toma concedida por carrera)
-- CLAIMS_REJECTED = 1520
-- DOUBLE_CLAIM_EVENTS = 0
-- SQLITE_ERRORS = 0, UNEXPECTED_EXCEPTIONS = 0
+- Carreras ejecutadas [RACE_RUNS] = 360, todas con barrera de
+  sincronización (100 con 2 procesos + 100 con 10 procesos + 100 de
+  ámbitos cruzados + 60 entre conexiones; el bloque de control no suma)
+- Tomas concedidas [CLAIMS_SUCCESS] = 360: exactamente una por carrera
+- Tomas rechazadas [CLAIMS_REJECTED] = 1520
+- Dobles tomas [DOUBLE_CLAIM_EVENTS] = 0
+- Errores de SQLite = 0; excepciones inesperadas = 0
 - PRAGMA integrity_check: 8 de 8 bases en "ok", sin claves foráneas rotas
 - Contención medida hasta 24 procesos simultáneos: un solo ganador
   siempre, sin agotar el busy_timeout ni un solo error de SQLite
