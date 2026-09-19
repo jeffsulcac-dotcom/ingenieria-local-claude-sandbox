@@ -75,9 +75,14 @@ function Iniciar-Docker {
 
     Write-Host "[..] Iniciando Docker Desktop..." -ForegroundColor Yellow
 
-    $DockerDesktop = "C:\Program Files\Docker\Docker\Docker Desktop.exe"
+    $RutasDockerDesktop = @(
+        "C:\Program Files\Docker\Docker\Docker Desktop.exe",
+        "$env:LOCALAPPDATA\Programs\DockerDesktop\Docker Desktop.exe"
+    )
 
-    if (-not (Test-Path $DockerDesktop)) {
+    $DockerDesktop = $RutasDockerDesktop | Where-Object { Test-Path $_ } | Select-Object -First 1
+
+    if (-not $DockerDesktop) {
         throw "No se encontró Docker Desktop."
     }
 
