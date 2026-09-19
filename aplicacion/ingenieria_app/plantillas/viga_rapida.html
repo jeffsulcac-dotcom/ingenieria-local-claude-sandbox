@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>Viga rápida · Ingeniería Local</title>
+
+    <link
+        rel="stylesheet"
+        href="/estaticos/estilo.css"
+    >
+</head>
+
+<body>
+
+<header class="barra-superior">
+
+    <div>
+        <a href="/" class="marca enlace-marca">
+            INGENIERÍA LOCAL
+        </a>
+
+        <span class="version">
+            cálculo rápido
+        </span>
+    </div>
+
+    <div class="estado-local">
+        <span class="punto"></span>
+        Motor local
+    </div>
+
+</header>
+
+
+<div class="estructura">
+
+    <aside class="lateral">
+
+        <div class="grupo">
+            <a class="opcion enlace-opcion" href="/">
+                Inicio
+            </a>
+        </div>
+
+        <div class="titulo-grupo">
+            CÁLCULO RÁPIDO
+        </div>
+
+        <div class="opcion activa">
+            Viga
+        </div>
+
+        <div class="opcion deshabilitada">
+            Columna
+        </div>
+
+        <div class="opcion deshabilitada">
+            Losa
+        </div>
+
+        <div class="opcion deshabilitada">
+            Placa
+        </div>
+
+        <div class="opcion deshabilitada">
+            Escalera
+        </div>
+
+        <div class="opcion deshabilitada">
+            Zapata
+        </div>
+
+    </aside>
+
+
+    <main class="contenido contenido-calculo">
+
+        <section class="bienvenida">
+
+            <div class="subtitulo">
+                PREDIMENSIONAMIENTO
+            </div>
+
+            <h1>
+                Viga de concreto armado
+            </h1>
+
+            <p>
+                Estimación preliminar rápida.
+                Los parámetros avanzados permanecen ocultos
+                mientras no sean necesarios.
+            </p>
+
+        </section>
+
+
+        <section class="cuaderno">
+
+            <div class="celda">
+
+                <div class="celda-numero">
+                    01
+                </div>
+
+
+                <div class="celda-contenido">
+
+                    <div class="formulario-grid">
+
+                        <label class="campo">
+
+                            <span>Luz</span>
+
+                            <div class="entrada-unidad">
+
+                                <input
+                                    id="luz"
+                                    type="number"
+                                    value="6.00"
+                                    min="0.01"
+                                    step="0.05"
+                                >
+
+                                <span>m</span>
+
+                            </div>
+
+                        </label>
+
+
+                        <label class="campo">
+
+                            <span>Condición</span>
+
+                            <select id="condicion">
+
+                                <option value="simplemente_apoyada">
+                                    Simplemente apoyada
+                                </option>
+
+                                <option value="un_extremo_continuo">
+                                    Un extremo continuo
+                                </option>
+
+                                <option value="ambos_extremos_continuos">
+                                    Ambos extremos continuos
+                                </option>
+
+                                <option value="voladizo">
+                                    Voladizo
+                                </option>
+
+                            </select>
+
+                        </label>
+
+                    </div>
+
+
+                    <details class="avanzado">
+
+                        <summary>
+                            Parámetros adicionales
+                        </summary>
+
+                        <div class="formulario-grid espacio-superior">
+
+                            <label class="campo">
+
+                                <span>fy</span>
+
+                                <div class="entrada-unidad">
+
+                                    <input
+                                        id="fy"
+                                        type="number"
+                                        value="420"
+                                        min="1"
+                                        step="10"
+                                    >
+
+                                    <span>MPa</span>
+
+                                </div>
+
+                            </label>
+
+
+                            <label class="campo campo-check">
+
+                                <input
+                                    id="sismico"
+                                    type="checkbox"
+                                >
+
+                                <span>
+                                    Viga del sistema
+                                    sismorresistente
+                                </span>
+
+                            </label>
+
+                        </div>
+
+                    </details>
+
+
+                    <button
+                        id="calcular"
+                        class="boton-principal"
+                        type="button"
+                    >
+                        Calcular
+                    </button>
+
+                </div>
+
+            </div>
+
+
+            <div
+                id="resultado"
+                class="celda resultado-celda oculto"
+            >
+
+                <div class="celda-numero">
+                    R
+                </div>
+
+
+                <div class="celda-contenido">
+
+                    <div class="subtitulo">
+                        RESULTADO PRELIMINAR
+                    </div>
+
+
+                    <div class="resultado-principal">
+
+                        <div>
+
+                            <span class="resultado-etiqueta">
+                                Peralte mínimo
+                            </span>
+
+                            <strong id="peralte-minimo">
+                                —
+                            </strong>
+
+                        </div>
+
+
+                        <div>
+
+                            <span class="resultado-etiqueta">
+                                Peralte adoptado
+                            </span>
+
+                            <strong id="peralte-adoptado">
+                                —
+                            </strong>
+
+                        </div>
+
+
+                        <div
+                            id="bloque-ancho"
+                            class="oculto"
+                        >
+
+                            <span class="resultado-etiqueta">
+                                Ancho mínimo sísmico
+                            </span>
+
+                            <strong id="ancho-minimo">
+                                —
+                            </strong>
+
+                        </div>
+
+                    </div>
+
+
+                    <div
+                        id="comprobacion-sismica"
+                        class="mensaje-tecnico oculto"
+                    ></div>
+
+
+                    <div class="norma">
+
+                        <span id="norma"></span>
+
+                        <span id="referencia"></span>
+
+                    </div>
+
+
+                    <div
+                        id="advertencia"
+                        class="advertencia"
+                    ></div>
+
+                </div>
+
+            </div>
+
+        </section>
+
+    </main>
+
+</div>
+
+
+<footer>
+
+    <span>Motor local activo</span>
+
+    <span>•</span>
+
+    <span>Predimensionamiento</span>
+
+    <span>•</span>
+
+    <span>Datos en esta PC</span>
+
+</footer>
+
+
+<script>
+
+const boton = document.getElementById("calcular");
+
+boton.addEventListener("click", calcular);
+
+
+async function calcular() {
+
+    boton.disabled = true;
+    boton.textContent = "Calculando...";
+
+    const datos = {
+        luz_m:
+            Number(
+                document.getElementById("luz").value
+            ),
+
+        condicion_apoyo:
+            document.getElementById("condicion").value,
+
+        fy_mpa:
+            Number(
+                document.getElementById("fy").value
+            ),
+
+        sistema_sismorresistente:
+            document.getElementById("sismico").checked
+    };
+
+
+    try {
+
+        const respuesta = await fetch(
+            "/api/predimensionamiento/viga",
+            {
+                method: "POST",
+
+                headers: {
+                    "Content-Type": "application/json"
+                },
+
+                body: JSON.stringify(datos)
+            }
+        );
+
+
+        if (!respuesta.ok) {
+            throw new Error(
+                "No se pudo completar el cálculo."
+            );
+        }
+
+
+        const resultado = await respuesta.json();
+
+
+        document.getElementById(
+            "peralte-minimo"
+        ).textContent =
+            resultado.peralte_minimo_m.toFixed(3)
+            + " m";
+
+
+        document.getElementById(
+            "peralte-adoptado"
+        ).textContent =
+            resultado.peralte_adoptado_m.toFixed(2)
+            + " m";
+
+
+        const bloqueAncho =
+            document.getElementById("bloque-ancho");
+
+        const comprobacion =
+            document.getElementById(
+                "comprobacion-sismica"
+            );
+
+
+        if (
+            resultado.ancho_minimo_sismico_m !== null
+        ) {
+
+            bloqueAncho.classList.remove("oculto");
+
+            document.getElementById(
+                "ancho-minimo"
+            ).textContent =
+                resultado.ancho_minimo_sismico_m
+                    .toFixed(2)
+                + " m";
+
+
+            comprobacion.classList.remove("oculto");
+
+            if (
+                resultado.cumple_relacion_luz_peralte
+            ) {
+
+                comprobacion.textContent =
+                    "✓ Cumple la relación geométrica "
+                    + "preliminar luz/peralte.";
+
+                comprobacion.className =
+                    "mensaje-tecnico correcto";
+
+            }
+            else {
+
+                comprobacion.textContent =
+                    "⚠ No cumple la relación geométrica "
+                    + "preliminar luz/peralte.";
+
+                comprobacion.className =
+                    "mensaje-tecnico aviso";
+
+            }
+
+        }
+        else {
+
+            bloqueAncho.classList.add("oculto");
+            comprobacion.classList.add("oculto");
+
+        }
+
+
+        document.getElementById(
+            "norma"
+        ).textContent =
+            resultado.norma;
+
+
+        document.getElementById(
+            "referencia"
+        ).textContent =
+            resultado.referencia_peralte;
+
+
+        document.getElementById(
+            "advertencia"
+        ).textContent =
+            resultado.advertencia;
+
+
+        document.getElementById(
+            "resultado"
+        ).classList.remove("oculto");
+
+    }
+    catch (error) {
+
+        alert(error.message);
+
+    }
+    finally {
+
+        boton.disabled = false;
+        boton.textContent = "Calcular";
+
+    }
+}
+
+</script>
+
+
+</body>
+</html>

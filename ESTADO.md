@@ -127,3 +127,31 @@ Pruebas realizadas:
 
 Estado:
 CONTROL_LOCAL = APROBADO
+
+## Predimensionamiento rápido — Vigas
+
+Primer módulo de ingeniería implementado y verificado.
+
+Características:
+- funcionamiento independiente
+- motor Python local
+- modo rápido
+- luz de viga
+- condición de apoyo
+- fy configurable
+- opción de sistema sismorresistente
+- peralte mínimo
+- peralte adoptado
+- comprobaciones geométricas preliminares
+- referencia normativa visible
+- integración con la interfaz local
+
+Pruebas:
+- PRUEBA_VIGA_RAPIDA=OK
+- interfaz de cálculo: OK
+- caso L = 6.00 m simplemente apoyada:
+  - peralte mínimo = 0.375 m
+  - peralte adoptado = 0.40 m
+
+Estado:
+PREDIMENSIONAMIENTO_VIGA_RAPIDA = APROBADO
