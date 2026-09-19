@@ -1709,21 +1709,60 @@ def importar_ficha(
     return {"id": ficha.id, "accion": ACCION_IMPORTADA, "eventos": importados + 1}
 
 
+def _pendientes_que_desaparecen(existente: dict, ficha: Ficha) -> list:
+    """
+    Decisiones humanas PENDIENTES que la declaración nueva ya no trae.
+
+    Una decisión pendiente frena la tarea: `verificar` no puede llevarla a
+    PROPUESTO mientras quede alguna. Si al refrescar la definición esa
+    decisión desaparece, el freno desaparece con ella, y eso es alterar en
+    silencio una garantía que la tarea tenía cuando se tomó.
+    """
+    declaradas = {
+        str(una.get("clave"))
+        for una in ficha.requiere_decision_humana
+        if una.get("clave") is not None
+    }
+
+    return [
+        str(una.get("clave"))
+        for una in (existente["decisiones"] or [])
+        if not una.get("resuelta", False)
+        and str(una.get("clave")) not in declaradas
+    ]
+
+
 def ambito_congelado(existente: dict, ficha: Ficha) -> bool:
     """
-    ¿Hay que dejar el ámbito como está porque la tarea lo retiene?
+    ¿Hay que dejar la definición como está porque la tarea está viva?
 
-    Se compara por CONTENIDO y no por orden. La garantía que esto protege
-    —`supervisor.solapamientos`— recorre el producto cartesiano de los dos
-    ámbitos, así que ['a','b'] y ['b','a'] garantizan exactamente lo mismo.
-    Comparar las listas tal cual haría que reordenar un patrón, sin mover un
-    solo archivo, congelara toda la definición y bloqueara de paso un
-    arreglo de título que viajara en la misma edición.
+    Se congela por dos motivos, y los dos alteran en silencio una garantía
+    que la tarea tenía cuando se tomó:
+
+    1. Cambia el ÁMBITO. Es el caso que da nombre a la función y el que
+       sostiene la regla de un solo escritor.
+
+       Se compara por CONTENIDO y no por orden: `supervisor.solapamientos`
+       recorre el producto cartesiano, así que ['a','b'] y ['b','a']
+       garantizan lo mismo. Comparar las listas tal cual haría que
+       reordenar un patrón, sin mover un solo archivo, congelara toda la
+       definición y bloqueara de paso un arreglo de título.
+
+    2. DESAPARECE una decisión humana pendiente. Una decisión pendiente
+       frena la tarea, y borrarla del JSON quitaba el freno: comprobado,
+       bastaba un `ver` después de editar el archivo. Añadir decisiones
+       nuevas sí se permite, porque añade frenos, no los quita.
+
+    Lo demás —título, descripción de una decisión, criterios— se sincroniza
+    con normalidad: sólo se frena lo que rompería una garantía.
     """
     if str(existente["estado"]) not in ESTADOS_QUE_RETIENEN_AMBITO:
         return False
 
-    return set(ficha.ambito_archivos) != set(existente["ambito_archivos"] or [])
+    if set(ficha.ambito_archivos) != set(existente["ambito_archivos"] or []):
+        return True
+
+    return bool(_pendientes_que_desaparecen(existente, ficha))
 
 
 def informe_ambito_congelado(existente: dict, ficha: Ficha) -> dict:
@@ -1734,6 +1773,17 @@ def informe_ambito_congelado(existente: dict, ficha: Ficha) -> dict:
     `asegurar_ficha`, que necesita devolverlo SIN abrir ninguna. Que salga
     de aquí es lo que garantiza que las dos cuenten lo mismo.
     """
+    perdidas = _pendientes_que_desaparecen(existente, ficha)
+
+    if set(ficha.ambito_archivos) != set(existente["ambito_archivos"] or []):
+        motivo = "no se aplica el cambio de ámbito declarado en el JSON"
+    else:
+        motivo = (
+            "el JSON ya no declara decisiones humanas que siguen pendientes"
+            " (" + ", ".join(sorted(perdidas)) + "), y quitarlas le quitaría"
+            " el freno"
+        )
+
     return {
         "id": ficha.id,
         "accion": ACCION_AMBITO_CONGELADO,
@@ -1741,10 +1791,11 @@ def informe_ambito_congelado(existente: dict, ficha: Ficha) -> dict:
         "estado": existente["estado"],
         "ambito_grabado": list(existente["ambito_archivos"] or []),
         "ambito_declarado": list(ficha.ambito_archivos),
+        "decisiones_pendientes_perdidas": sorted(perdidas),
         "detalle": "La tarea '" + ficha.id + "' está en estado '"
-        + str(existente["estado"]) + "' y retiene su ámbito: no se "
-        "aplica el cambio de ámbito declarado en el JSON. Se "
-        "sincronizará sola cuando la tarea deje de estar viva.",
+        + str(existente["estado"]) + "' y su definición queda congelada: "
+        + motivo + ". Se sincronizará sola cuando la tarea deje de estar "
+        "viva.",
     }
 
 

@@ -477,9 +477,16 @@ Ahora, mientras el estado de la tarea retenga su ámbito
 (`en_ejecucion`, `requiere_revision`, `propuesto`), un cambio de ámbito no
 se aplica y la huella de definición NO avanza. Eso último es lo que impide
 que el refresco se pierda en silencio: vuelve a intentarse solo en cuanto
-la tarea deja de estar viva. Un cambio declarativo inocuo —el título, la
-descripción de una decisión— sigue sincronizándose con normalidad: sólo se
-frena lo que rompería la garantía.
+la tarea deja de estar viva. Se congela por un segundo motivo, de la misma clase: que DESAPAREZCA del
+JSON una decisión humana pendiente. Una decisión pendiente frena la tarea
+—`verificar` no puede llevarla a PROPUESTO mientras quede alguna— y
+borrarla del archivo quitaba el freno; comprobado, bastaba un `ver`
+después de editar. Añadir decisiones nuevas sí se permite: añade frenos,
+no los quita.
+
+Un cambio declarativo inocuo —el título, la descripción de una decisión,
+los criterios— sigue sincronizándose con normalidad: sólo se frena lo que
+rompería una garantía que la tarea tenía cuando se tomó.
 
 Tres detalles que costaron una ronda de auditoría cada uno:
 

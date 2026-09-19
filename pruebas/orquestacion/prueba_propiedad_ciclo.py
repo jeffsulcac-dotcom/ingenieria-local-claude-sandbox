@@ -1003,8 +1003,104 @@ def prueba_j_una_sincronizacion_inocua_no_rompe_una_tarea_viva():
     print("OK")
 
 
+def prueba_j2_borrar_una_decision_pendiente_no_quita_el_freno():
+    """
+    Borrar del JSON una decisión humana pendiente no desbloquea la tarea.
+
+    Una decisión pendiente frena la tarea: `verificar` no puede llevarla a
+    PROPUESTO mientras quede alguna. Encontrado por la auditoría: bastaba
+    borrarla del archivo y ejecutar un `ver` —una orden de SÓLO LECTURA—
+    para que el freno desapareciera. Es la misma clase que el ámbito: una
+    garantía que la tarea tenía al tomarse, alterada en silencio desde un
+    archivo del árbol de trabajo.
+
+    Añadir decisiones nuevas sí se permite, y se comprueba aquí: añade
+    frenos, no los quita.
+    """
+    print(" 12. borrar una decisión pendiente no quita el freno:", end=" ")
+
+    raiz = crear_repositorio()
+
+    try:
+        import json
+
+        ficha_minima(
+            raiz,
+            "T-0901",
+            decisiones=[{"clave": "D-1", "descripcion": "hay que decidir"}],
+        )
+        nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+
+        assert fila_de(raiz, "T-0901")["requiere_decision_humana"], (
+            "El escenario exige una decisión pendiente de verdad."
+        )
+
+        ruta = fichas.ruta_ficha(raiz, "T-0901")
+
+        # (a) Añadir una decisión nueva SÍ se sincroniza: añade freno.
+        datos = json.loads(ruta.read_text(encoding="utf-8"))
+        datos["requiere_decision_humana"].append(
+            {"clave": "D-2", "descripcion": "otra más"}
+        )
+        ruta.write_text(
+            json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        nucleo.cargar(raiz, "T-0901")
+
+        claves = {
+            str(una["clave"])
+            for una in fila_de(raiz, "T-0901")["decisiones"]
+        }
+
+        assert claves == {"D-1", "D-2"}, (
+            "Añadir una decisión a una tarea viva debe sincronizarse: "
+            + repr(claves)
+        )
+
+        # (b) Borrarlas SÍ se congela: quitaría el freno.
+        antes = testigo(raiz, "T-0901")
+
+        datos = json.loads(ruta.read_text(encoding="utf-8"))
+        datos["requiere_decision_humana"] = []
+        ruta.write_text(
+            json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        nucleo.cargar(raiz, "T-0901")
+
+        fila = fila_de(raiz, "T-0901")
+
+        assert fila["requiere_decision_humana"], (
+            "Borrar las decisiones del JSON le quitó el freno a una tarea "
+            "viva: `verificar` ya podría llevarla a PROPUESTO."
+        )
+        assert {str(una["clave"]) for una in fila["decisiones"]} == {
+            "D-1",
+            "D-2",
+        }
+
+        exigir_intacto(raiz, "T-0901", antes, "borrado de decisiones")
+
+        # Y se informa, no se disimula.
+        informe = estado_global.sincronizar_definiciones(raiz)
+        congelados = informe.get("ambito_congelado") or []
+
+        assert [uno["id"] for uno in congelados] == ["T-0901"]
+        assert "decisiones humanas" in congelados[0]["detalle"], (
+            "El motivo del congelado no dice cuál de los dos fue: "
+            + congelados[0]["detalle"]
+        )
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
 def prueba_k_el_ambito_se_refresca_cuando_la_tarea_deja_de_estar_viva():
-    print(" 12. el ámbito congelado se refresca al cerrarse la tarea:", end=" ")
+    print(" 13. el ámbito congelado se refresca al cerrarse la tarea:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1194,7 +1290,7 @@ def _ronda_bootstrap(procesos: int) -> dict:
 
 def prueba_l_bootstrap_concurrente():
     print(
-        " 13. bootstrap concurrente ("
+        " 14. bootstrap concurrente ("
         + str(PROCESOS_BOOTSTRAP)
         + " procesos x "
         + str(RONDAS_BOOTSTRAP)
@@ -1258,7 +1354,7 @@ def prueba_l2_el_journal_no_se_reconvierte_en_cada_apertura():
     sirve de gate. Aquí se comprueba la mitad determinista; la otra la
     respalda aquella observación, anotada en orquestacion/README.md.
     """
-    print(" 14. una base ya en WAL no se reconvierte al abrirla:", end=" ")
+    print(" 15. una base ya en WAL no se reconvierte al abrirla:", end=" ")
 
     raiz = crear_repositorio("wal_")
 
@@ -1352,7 +1448,7 @@ def prueba_l3_el_diagnostico_distingue_ocupada_de_sin_wal():
     Aquí se provoca el caso que NO es contención y se exige el mensaje que
     de verdad orienta a quien lo lea.
     """
-    print(" 15. el diagnóstico distingue ocupada de sin WAL:", end=" ")
+    print(" 16. el diagnóstico distingue ocupada de sin WAL:", end=" ")
 
     raiz = crear_repositorio("wal_")
 
@@ -1403,7 +1499,7 @@ def prueba_l4_una_migracion_ajena_a_mitad_no_pasa_inadvertida():
     versión ve la base al día y la última la ve ya migrada por otro, que es
     exactamente lo que ocurriría de verdad.
     """
-    print(" 16. una migración ajena a mitad no pasa inadvertida:", end=" ")
+    print(" 17. una migración ajena a mitad no pasa inadvertida:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1470,7 +1566,7 @@ def prueba_l5_la_memoria_de_git_no_confunde_repositorios():
     Se comprueba además que la memoria sigue ahorrando: invalidarla en cada
     llamada arreglaría un problema creando otro.
     """
-    print(" 17. la memoria de git no confunde repositorios:", end=" ")
+    print(" 18. la memoria de git no confunde repositorios:", end=" ")
 
     principal = crear_repositorio("memoria_")
     aparte = Path(tempfile.mkdtemp(prefix="memoria_wt_"))
@@ -1550,7 +1646,7 @@ def prueba_l5_la_memoria_de_git_no_confunde_repositorios():
 
 
 def prueba_m_codigo_de_salida_por_propiedad():
-    print(" 18. la CLI devuelve 4 al rechazar por propiedad:", end=" ")
+    print(" 19. la CLI devuelve 4 al rechazar por propiedad:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1627,7 +1723,7 @@ def prueba_m_codigo_de_salida_por_propiedad():
 # ----------------------------------------------------------------------
 
 def prueba_n_reanudar_respeta_una_toma_reciente():
-    print(" 19. `reanudar` no arrebata una tarea recién tomada:", end=" ")
+    print(" 20. `reanudar` no arrebata una tarea recién tomada:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1647,18 +1743,78 @@ def prueba_n_reanudar_respeta_una_toma_reciente():
             latido_gracia_s=0,
         )
 
-        # Con la foto que leyó, la tarea le parecía abandonada. La escritura
-        # se condiciona igualmente, así que si alguien la hubiera tomado
-        # entretanto no se la quitaría. Aquí nadie lo hizo, luego la
-        # recupera: lo que se comprueba es que el camino existe y que el
-        # informe lo cuenta.
-        assert "reclamadas_mientras_tanto" in informe, (
-            "El informe de recuperación debe poder contar que una tarea fue "
-            "reclamada mientras se la juzgaba."
-        )
+        assert "reclamadas_mientras_tanto" in informe
         assert informe["revisadas"] == 1
 
+        # Hasta aquí sólo se ha ejercitado el camino que funciona, y la
+        # auditoría lo señaló: comprobar que la CLAVE existe no es
+        # comprobar que el rechazo ocurre. Ahora se fuerza la carrera de
+        # verdad, tomando la tarea DENTRO de la ventana de `reanudar`.
+        nucleo.tomar(raiz, "T-0901", trabajador_id="worker-X", pid=1)
+        METRICAS["CAMBIOS_DE_PROPIEDAD"] += 1
+
+        vigilada = testigo(raiz, "T-0901")
+
+        original = nucleo.clasificar_ejecucion
+        irrumpido = {"hecho": False}
+
+        def clasificar_e_irrumpir(*argumentos, **claves):
+            # Entre la foto que tomó `reanudar` y su escritura, otro
+            # trabajador reclama la tarea legítimamente.
+            if not irrumpido["hecho"]:
+                irrumpido["hecho"] = True
+                nucleo.devolver(
+                    raiz,
+                    "T-0901",
+                    trabajador_id="worker-X",
+                )
+                nucleo.tomar(raiz, "T-0901", trabajador_id="worker-Z", pid=1)
+
+            return original(*argumentos, **claves)
+
+        nucleo.clasificar_ejecucion = clasificar_e_irrumpir
+
+        try:
+            segundo = nucleo.reanudar(
+                raiz,
+                comprobar_proceso=lambda _pid: False,
+                latido_maximo_s=0,
+                latido_gracia_s=0,
+            )
+        finally:
+            nucleo.clasificar_ejecucion = original
+
+        assert irrumpido["hecho"], "La carrera no llegó a montarse."
+
+        reclamadas = [
+            uno["id"] for uno in segundo["reclamadas_mientras_tanto"]
+        ]
+
+        assert reclamadas == ["T-0901"], (
+            "`reanudar` no detectó que la tarea fue reclamada mientras la "
+            "juzgaba: " + repr(segundo["reclamadas_mientras_tanto"])
+        )
+        assert not segundo["huerfanas"], (
+            "Se declaró huérfana una tarea que acababa de tomarse."
+        )
+
+        final = fila_de(raiz, "T-0901")
+
+        assert final["trabajador_id"] == "worker-Z", (
+            "`reanudar` le arrebató la tarea a quien acababa de tomarla: "
+            + repr(final["trabajador_id"])
+        )
+        assert final["estado"] == str(Estado.EN_EJECUCION)
+
+        # El dueño nuevo sigue pudiendo trabajar.
+        nucleo.latido(raiz, "T-0901", trabajador_id="worker-Z")
+        METRICAS["ORDENES_TOTALES"] += 1
+        METRICAS["ORDENES_ACEPTADAS"] += 1
+
+        assert vigilada["trabajador_id"] == "worker-X"
+
         # Ahora el caso que importa: una tarea VIVA y sana no se toca.
+        nucleo.devolver(raiz, "T-0901", trabajador_id="worker-Z")
         nucleo.tomar(raiz, "T-0901", trabajador_id="worker-C", pid=os.getpid())
         METRICAS["CAMBIOS_DE_PROPIEDAD"] += 1
 
@@ -1686,7 +1842,7 @@ def prueba_n_reanudar_respeta_una_toma_reciente():
 
 def prueba_o_estres_de_ordenes_rezagadas(rezagadas: int):
     print(
-        " 29. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
+        " 30. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
         "dueño vigente:",
         end=" ",
     )
@@ -1793,7 +1949,7 @@ def prueba_u_la_toma_graba_el_ambito_que_valido():
     escritores sobre los mismos archivos, que es exactamente lo que la
     guarda existe para impedir.
     """
-    print(" 20. la toma graba el ámbito que acaba de validar:", end=" ")
+    print(" 21. la toma graba el ámbito que acaba de validar:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1877,7 +2033,7 @@ def prueba_u3_retomar_con_ambito_encogido_no_libera_el_terreno():
     anterior, que hacía que la toma grabara el ámbito declarado sin mirar
     si ampliaba o encogía. Ahora reclama la UNIÓN.
     """
-    print(" 21. retomar con ámbito encogido no libera el terreno:", end=" ")
+    print(" 22. retomar con ámbito encogido no libera el terreno:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1950,7 +2106,7 @@ def prueba_u2_el_ambito_vigente_no_miente_al_trabajador():
     la declaración que una persona acababa de escribir. Se comprobó
     rompiéndolo.
     """
-    print(" 22. el ámbito vigente no le miente al trabajador:", end=" ")
+    print(" 23. el ámbito vigente no le miente al trabajador:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2022,7 +2178,7 @@ def prueba_v_reordenar_el_ambito_no_congela_nada():
     congelaría toda la definición y bloquearía de paso cualquier arreglo
     que viajara en la misma edición.
     """
-    print(" 23. reordenar el ámbito no congela la definición:", end=" ")
+    print(" 24. reordenar el ámbito no congela la definición:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2079,7 +2235,7 @@ def prueba_w_el_ambito_congelado_no_pide_el_bloqueo_de_escritura():
     de toda la base para no escribir nada; bajo concurrencia eso convierte
     una consulta en una espera que acaba en "database is locked".
     """
-    print(" 24. una consulta sobre tarea congelada no pide el candado:", end=" ")
+    print(" 25. una consulta sobre tarea congelada no pide el candado:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2157,7 +2313,7 @@ def prueba_w2_la_salida_rapida_nunca_escribe_fuera_de_transaccion():
     intercala una lectura que devuelve la tarea ya cerrada, que es justo
     lo que vería el segundo vistazo si otro proceso la cerrara en medio.
     """
-    print(" 25. la salida rápida no escribe fuera de transacción:", end=" ")
+    print(" 26. la salida rápida no escribe fuera de transacción:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2255,7 +2411,7 @@ def prueba_r_la_generacion_no_sale_de_sqlite():
     podía volver a hacer indistinguibles dos ejecuciones, que es justo el
     problema ABA que la columna existe para cerrar.
     """
-    print(" 26. la generación no se puede falsificar desde el JSON:", end=" ")
+    print(" 27. la generación no se puede falsificar desde el JSON:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2455,7 +2611,7 @@ def prueba_s_orden_humana_rezagada_no_revierte_una_transicion():
     Lo cierra la tercera precondición: la escritura exige que la fila siga
     en el estado que tenía cuando se leyó.
     """
-    print(" 27. una orden humana rezagada no revierte el ciclo:", end=" ")
+    print(" 28. una orden humana rezagada no revierte el ciclo:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2509,7 +2665,7 @@ def prueba_t_el_ambito_congelado_se_informa():
     función importante produzca un resultado visible y verificable, y un
     cambio en espera es justo eso.
     """
-    print(" 28. el ámbito congelado se informa, no se disimula:", end=" ")
+    print(" 29. el ámbito congelado se informa, no se disimula:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2670,7 +2826,7 @@ def prueba_p_estres_concurrente(emisores: int, ordenes: int):
     órdenes entre. Una sola aceptada es un fallo, y se nombra cuál fue.
     """
     print(
-        " 30. estrés concurrente: " + str(emisores) + " procesos x "
+        " 31. estrés concurrente: " + str(emisores) + " procesos x "
         + str(ordenes) + " órdenes rezagadas:",
         end=" ",
     )
@@ -2784,6 +2940,7 @@ COMPROBACIONES = (
     prueba_h_cargar_no_estrecha_el_ambito_de_una_tarea_viva,
     prueba_i_una_toma_rechazada_tampoco_pisa_el_ambito,
     prueba_j_una_sincronizacion_inocua_no_rompe_una_tarea_viva,
+    prueba_j2_borrar_una_decision_pendiente_no_quita_el_freno,
     prueba_k_el_ambito_se_refresca_cuando_la_tarea_deja_de_estar_viva,
     prueba_l_bootstrap_concurrente,
     prueba_l2_el_journal_no_se_reconvierte_en_cada_apertura,
