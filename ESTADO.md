@@ -351,6 +351,13 @@ Por qué no admite dos ganadores (tres mecanismos, no uno):
 Además, conceder la toma cambia el estado a uno que ya no es reclamable, de
 modo que el propio cambio cierra la puerta al siguiente aspirante.
 
+Cuál actúa dónde, medido: en `tomar` la garantía la sostiene el mecanismo 1
+(BEGIN IMMEDIATE serializa, y la segunda transacción lee la fila ya
+cambiada y se rechaza en la comprobación de estado). Los mecanismos 2 y 3
+son la garantía del primitivo `reclamar`, y quedan de red de seguridad; se
+ejercitan de lleno en la carrera entre conexiones, que llama a `reclamar`
+directamente y produce sus 420 rechazos por rowcount = 0.
+
 Componentes:
 - estado_global.py: `reclamar()`, el primitivo de toma atómica; un conflicto
   NO es excepción, se devuelve descrito
@@ -375,8 +382,17 @@ Evidencia de concurrencia REAL (no "PASS"). Corrida de estrés, medida con:
 - Dobles tomas [DOUBLE_CLAIM_EVENTS] = 0
 - Errores de SQLite = 0; excepciones inesperadas = 0
 - PRAGMA integrity_check: 8 de 8 bases en "ok", sin claves foráneas rotas
-- Contención medida hasta 24 procesos simultáneos: un solo ganador
-  siempre, sin agotar el busy_timeout ni un solo error de SQLite
+
+Contención máxima que alcanza esa corrida: 10 procesos simultáneos sobre la
+misma tarea (bloque "procesos x10") y 8 conexiones simultáneas sobre
+BEGIN IMMEDIATE (bloque "conexiones x8"). En total arranca 22 procesos con
+"spawn", nunca los 22 a la vez: los bloques abren y cierran su arnés uno
+tras otro.
+
+Fuera de la prueba, a mano, se comprobó además con 16 y con 24 procesos
+simultáneos: un solo ganador en todas las rondas, sin agotar el
+busy_timeout ni un error de SQLite. Eso NO forma parte de la prueba
+automática; queda aquí como dato, no como evidencia repetible.
 
 El arnés se validó por MUTACIÓN del código, no por confianza:
 - reintroducido el TOCTOU en `tomar` (decisión fuera de la transacción):
@@ -425,7 +441,20 @@ Hasta dónde llega la garantía (importante, medido, no supuesto):
   órdenes del ciclo: eso es A3.2, no A3.1.
 
 Correcciones aplicadas durante la auditoría adversarial (todas
-reproducidas antes de corregir y validadas por mutación después):
+reproducidas antes de corregir; las de comportamiento, validadas después
+por mutación del código):
+- El rechazo por estado se decide antes que el rechazo por ámbito, dentro
+  de la transacción, para que el motivo sea el verdadero. Antes, una tarea
+  aprobada cuyo ámbito además se solapara se rechazaba por "ámbito en
+  conflicto" y quien la pedía quedaba esperando a que se liberase un
+  ámbito que no la iba a desbloquear nunca. Validado por mutación: quitar
+  la comprobación hace fallar la comprobación L.
+- El código de salida 3 de `tomar` estaba documentado pero no probado, y
+  lo documentado no era cierto: una tarea inexistente sale con 2, no con
+  3. Ahora hay una comprobación de extremo a extremo sobre la propia CLI.
+- El informe de rechazo se extrajo a `estado_global.rechazo`, compartida
+  por `reclamar` y por la comprobación previa, para que el rechazo se lea
+  igual venga de donde venga.
 - `tomar` refrescaba TODAS las definiciones antes de comprobar los
   ámbitos, con lo que reescribía el `ambito_archivos` registrado de una
   tarea que otro trabajador tenía en ejecución en otra rama; acto seguido

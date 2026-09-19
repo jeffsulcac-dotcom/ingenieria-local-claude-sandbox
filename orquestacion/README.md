@@ -123,21 +123,35 @@ transacción `BEGIN IMMEDIATE` sobre la base global:
     comprobación de estado  ->  comprobación de ámbitos
     ->  UPDATE condicional  ->  evento  ->  COMMIT
 
-La comprobación de estado que abre la secuencia no concede ni deniega nada
-por su cuenta: está para que el rechazo diga el motivo verdadero, y no
-"ámbito en conflicto" cuando el problema es que la tarea está aprobada.
+La comprobación de estado que abre la secuencia SÍ deniega: es la que, en
+la práctica, rechaza al perdedor de una carrera, porque al leerse la fila
+dentro de esta misma transacción ya ve el estado que la toma anterior dejó.
+Está ahí para que el motivo sea el verdadero y no "ámbito en conflicto"
+cuando el problema es que la tarea está aprobada. Lo que NO hace es
+conceder: eso lo sigue decidiendo el UPDATE condicional.
 
-Por qué no puede haber dos ganadores. No es un mecanismo, son tres:
+Por qué no puede haber dos ganadores. No es un mecanismo, son tres, y
+conviene saber cuál actúa dónde:
 
 1. `BEGIN IMMEDIATE` pide el bloqueo de escritura en el primer instante de
    la transacción. SQLite admite un solo escritor: la segunda toma espera
-   (`busy_timeout = 5000 ms`) a que la primera confirme o anule.
+   (`busy_timeout = 5000 ms`) a que la primera confirme o anule. **Éste es
+   el que sostiene la garantía en `tomar`**: cuando la segunda transacción
+   por fin entra, lee la fila ya cambiada y se rechaza.
 2. El estado esperado viaja en la propia cláusula `WHERE` del UPDATE. El
    motor lo comprueba contra la fila REAL en el momento de escribir, no
    contra una lectura anterior: no queda ventana entre comprobar y escribir.
 3. La decisión se toma con `rowcount`, el número de filas que el motor
    modificó de verdad. 1 = ganó; 0 = alguien se adelantó. No se deduce de
    ninguna lectura hecha por Python.
+
+Los mecanismos 2 y 3 son la garantía de `estado_global.reclamar`, el
+primitivo, y se ejercitan de lleno en la carrera entre conexiones, que lo
+llama directamente. Desde `tomar`, en cambio, el perdedor ya se rechaza en
+la comprobación de estado, así que el `rowcount = 0` no llega a ocurrir:
+el UPDATE condicional queda de red de seguridad, no de primera línea. Se
+dice porque es la verdad medible, y porque quien use `reclamar` por su
+cuenta sí depende de los tres.
 
 Además, conceder la toma cambia el estado a uno que ya no es reclamable, de
 modo que el propio cambio cierra la puerta al siguiente aspirante.
@@ -180,10 +194,17 @@ intomable una fila que estuviera en estado reclamable pero conservara un
 propietario residual (ficha V1 importada a medias, edición externa), y la
 recuperación automática está fuera del alcance de A3.1. En su lugar la toma
 desplaza al residual y lo anota en el evento
-(`datos.propietario_desplazado`), para que el cambio sea trazable. El
-invariante real es que los estados reclamables (`nuevo`, `reabierto`,
-`requiere_revision`) siempre tienen `trabajador_id` nulo, porque
-`verificar`, `devolver` y `reanudar` liberan al trabajador.
+(`datos.propietario_desplazado`), para que el cambio sea trazable.
+
+El invariante en el que se apoya esto —que un estado reclamable (`nuevo`,
+`reabierto`, `requiere_revision`) no conserva propietario— se cumple para
+toda fila que escribe el propio Supervisor, porque `verificar`, `devolver`
+y `reanudar` liberan al trabajador. NO se cumple para las que llegan por
+importación de una ficha V1 o por una edición externa de la base, y esas
+son justamente las que la condición extra habría dejado intomables para
+siempre. Medido sobre el uso normal: 43.035 muestras de un vigilante
+durante ciclos concurrentes de toma, latido y devolución, sin una sola
+violación.
 
 **Hasta dónde llega la garantía.** A3.1 hace atómica LA TOMA. No hace
 atómico el resto del ciclo de vida, y conviene tenerlo claro porque la
@@ -224,11 +245,13 @@ en `persistir`), que es A3.2. No se adelantó aquí para no rehacer las nueve
   valor obsoleto en Git. SQLite es la autoridad: `cargar`, la API y el
   tablero leen de ahí, así que nadie decide nada con el JSON atrasado.
 
-  Esto se nota en `tomar` y no en las demás órdenes precisamente porque
-  `tomar` es la única que NO pisa la base: las otras escriben con
-  `persistir`, cuyo UPDATE incondicional deja base y espejo de acuerdo en
-  un valor que puede ser el equivocado. Preferir un espejo atrasado a un
-  valor pisado es deliberado. La ventana se cierra sola con A3.2: cuando
+  La ventana existe igual en `persistir`, que también escribe el espejo
+  después del COMMIT: dos órdenes concurrentes pueden confirmar en un
+  orden y escribir el JSON en el contrario. La diferencia es otra. Al
+  pisar la base con un UPDATE incondicional, `persistir` deja base y
+  espejo de acuerdo en un valor que puede ser el equivocado; `tomar`, que
+  no pisa, deja el espejo atrasado respecto de un valor correcto. Preferir
+  lo segundo es deliberado. La ventana se cierra sola con A3.2: cuando
   ninguna orden pueda tocar una tarea ajena, nada podrá cruzarse ahí.
 
   Si el proceso muere justo en esa ventana, el estado operativo está a
@@ -238,7 +261,9 @@ en `persistir`), que es A3.2. No se adelantó aquí para no rehacer las nueve
   los perdedores con "table tareas already exists" (deuda declarada de A2,
   en `inicializar()`). Está comprobado que no produce dos propietarios:
   falla de forma explícita, sin corromper nada. Basta con crear la base
-  una vez (`inicializar-estado`) antes de lanzar trabajadores.
+  una vez (`inicializar-estado`) antes de lanzar trabajadores. Comprobado
+  a mano con 6 procesos, un solo ganador en 8 de 8 rondas; no hay prueba
+  automática que lo cubra, porque corregirlo es A3.2.
 - **El refresco de definiciones todavía puede pisar el ámbito de una tarea
   viva, por la puerta de `cargar`.** A3.1 cerró la puerta ancha: `tomar` ya
   no refresca las definiciones de las demás tareas. Pero `cargar`, que es
@@ -333,8 +358,12 @@ lo caro es arrancar los procesos) sino reducir el número de contendientes.
   `sincronizar-definiciones`.
 - (A3.1) Toma atómica de tareas: compitan los trabajadores que compitan por
   la misma tarea, gana exactamente uno. Comprobado con carreras reales
-  entre procesos y entre conexiones, con una prueba de control que
-  demuestra que el arnés sí detecta una carrera perdida.
+  entre procesos y entre conexiones, y con una prueba de control que pasa
+  por el mismo arnés una toma deliberadamente ingenua —con una ventana de
+  10 ms entre leer y escribir— y EXIGE dobles tomas: si ni con esa ventana
+  colisionara, el arnés estaría roto y el verde de todo lo demás no
+  significaría nada. Que el arnés detecta el defecto REAL, sin ventana
+  artificial, se comprobó aparte por mutación del código.
 
 Pruebas correspondientes:
 

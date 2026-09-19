@@ -865,13 +865,17 @@ def tomar(
     `rowcount` (ver `estado_global.reclamar`). Si algo falla en medio, el
     ROLLBACK deshace la toma entera: no quedan tomas a medias.
 
-    La comprobación de estado que abre la secuencia no concede ni deniega
-    nada por su cuenta: existe para que el rechazo diga el motivo
+    La comprobación de estado que abre la secuencia SÍ deniega: al leerse
+    la fila dentro de esta misma transacción, el perdedor de una carrera ya
+    ve el estado que dejó el ganador y se rechaza aquí, con el motivo
     verdadero. Sin ella, una tarea aprobada o bloqueada cuyo ámbito además
     se solapara se rechazaría por "ámbito en conflicto" y quien la pidiera
     esperaría a que se liberase un ámbito que no la desbloquearía nunca.
-    Tampoco abre ninguna ventana: se decide sobre la fila leída dentro de
-    esta misma transacción.
+
+    Lo que NO hace es conceder: eso lo decide el UPDATE condicional, que
+    queda como red de seguridad del primitivo. Y no abre ninguna ventana,
+    porque decide sobre una fila leída con el bloqueo de escritura ya
+    tomado.
 
     Lo que NO está dentro de la transacción es deliberado: leer el árbol de
     trabajo y consultar Git son esperas de disco, y sostener el bloqueo de
