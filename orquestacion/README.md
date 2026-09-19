@@ -154,15 +154,19 @@ vuelve a validar lo único que importa.
 
 **Códigos de salida de `tomar`** (la orden de la línea de comandos):
 
-| Código | Significado |
-|---|---|
-| 0 | Tarea tomada |
-| 2 | Error del Supervisor (ficha inválida, ámbito en conflicto, base ilegible) |
-| 3 | **Toma rechazada**: otro trabajador se adelantó, la tarea no existe o su estado no admite toma |
+| Código | Significado | Ejemplo |
+|---|---|---|
+| 0 | Tarea tomada | — |
+| 2 | Error del Supervisor | ficha inexistente o inválida, ámbito en conflicto con otra tarea activa, base ilegible |
+| 3 | **Toma rechazada** | otro trabajador se adelantó, o el estado de la tarea no admite toma (`propuesto`, `aprobado`, `bloqueado`…) |
 
 El 3 distingue "perdí la carrera" de "el Supervisor está roto". Un
-orquestador (n8n, un script) puede reintentar con otra tarea ante un 3 y
-detenerse ante un 2.
+orquestador (n8n, un script) puede pasar a otra tarea ante un 3 y detenerse
+ante un 2.
+
+El ámbito en conflicto sale por el 2 a propósito: no es una carrera que se
+pueda reintentar, sino una tarea que no se podrá tomar mientras la otra
+siga activa.
 
 **Decisión de diseño.** El `WHERE` condiciona sólo por `estado`, no por
 `trabajador_id IS NULL`. Añadir esa condición dejaría permanentemente

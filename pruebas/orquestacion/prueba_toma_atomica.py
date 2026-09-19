@@ -1392,6 +1392,83 @@ def prueba_i_la_toma_sobrevive_al_apagon():
         borrar(raiz)
 
 
+def _cli(raiz: Path, *argumentos) -> subprocess.CompletedProcess:
+    """Invoca la línea de órdenes canónica en un proceso nuevo."""
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "orquestacion.ingenieria_supervisor",
+            "--raiz",
+            str(raiz),
+            *argumentos,
+        ],
+        cwd=str(RAIZ),
+        env=corredor.entorno_controlado(RAIZ),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+    )
+
+
+def prueba_h_codigo_de_salida_de_la_toma_rechazada():
+    """
+    Perder la carrera tiene su propio código de salida: 3, no 2.
+
+    Quien automatice el Supervisor (n8n, un guion) necesita distinguir
+    "perdí la carrera, paso a otra tarea" de "el Supervisor está roto,
+    me detengo". Si ambos casos salieran con el mismo código, un
+    orquestador reintentaría en bucle sobre una avería real.
+    """
+    raiz = crear_repositorio()
+
+    try:
+        ficha_minima(raiz, "T-0901")
+
+        primera = _cli(raiz, "tomar", "T-0901", "--trabajador", "equipo/cli/1")
+
+        assert primera.returncode == 0, primera.stdout + primera.stderr
+
+        perdida = _cli(raiz, "tomar", "T-0901", "--trabajador", "equipo/cli/2")
+
+        assert perdida.returncode == 3, (
+            "Perder la carrera debía salir con 3: "
+            + str(perdida.returncode) + "\n" + perdida.stdout
+        )
+        assert "TOMA RECHAZADA" in perdida.stdout, perdida.stdout
+        assert "equipo/cli/1" in perdida.stdout, (
+            "El rechazo debe decir quién tiene la tarea: " + perdida.stdout
+        )
+        assert estado_global.MOTIVO_YA_RECLAMADA in perdida.stdout, (
+            perdida.stdout
+        )
+
+        # Un error de verdad NO se confunde con perder la carrera.
+        inexistente = _cli(raiz, "tomar", "T-9999", "--trabajador", "equipo/x")
+
+        assert inexistente.returncode == 2, (
+            "Una tarea inexistente es un error, no una carrera perdida: "
+            + str(inexistente.returncode) + "\n" + inexistente.stdout
+        )
+
+        # El ámbito en conflicto tampoco: no es una carrera reintentable.
+        ficha_minima(
+            raiz, "T-0902",
+            ambito_archivos=["modulos/demostracion/T-0901.py"],
+        )
+
+        choque = _cli(raiz, "tomar", "T-0902", "--trabajador", "equipo/cli/3")
+
+        assert choque.returncode == 2, (
+            "El ámbito en conflicto debía salir con 2: "
+            + str(choque.returncode) + "\n" + choque.stdout
+        )
+    finally:
+        borrar(raiz)
+
+
 # ----------------------------------------------------------------------
 # J. Integridad de la base tras las carreras
 # ----------------------------------------------------------------------
@@ -1827,6 +1904,8 @@ COMPROBACIONES = [
      prueba_g_rollback_con_la_base_sin_espacio),
     ("H. proceso nuevo lee al propietario",
      prueba_h_proceso_nuevo_lee_al_propietario),
+    ("H. código de salida de la toma rechazada",
+     prueba_h_codigo_de_salida_de_la_toma_rechazada),
     ("I. persistencia de la toma", prueba_i_persistencia_del_claim),
     ("I. la toma sobrevive al apagón", prueba_i_la_toma_sobrevive_al_apagon),
     ("J. integridad de SQLite", prueba_j_integridad_sqlite),
