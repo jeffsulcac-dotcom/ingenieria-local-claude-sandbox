@@ -851,12 +851,9 @@ def reclamar(
         tuple(campos.values()) + (identificador,) + estados,
     )
 
-    if cursor.rowcount > 1:
-        raise ErrorEstadoGlobal(
-            "La toma de '" + str(identificador) + "' modificó "
-            + str(cursor.rowcount) + " filas; 'id' debería ser única."
-        )
-
+    # `rowcount` sólo puede valer 0 o 1: el WHERE filtra por `id`, que es
+    # PRIMARY KEY. La unicidad la garantiza el esquema, no una comprobación
+    # en tiempo de ejecución que nadie podría llegar a ejercitar.
     if cursor.rowcount == 1:
         return {
             "resultado": CLAIM_OTORGADO,

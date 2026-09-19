@@ -300,11 +300,16 @@ worktree de la tarea, lanzamiento de Claude, workers paralelos, worktrees
 automáticos, cola automática, n8n ejecutando tareas, Redis como cola,
 PostgreSQL como estado.
 
+(La toma atómica de esa lista ya está implementada: la trajo A3.1, más
+abajo. El resto sigue pendiente.)
+
 Deuda conocida de A2, no corregida por quedar fuera de su alcance:
 - `inicializar()` lee la versión del esquema antes de abrir la
   transacción. Dos procesos que creen la base a la vez pueden intentar la
   misma migración; el segundo falla con error explícito, sin corromper
-  nada. La concurrencia pertenece a A3/B.
+  nada. SIGUE VIGENTE tras A3.1, y ahora está reproducida: 6 procesos
+  creando la base a la vez dejan a algunos con "table tareas already
+  exists". Nunca produjo doble propietario. Pertenece a A3.2.
 - Borrar una ficha JSON no borra la tarea del estado global: el
   identificador queda reservado y no puede volver a crearse.
 - `prueba_api.py` lee el repositorio real, de modo que ejecutarla crea la
@@ -357,13 +362,20 @@ Componentes:
 Sin cambios de esquema en SQLite: la garantía sale de cómo se escribe, no
 de tablas ni columnas nuevas.
 
-Evidencia de concurrencia REAL (no "PASS"), corrida de estrés medida:
+Evidencia de concurrencia REAL (no "PASS"). Corrida de estrés, medida con:
+
+    python pruebas/orquestacion/prueba_toma_atomica.py --carreras 100
+
 - RACE_RUNS = 360 carreras con barrera de sincronización
+  (100 con 2 procesos + 100 con 10 procesos + 100 de ámbitos cruzados
+   + 60 entre conexiones; el bloque de control no suma)
 - CLAIMS_SUCCESS = 360 (exactamente una toma concedida por carrera)
 - CLAIMS_REJECTED = 1520
 - DOUBLE_CLAIM_EVENTS = 0
 - SQLITE_ERRORS = 0, UNEXPECTED_EXCEPTIONS = 0
-- PRAGMA integrity_check: 6 de 6 bases en "ok", sin claves foráneas rotas
+- PRAGMA integrity_check: 8 de 8 bases en "ok", sin claves foráneas rotas
+- Contención medida hasta 24 procesos simultáneos: un solo ganador
+  siempre, sin agotar el busy_timeout ni un solo error de SQLite
 
 El arnés se validó por MUTACIÓN del código, no por confianza:
 - reintroducido el TOCTOU en `tomar` (decisión fuera de la transacción):
@@ -388,9 +400,11 @@ Pruebas ejecutadas (Python 3.11.15, Linux):
 - PRUEBA_SUPERVISOR=OK        31 comprobaciones
 - PRUEBA_ESTADO_GLOBAL=OK     16 comprobaciones
 - PRUEBA_API=OK               12 comprobaciones
-- PRUEBA_TOMA_ATOMICA=OK      21 comprobaciones (matriz A..N)
+- PRUEBA_TOMA_ATOMICA=OK      23 comprobaciones (matriz A..N)
 
-6 de 6 archivos de prueba en OK.
+6 de 6 archivos de prueba en OK. La corrida por omisión de
+prueba_toma_atomica tarda unos 7 s, muy por debajo del límite de 120 s que
+el corredor único concede a cada archivo.
 
 NO implementado en A3.1 (reservado a A3.2/B): latidos automáticos,
 expiración de trabajadores, detección de trabajadores muertos, recuperación

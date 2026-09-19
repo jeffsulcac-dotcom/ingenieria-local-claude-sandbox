@@ -124,6 +124,11 @@ METRICAS = {
 # Detalle por bloque de carreras, para poder reportar sin inventar nada.
 INFORMES = []
 
+# Bloques que miden el ARNÉS, no la implementación: sus dobles tomas son
+# deliberadas, así que figuran en el informe pero no suman a los totales.
+ETIQUETA_CONTROL = "control ingenuo x4"
+CONTROLES = frozenset({ETIQUETA_CONTROL})
+
 
 def _acumular(informe: dict) -> None:
     """Suma un bloque de carreras a las métricas globales."""
@@ -686,7 +691,7 @@ def prueba_el_detector_detecta_la_carrera():
 
                 _liberar(raiz, "T-0901")
 
-        informe = _juzgar_carreras("control ingenuo x4", respuestas_por_ronda)
+        informe = _juzgar_carreras(ETIQUETA_CONTROL, respuestas_por_ronda)
 
         # NO se acumula en las métricas globales: este bloque mide el arnés,
         # no la implementación real, y sus dobles tomas son deliberadas.
@@ -1928,45 +1933,65 @@ def prueba_n_idempotencia_del_rechazo():
 # Informe de métricas
 # ----------------------------------------------------------------------
 
+def _fila_de_informe(informe: dict) -> str:
+    return (
+        "    · " + informe["ETIQUETA"].ljust(26)
+        + "  carreras=" + str(informe["RACE_RUNS"]).rjust(4)
+        + "  contendientes=" + str(informe["CONTENDIENTES"]).rjust(3)
+        + "  tomas=" + str(informe["CLAIMS_SUCCESS"]).rjust(4)
+        + "  rechazos=" + str(informe["CLAIMS_REJECTED"]).rjust(5)
+        + "  dobles=" + str(informe["DOUBLE_CLAIMS"]).rjust(3)
+    )
+
+
 def imprimir_metricas() -> None:
+    """
+    El informe de la corrida. Las cifras salen de lo medido, no de lo previsto.
+
+    El bloque de control se imprime aparte y se dice por qué: sus dobles
+    tomas son deliberadas y NO suman a los totales. Si apareciera en la
+    misma lista, la tabla y los totales se contradirían en pantalla y
+    quien leyera el informe no tendría forma de saber cuál creer.
+    """
+    reales = [i for i in INFORMES if i["ETIQUETA"] not in CONTROLES]
+    controles = [i for i in INFORMES if i["ETIQUETA"] in CONTROLES]
+
     print("")
     print("  MÉTRICAS DE CONCURRENCIA (medidas, no estimadas)")
     print("")
 
-    for informe in INFORMES:
+    for informe in reales:
+        print(_fila_de_informe(informe))
+
+    if controles:
+        print("")
         print(
-            "    · " + informe["ETIQUETA"].ljust(24)
-            + "  carreras=" + str(informe["RACE_RUNS"]).rjust(4)
-            + "  contendientes=" + str(informe["CONTENDIENTES"]).rjust(3)
-            + "  tomas=" + str(informe["CLAIMS_SUCCESS"]).rjust(4)
-            + "  rechazos=" + str(informe["CLAIMS_REJECTED"]).rjust(5)
-            + "  dobles=" + str(informe["DOUBLE_CLAIMS"]).rjust(3)
+            "    Control del arnés (NO suma a los totales: sus dobles tomas "
+            "son deliberadas)"
         )
+        for informe in controles:
+            print(_fila_de_informe(informe))
 
     print("")
-    print("    RACE_RUNS                = " + str(METRICAS["TOTAL_RACES"]))
-    print(
-        "    CLAIMS_SUCCESS           = "
-        + str(METRICAS["TOTAL_SUCCESSFUL_CLAIMS"])
-    )
-    print(
-        "    CLAIMS_REJECTED          = "
-        + str(METRICAS["TOTAL_REJECTED_CLAIMS"])
-    )
-    print(
-        "    DOUBLE_CLAIM_EVENTS      = "
-        + str(METRICAS["DOUBLE_CLAIM_EVENTS"])
-    )
-    print("    SQLITE_ERRORS            = " + str(METRICAS["SQLITE_ERRORS"]))
-    print(
-        "    UNEXPECTED_EXCEPTIONS    = "
-        + str(METRICAS["UNEXPECTED_EXCEPTIONS"])
-    )
-    print(
-        "    SQLITE_INTEGRITY         = "
-        + str(METRICAS["INTEGRITY_CHECKS"]) + " comprobaciones, "
-        + str(METRICAS["INTEGRITY_FAILURES"]) + " fallos"
-    )
+    print("    Carreras ejecutadas ........... "
+          + str(METRICAS["TOTAL_RACES"]) + "   [RACE_RUNS]")
+    print("    Tomas concedidas .............. "
+          + str(METRICAS["TOTAL_SUCCESSFUL_CLAIMS"]) + "   [CLAIMS_SUCCESS]")
+    print("    Tomas rechazadas .............. "
+          + str(METRICAS["TOTAL_REJECTED_CLAIMS"]) + "   [CLAIMS_REJECTED]")
+    print("    Dobles tomas .................. "
+          + str(METRICAS["DOUBLE_CLAIM_EVENTS"]) + "   [DOUBLE_CLAIM_EVENTS]")
+    print("    Errores de SQLite ............. "
+          + str(METRICAS["SQLITE_ERRORS"]) + "   [SQLITE_ERRORS]")
+    print("    Excepciones inesperadas ....... "
+          + str(METRICAS["UNEXPECTED_EXCEPTIONS"])
+          + "   [UNEXPECTED_EXCEPTIONS]")
+    print("    Integridad de la base ......... "
+          + str(METRICAS["INTEGRITY_CHECKS"]) + " comprobaciones, "
+          + str(METRICAS["INTEGRITY_FAILURES"]) + " fallos"
+          + "   [SQLITE_INTEGRITY]")
+    print("")
+    print("    (Entre corchetes, el nombre con el que cada cifra se reporta.)")
     print("")
 
 

@@ -172,7 +172,6 @@ class ErrorToma(ErrorSupervisor):
     def __init__(self, informe: dict):
         super().__init__(informe.get("detalle") or "No se pudo tomar la tarea.")
 
-        self.informe = dict(informe)
         self.tarea = informe.get("tarea")
         self.motivo = informe.get("motivo")
         self.estado = informe.get("estado")
@@ -859,11 +858,20 @@ def tomar(
     Todo lo que decide la toma ocurre dentro de UNA sola transacción
     `BEGIN IMMEDIATE` sobre la base global:
 
-        comprobación de ámbitos  ->  UPDATE condicional  ->  evento  ->  COMMIT
+        comprobación de estado  ->  comprobación de ámbitos
+        ->  UPDATE condicional  ->  evento  ->  COMMIT
 
     El UPDATE lleva el estado esperado en su WHERE y la decisión se toma con
     `rowcount` (ver `estado_global.reclamar`). Si algo falla en medio, el
     ROLLBACK deshace la toma entera: no quedan tomas a medias.
+
+    La comprobación de estado que abre la secuencia no concede ni deniega
+    nada por su cuenta: existe para que el rechazo diga el motivo
+    verdadero. Sin ella, una tarea aprobada o bloqueada cuyo ámbito además
+    se solapara se rechazaría por "ámbito en conflicto" y quien la pidiera
+    esperaría a que se liberase un ámbito que no la desbloquearía nunca.
+    Tampoco abre ninguna ventana: se decide sobre la fila leída dentro de
+    esta misma transacción.
 
     Lo que NO está dentro de la transacción es deliberado: leer el árbol de
     trabajo y consultar Git son esperas de disco, y sostener el bloqueo de

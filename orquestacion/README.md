@@ -211,13 +211,23 @@ en `persistir`), que es A3.2. No se adelantó aquí para no rehacer las nueve
   vence; la política de expiración pertenece a A3.2.
 - No hay latidos automáticos, expiración de trabajadores, detección de
   trabajadores muertos ni recuperación automática de tareas abandonadas.
-- El espejo JSON se escribe DESPUÉS del COMMIT, así que puede quedar
-  momentáneamente atrasado respecto de SQLite si otra orden se cruza en
-  medio. No es nuevo de A3.1: le pasa a toda operación desde A2. SQLite
-  manda siempre, y la siguiente operación regenera el espejo. Si el
-  proceso muere justo en esa ventana, el estado operativo está a salvo:
-  está comprobado que la toma sobrevive y que la orden siguiente pone el
-  JSON al día.
+- El espejo JSON se escribe DESPUÉS del COMMIT, con lo que la transacción
+  confirmó. Si otra orden se cruza en esa ventana (de microsegundos), el
+  JSON queda desfasado respecto de SQLite hasta la siguiente operación
+  sobre esa tarea, y el commit automático de la ficha puede dejar ese
+  valor obsoleto en Git. SQLite es la autoridad: `cargar`, la API y el
+  tablero leen de ahí, así que nadie decide nada con el JSON atrasado.
+
+  Esto se nota en `tomar` y no en las demás órdenes precisamente porque
+  `tomar` es la única que NO pisa la base: las otras escriben con
+  `persistir`, cuyo UPDATE incondicional deja base y espejo de acuerdo en
+  un valor que puede ser el equivocado. Preferir un espejo atrasado a un
+  valor pisado es deliberado. La ventana se cierra sola con A3.2: cuando
+  ninguna orden pueda tocar una tarea ajena, nada podrá cruzarse ahí.
+
+  Si el proceso muere justo en esa ventana, el estado operativo está a
+  salvo: está comprobado que la toma sobrevive, que la base no queda
+  bloqueada y que la orden siguiente pone el JSON al día.
 - Crear la base desde cero con varios procesos a la vez sigue fallando en
   los perdedores con "table tareas already exists" (deuda declarada de A2,
   en `inicializar()`). Está comprobado que no produce dos propietarios:
