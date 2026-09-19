@@ -553,7 +553,18 @@ corregidas:
   compite por un bloqueo que no necesita. Se comprueba contando las
   sentencias que llegan al motor, no midiendo tiempos.
 
-  Y si hay que convertir, se reintenta de forma acotada. Esto costó una
+  Y si hay que convertir, se reintenta de forma acotada EN TIEMPO, no sólo
+  en número de intentos: durante la conversión se baja el temporizador de
+  ocupado a 250 ms, porque el pragma sí lo respeta y con los 5 s normales
+  el peor caso del bucle subía a unos 41 s. Con eso baja a unos 3 s, y no
+  se pierde nada: el choque que hay que absorber aquí es inmediato, y el
+  resto de operaciones conservan su temporizador completo.
+
+  Los dos motivos por los que WAL puede no activarse se diagnostican
+  distinto, que antes no era así: si el motor nunca se quejó de bloqueo no
+  hay contención ninguna y lo que pasa es que el sistema de archivos no
+  admite WAL. El mensaje de la unidad de red vivía en una rama inalcanzable
+  de `abrir`; ahora sale de donde puede saberse. Esto costó una
   vuelta que merece quedar escrita. Primero se midió que la conversión SÍ
   respeta el `busy_timeout` —con un lector abierto esperó los 5,007 s
   completos antes de rendirse— y de ahí se concluyó que el reintento sobraba

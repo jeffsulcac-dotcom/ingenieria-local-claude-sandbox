@@ -86,6 +86,10 @@ INTENTOS_JOURNAL = 8
 ESPERA_JOURNAL_S = 0.02
 ESPERA_JOURNAL_MAXIMA_S = 0.25
 
+# Temporizador de ocupado SÓLO durante la conversión, para que el peor caso
+# del bucle quede acotado en TIEMPO y no sólo en número de intentos.
+ESPERA_OCUPADO_JOURNAL_MS = 250
+
 # WAL: lecturas que no bloquean escrituras, adecuado para uso local.
 # synchronous=FULL: un corte de energía no pierde transacciones confirmadas.
 JOURNAL_MODE = "wal"
@@ -382,10 +386,32 @@ def _activar_journal(con: sqlite3.Connection, ruta: Path) -> str:
     otro tiene tomada en exclusiva falla igual, y dejarla fuera hacía morir
     sin reintentar nada al primero que llegara mientras otro convierte.
 
-    El modo se devuelve para que quien llama compruebe el resultado real.
+    El modo se devuelve para que quien llama compruebe el resultado real, y
+    sólo se devuelve cuando es el bueno: cualquier otro desenlace lanza con
+    el diagnóstico que corresponda.
     """
+    # Durante la conversión se baja el temporizador de ocupado.
+    #
+    # El pragma de conversión SÍ lo respeta, así que con los 5 s normales
+    # cada intento podía quedarse esperando ese tiempo y el peor caso del
+    # bucle subía a unos 41 s: acotado en número de intentos, pero no en
+    # tiempo, que es lo que de verdad importa. Con 250 ms el peor caso baja
+    # a unos 3 s, y no se pierde nada: el choque que hay que absorber aquí
+    # es inmediato, y quien de verdad necesite esperar mucho es el resto de
+    # operaciones, que conservan BUSY_TIMEOUT_MS.
+    con.execute("PRAGMA busy_timeout = " + str(ESPERA_OCUPADO_JOURNAL_MS))
+
+    try:
+        return _convertir_journal(con, ruta)
+    finally:
+        con.execute("PRAGMA busy_timeout = " + str(BUSY_TIMEOUT_MS))
+
+
+def _convertir_journal(con: sqlite3.Connection, ruta: Path) -> str:
+    """Bucle de conversión propiamente dicho. Ver `_activar_journal`."""
     espera = ESPERA_JOURNAL_S
     ultimo = None
+    nunca_se_bloqueo = True
 
     for intento in range(INTENTOS_JOURNAL):
         try:
@@ -401,6 +427,8 @@ def _activar_journal(con: sqlite3.Connection, ruta: Path) -> str:
             if str(modo).lower() == JOURNAL_MODE:
                 return str(modo)
 
+            # El motor no se quejó y aun así no cambió de modo. Eso ya no
+            # es contención: es que este sistema de archivos no admite WAL.
             ultimo = "quedó en '" + str(modo) + "'"
         except sqlite3.OperationalError as error:
             # Sólo se reintenta el choque con otro que tiene la base.
@@ -408,11 +436,22 @@ def _activar_journal(con: sqlite3.Connection, ruta: Path) -> str:
             if "locked" not in str(error).lower() and "busy" not in str(error).lower():
                 raise
 
+            nunca_se_bloqueo = False
             ultimo = str(error)
 
         if intento + 1 < INTENTOS_JOURNAL:
             time.sleep(espera)
             espera = min(espera * 2, ESPERA_JOURNAL_MAXIMA_S)
+
+    # Los dos desenlaces piden diagnósticos distintos, y antes se daba
+    # siempre el mismo. Si el motor nunca se quejó de bloqueo, no hay
+    # ninguna contención que esperar: el sistema de archivos no admite WAL.
+    if nunca_se_bloqueo:
+        raise ErrorEstadoGlobal(
+            "SQLite no pudo activar journal_mode=" + JOURNAL_MODE + " en '"
+            + str(ruta) + "' (" + str(ultimo) + "), y no por estar ocupada."
+            " ¿La base está en una unidad de red?"
+        )
 
     raise ErrorEstadoGlobal(
         "No se pudo poner la base '" + str(ruta) + "' en journal_mode="
@@ -458,14 +497,12 @@ def abrir(ruta: Path, solo_lectura: bool = False) -> sqlite3.Connection:
         con.execute("PRAGMA busy_timeout = " + str(BUSY_TIMEOUT_MS))
 
         if not solo_lectura:
-            modo = _activar_journal(con, ruta)
-
-            if str(modo).lower() != JOURNAL_MODE:
-                raise ErrorEstadoGlobal(
-                    "SQLite no pudo activar journal_mode=" + JOURNAL_MODE
-                    + " en '" + str(ruta) + "' (quedó en '" + str(modo)
-                    + "'). ¿La base está en una unidad de red?"
-                )
+            # `_activar_journal` devuelve el modo sólo cuando es el bueno;
+            # en cualquier otro caso lanza con el diagnóstico que
+            # corresponda (contención o sistema de archivos). Repetir aquí
+            # la comprobación sería una rama inalcanzable que aparenta
+            # cubrir un caso sin cubrirlo.
+            _activar_journal(con, ruta)
 
             con.execute("PRAGMA synchronous = " + SYNCHRONOUS)
     except sqlite3.Error as error:
@@ -670,9 +707,26 @@ def inicializar(con: sqlite3.Connection) -> dict:
 
         aplicadas.append(version)
 
+    final = version_esquema(con)
+
+    # Última comprobación, y hace falta aunque parezca redundante: cuando la
+    # base ya está al día el bucle de arriba no se ejecuta ni una vez, así
+    # que la guarda que vive dentro no llega a evaluarse. Ése es justo el
+    # camino que recorre `conexion()` en CADA orden. Sin esto, un proceso
+    # con una build antigua podía seguir adelante sobre un esquema que otro
+    # acababa de migrar por delante de él.
+    if final > VERSION_ESQUEMA:
+        raise ErrorEstadoGlobal(
+            "La base global está en la versión de esquema "
+            + str(final)
+            + ", más nueva que la que entiende este Supervisor ("
+            + str(VERSION_ESQUEMA)
+            + ")."
+        )
+
     return {
         "version_anterior": anterior,
-        "version_actual": version_esquema(con),
+        "version_actual": final,
         "aplicadas": aplicadas,
     }
 

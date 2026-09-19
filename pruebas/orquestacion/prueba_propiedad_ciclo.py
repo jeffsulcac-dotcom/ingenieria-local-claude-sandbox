@@ -1319,8 +1319,140 @@ def prueba_l2_el_journal_no_se_reconvierte_en_cada_apertura():
     print("OK")
 
 
+class _ConexionSinWal(sqlite3.Connection):
+    """
+    Conexión que simula un sistema de archivos que no admite WAL.
+
+    El motor no se queja —no hay bloqueo ninguno— pero el modo no cambia.
+    Es el caso de una base en una unidad de red, y es distinto de la
+    contención: esperar no lo arregla nunca.
+    """
+
+    def execute(self, sentencia, *resto):
+        texto = str(sentencia).lower()
+
+        if "journal_mode" in texto and "=" in texto:
+            return super().execute("PRAGMA journal_mode = delete")
+
+        return super().execute(sentencia, *resto)
+
+
+def prueba_l3_el_diagnostico_distingue_ocupada_de_sin_wal():
+    """
+    Los dos motivos por los que WAL puede no activarse se diagnostican
+    distinto.
+
+    Antes se daba siempre el mismo mensaje —"¿hay otro proceso
+    bloqueándola?"— y el diagnóstico correcto para una unidad de red vivía
+    en una rama inalcanzable de `abrir`: `_activar_journal` sólo devuelve el
+    modo cuando ya es el bueno, así que la comprobación posterior nunca se
+    cumplía. Una rama que aparenta cubrir un caso sin cubrirlo es peor que
+    no tenerla.
+
+    Aquí se provoca el caso que NO es contención y se exige el mensaje que
+    de verdad orienta a quien lo lea.
+    """
+    print(" 15. el diagnóstico distingue ocupada de sin WAL:", end=" ")
+
+    raiz = crear_repositorio("wal_")
+
+    try:
+        ruta = estado_global.ruta_base(raiz)
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+
+        con = sqlite3.connect(str(ruta), factory=_ConexionSinWal)
+
+        try:
+            estado_global._activar_journal(con, ruta)
+        except estado_global.ErrorEstadoGlobal as error:
+            mensaje = str(error)
+        else:
+            raise AssertionError(
+                "No se detectó que la base no puede ponerse en WAL."
+            )
+        finally:
+            con.close()
+
+        assert "unidad de red" in mensaje, (
+            "El diagnóstico no distingue 'no admite WAL' de 'está ocupada': "
+            + mensaje
+        )
+        assert "bloqueándola" not in mensaje, (
+            "Se culpa a otro proceso de un fallo que no es de contención: "
+            + mensaje
+        )
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+def prueba_l4_una_migracion_ajena_a_mitad_no_pasa_inadvertida():
+    """
+    Si otro proceso migra por delante, esta build no sigue adelante.
+
+    La guarda de "esquema más nuevo del que entiende este Supervisor" vive
+    al principio de `inicializar`, sobre una lectura en autocommit, y
+    reevaluada dentro de la transacción de cada migración. Pero cuando la
+    base YA está al día el bucle de migraciones no se ejecuta ni una vez,
+    y ése es justo el camino que recorre `conexion()` en CADA orden: una
+    build antigua podía seguir adelante sobre un esquema que otro proceso
+    acababa de migrar por delante de ella.
+
+    La carrera se reproduce de forma determinista: la primera lectura de la
+    versión ve la base al día y la última la ve ya migrada por otro, que es
+    exactamente lo que ocurriría de verdad.
+    """
+    print(" 16. una migración ajena a mitad no pasa inadvertida:", end=" ")
+
+    raiz = crear_repositorio()
+
+    try:
+        estado_global.inicializar_base(raiz)
+
+        original = estado_global.version_esquema
+        vistas = {"n": 0}
+
+        def version_con_carrera(con):
+            vistas["n"] += 1
+            real = original(con)
+
+            # La última lectura, la de después del bucle, ve una versión que
+            # otro proceso acaba de aplicar.
+            return real + 1 if vistas["n"] >= 2 else real
+
+        estado_global.version_esquema = version_con_carrera
+
+        try:
+            con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+            try:
+                estado_global.inicializar(con)
+            except estado_global.ErrorEstadoGlobal as error:
+                mensaje = str(error)
+            else:
+                raise AssertionError(
+                    "Se siguió adelante sobre un esquema más nuevo del que "
+                    "esta build entiende."
+                )
+            finally:
+                con.close()
+        finally:
+            estado_global.version_esquema = original
+
+        assert "más nueva que la que entiende" in mensaje, (
+            "El rechazo no explica el motivo real: " + mensaje
+        )
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
 def prueba_m_codigo_de_salida_por_propiedad():
-    print(" 15. la CLI devuelve 4 al rechazar por propiedad:", end=" ")
+    print(" 17. la CLI devuelve 4 al rechazar por propiedad:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1397,7 +1529,7 @@ def prueba_m_codigo_de_salida_por_propiedad():
 # ----------------------------------------------------------------------
 
 def prueba_n_reanudar_respeta_una_toma_reciente():
-    print(" 16. `reanudar` no arrebata una tarea recién tomada:", end=" ")
+    print(" 18. `reanudar` no arrebata una tarea recién tomada:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1456,7 +1588,7 @@ def prueba_n_reanudar_respeta_una_toma_reciente():
 
 def prueba_o_estres_de_ordenes_rezagadas(rezagadas: int):
     print(
-        " 26. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
+        " 28. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
         "dueño vigente:",
         end=" ",
     )
@@ -1563,7 +1695,7 @@ def prueba_u_la_toma_graba_el_ambito_que_valido():
     escritores sobre los mismos archivos, que es exactamente lo que la
     guarda existe para impedir.
     """
-    print(" 17. la toma graba el ámbito que acaba de validar:", end=" ")
+    print(" 19. la toma graba el ámbito que acaba de validar:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1647,7 +1779,7 @@ def prueba_u3_retomar_con_ambito_encogido_no_libera_el_terreno():
     anterior, que hacía que la toma grabara el ámbito declarado sin mirar
     si ampliaba o encogía. Ahora reclama la UNIÓN.
     """
-    print(" 18. retomar con ámbito encogido no libera el terreno:", end=" ")
+    print(" 20. retomar con ámbito encogido no libera el terreno:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1720,7 +1852,7 @@ def prueba_u2_el_ambito_vigente_no_miente_al_trabajador():
     la declaración que una persona acababa de escribir. Se comprobó
     rompiéndolo.
     """
-    print(" 19. el ámbito vigente no le miente al trabajador:", end=" ")
+    print(" 21. el ámbito vigente no le miente al trabajador:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1792,7 +1924,7 @@ def prueba_v_reordenar_el_ambito_no_congela_nada():
     congelaría toda la definición y bloquearía de paso cualquier arreglo
     que viajara en la misma edición.
     """
-    print(" 20. reordenar el ámbito no congela la definición:", end=" ")
+    print(" 22. reordenar el ámbito no congela la definición:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1849,7 +1981,7 @@ def prueba_w_el_ambito_congelado_no_pide_el_bloqueo_de_escritura():
     de toda la base para no escribir nada; bajo concurrencia eso convierte
     una consulta en una espera que acaba en "database is locked".
     """
-    print(" 21. una consulta sobre tarea congelada no pide el candado:", end=" ")
+    print(" 23. una consulta sobre tarea congelada no pide el candado:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1927,7 +2059,7 @@ def prueba_w2_la_salida_rapida_nunca_escribe_fuera_de_transaccion():
     intercala una lectura que devuelve la tarea ya cerrada, que es justo
     lo que vería el segundo vistazo si otro proceso la cerrara en medio.
     """
-    print(" 22. la salida rápida no escribe fuera de transacción:", end=" ")
+    print(" 24. la salida rápida no escribe fuera de transacción:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2025,7 +2157,7 @@ def prueba_r_la_generacion_no_sale_de_sqlite():
     podía volver a hacer indistinguibles dos ejecuciones, que es justo el
     problema ABA que la columna existe para cerrar.
     """
-    print(" 23. la generación no se puede falsificar desde el JSON:", end=" ")
+    print(" 25. la generación no se puede falsificar desde el JSON:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2225,7 +2357,7 @@ def prueba_s_orden_humana_rezagada_no_revierte_una_transicion():
     Lo cierra la tercera precondición: la escritura exige que la fila siga
     en el estado que tenía cuando se leyó.
     """
-    print(" 24. una orden humana rezagada no revierte el ciclo:", end=" ")
+    print(" 26. una orden humana rezagada no revierte el ciclo:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2279,7 +2411,7 @@ def prueba_t_el_ambito_congelado_se_informa():
     función importante produzca un resultado visible y verificable, y un
     cambio en espera es justo eso.
     """
-    print(" 25. el ámbito congelado se informa, no se disimula:", end=" ")
+    print(" 27. el ámbito congelado se informa, no se disimula:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2411,7 +2543,7 @@ def prueba_p_estres_concurrente(emisores: int, ordenes: int):
     órdenes entre. Una sola aceptada es un fallo, y se nombra cuál fue.
     """
     print(
-        " 27. estrés concurrente: " + str(emisores) + " procesos x "
+        " 29. estrés concurrente: " + str(emisores) + " procesos x "
         + str(ordenes) + " órdenes rezagadas:",
         end=" ",
     )
@@ -2528,6 +2660,8 @@ COMPROBACIONES = (
     prueba_k_el_ambito_se_refresca_cuando_la_tarea_deja_de_estar_viva,
     prueba_l_bootstrap_concurrente,
     prueba_l2_el_journal_no_se_reconvierte_en_cada_apertura,
+    prueba_l3_el_diagnostico_distingue_ocupada_de_sin_wal,
+    prueba_l4_una_migracion_ajena_a_mitad_no_pasa_inadvertida,
     prueba_m_codigo_de_salida_por_propiedad,
     prueba_n_reanudar_respeta_una_toma_reciente,
     prueba_u_la_toma_graba_el_ambito_que_valido,
