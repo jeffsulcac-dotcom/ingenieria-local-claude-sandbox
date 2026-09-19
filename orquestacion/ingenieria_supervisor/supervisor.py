@@ -19,9 +19,23 @@ Reglas duras que este módulo hace cumplir:
    global (`estado_global.py`). Toda operación que cambia estado persiste
    primero en SQLite y sólo después regenera la ficha JSON como espejo.
 
-Lo que NO hace este módulo (reservado para A3/B): toma atómica concurrente
-de tareas, locks, latidos automáticos, detección avanzada de trabajadores
-huérfanos, verificación dentro del worktree de la tarea, lanzamiento de
+6. Desde A3.1, `tomar` es ATÓMICA: comprobación de estado, comprobación
+   de ámbitos y toma ocurren en una sola transacción BEGIN IMMEDIATE, y la
+   concede un UPDATE condicional resuelto por rowcount. Compitan los trabajadores que
+   compitan por la misma tarea, la gana exactamente uno.
+
+   El alcance de esa garantía es la TOMA, no el ciclo de vida entero. Las
+   demás órdenes (`latido`, `devolver`, `verificar` y las humanas) siguen
+   escribiendo con `persistir`, cuyo UPDATE es incondicional: una de ellas
+   que llegue con una lectura vieja puede pisar al ganador de una toma
+   posterior. Corregirlo exige propiedad efectiva del claim, que es A3.2
+   (ver "Limitaciones conocidas de A3.1" en orquestacion/README.md).
+
+Lo que NO hace este módulo (reservado para A3.2/B): propiedad efectiva del
+claim (que cada orden exija ser el propietario), latidos automáticos,
+expiración de trabajadores, detección automática de trabajadores muertos,
+recuperación automática de tareas abandonadas, cola o planificador de
+tareas, verificación dentro del worktree de la tarea, lanzamiento de
 trabajadores.
 
 Este módulo no realiza cálculos de ingeniería.
@@ -140,6 +154,29 @@ class ErrorTransicion(ErrorSupervisor):
 
 class ErrorSolapamiento(ErrorSupervisor):
     """Dos tareas activas quieren escribir sobre el mismo ámbito."""
+
+
+class ErrorToma(ErrorSupervisor):
+    """
+    La tarea no se pudo reclamar: otro trabajador se adelantó, la tarea no
+    existe o su estado no admite toma.
+
+    No es un fallo del sistema sino el resultado NORMAL del perdedor de una
+    carrera: se comunica con todos los datos para que quien lo reciba pueda
+    decidir qué hacer (elegir otra tarea, reintentar, avisar).
+
+    Hereda de ErrorSupervisor, así que quien ya capturaba ErrorSupervisor
+    sigue funcionando sin cambios.
+    """
+
+    def __init__(self, informe: dict):
+        super().__init__(informe.get("detalle") or "No se pudo tomar la tarea.")
+
+        self.tarea = informe.get("tarea")
+        self.motivo = informe.get("motivo")
+        self.estado = informe.get("estado")
+        self.propietario = informe.get("propietario")
+        self.propia = bool(informe.get("propia"))
 
 
 # ----------------------------------------------------------------------
@@ -335,30 +372,32 @@ def solapamientos(ambito_uno: list[str], ambito_dos: list[str]) -> list[tuple]:
 
 
 def conflictos_de_ambito(
-    raiz: Path,
     ficha: Ficha,
+    filas: list[dict],
+    errores: list[dict] | None = None,
     estados_activos: frozenset = ESTADOS_QUE_RETIENEN_AMBITO,
 ) -> list[dict]:
     """
     Conflictos de esta ficha contra todas las tareas que retienen ámbito.
 
-    Se enumera desde SQLite (estado y ámbito registrados), no desde los JSON
-    del árbol actual: así una tarea cuya ficha sólo existe en la rama de
-    otro worktree sigue contando para la regla de un solo escritor.
+    Función PURA: recibe las `filas` ya leídas de SQLite y los `errores` de
+    lectura del árbol. No abre conexiones ni toca el disco.
+
+    Es así desde A3.1 a propósito: `tomar` la ejecuta DENTRO de la misma
+    transacción que concede la toma, con las filas leídas en esa
+    transacción, de modo que entre comprobar el ámbito y escribir la toma
+    no queda ninguna ventana. Si abriera su propia conexión, no podría.
+
+    Se juzga por SQLite (estado y ámbito registrados), no por los JSON del
+    árbol actual: así una tarea cuya ficha sólo existe en la rama de otro
+    worktree sigue contando para la regla de un solo escritor.
 
     Una ficha ilegible que la base todavía no conoce interrumpe, igual que
     en V1: sin conocer su ámbito no se puede garantizar nada.
-
-    La comprobación NO es atómica respecto de otros procesos: la toma
-    concurrente con locks pertenece a A3/B.
     """
     conflictos = []
 
-    fichas, errores = listar_con_errores(raiz)
-
-    with global_.conexion(raiz) as con:
-        global_.sincronizar_lista(con, fichas)
-        filas = global_.listar_tareas(con)
+    errores = errores or []
 
     registradas = {fila["id"] for fila in filas}
 
@@ -510,9 +549,9 @@ def persistir(raiz: Path, ficha: Ficha) -> Ficha:
     3. Sólo entonces se regenera el JSON como espejo, con la misma marca de
        actualización, mediante la escritura atómica ya existente.
 
-    Si el espejo no se pudiera escribir, el estado global ya quedó
-    confirmado y la siguiente persistencia lo regenera: nunca hay dos
-    escrituras contradictorias, porque el JSON siempre sale de SQLite.
+    No sirve para la TOMA de una tarea: su UPDATE es incondicional y
+    pisaría al ganador de una carrera. La toma usa `estado_global.reclamar`
+    (ver `tomar`).
     """
     Ficha.desde_dict(ficha.a_dict())
 
@@ -534,6 +573,19 @@ def persistir(raiz: Path, ficha: Ficha) -> Ficha:
 
     ficha.eventos_pendientes.clear()
 
+    _regenerar_espejo(raiz, ficha)
+
+    return ficha
+
+
+def _regenerar_espejo(raiz: Path, ficha: Ficha) -> None:
+    """
+    Reescribe el JSON como espejo de lo que SQLite ya confirmó.
+
+    Si el espejo no se pudiera escribir, el estado global ya quedó
+    confirmado y la siguiente persistencia lo regenera: nunca hay dos
+    escrituras contradictorias, porque el JSON siempre sale de SQLite.
+    """
     try:
         guardar(raiz, ficha, marcar_actualizacion=False)
     except (ErrorFicha, OSError) as error:
@@ -543,8 +595,6 @@ def persistir(raiz: Path, ficha: Ficha) -> Ficha:
             "el espejo JSON: " + str(error) + ". La siguiente operación lo "
             "regenerará; no se registró ningún commit."
         ) from error
-
-    return ficha
 
 
 # ----------------------------------------------------------------------
@@ -788,22 +838,61 @@ def tomar(
     git=None,
 ) -> Ficha:
     """
-    Reclama una tarea para trabajarla.
+    Reclama una tarea para trabajarla. Toma ATÓMICA desde A3.1.
 
-    Aquí se aplica la regla de un solo escritor: si otra tarea activa declara
-    un ámbito que se solapa, la toma se rechaza.
+    Cuando varios trabajadores compiten por la MISMA tarea, exactamente uno
+    obtiene la toma; los demás reciben `ErrorToma`, que describe quién la
+    tiene y en qué estado quedó. Dos tomas nunca se conceden a la vez.
 
-    A2: la comprobación y la escritura no son atómicas entre procesos.
-    La toma atómica concurrente con locks pertenece a A3/B.
+    Lo que esto NO promete: que el propietario resultante sobreviva a lo
+    que hagan después las demás órdenes. `latido`, `devolver` y `verificar`
+    escriben con `persistir`, cuyo UPDATE es incondicional, así que una de
+    ellas con una lectura vieja puede sobrescribir a quien acaba de ganar.
+    Eso lo resuelve la propiedad efectiva del claim, que es A3.2.
+
+    Aquí se aplica además la regla de un solo escritor: si otra tarea activa
+    declara un ámbito que se solapa, la toma se rechaza.
+
+    Cómo se garantiza
+    -----------------
+    Todo lo que decide la toma ocurre dentro de UNA sola transacción
+    `BEGIN IMMEDIATE` sobre la base global:
+
+        comprobación de estado  ->  comprobación de ámbitos
+        ->  UPDATE condicional  ->  evento  ->  COMMIT
+
+    El UPDATE lleva el estado esperado en su WHERE y la decisión se toma con
+    `rowcount` (ver `estado_global.reclamar`). Si algo falla en medio, el
+    ROLLBACK deshace la toma entera: no quedan tomas a medias.
+
+    La comprobación de estado que abre la secuencia SÍ deniega: al leerse
+    la fila dentro de esta misma transacción, el perdedor de una carrera ya
+    ve el estado que dejó el ganador y se rechaza aquí, con el motivo
+    verdadero. Sin ella, una tarea aprobada o bloqueada cuyo ámbito además
+    se solapara se rechazaría por "ámbito en conflicto" y quien la pidiera
+    esperaría a que se liberase un ámbito que no la desbloquearía nunca.
+
+    Lo que NO hace es conceder: eso lo decide el UPDATE condicional, que
+    queda como red de seguridad del primitivo. Y no abre ninguna ventana,
+    porque decide sobre una fila leída con el bloqueo de escritura ya
+    tomado.
+
+    Lo que NO está dentro de la transacción es deliberado: leer el árbol de
+    trabajo y consultar Git son esperas de disco, y sostener el bloqueo de
+    escritura mientras tanto castigaría a todos los demás trabajadores. Nada
+    de eso decide la toma; sólo aporta datos que el UPDATE vuelve a validar.
+
+    El espejo JSON se regenera DESPUÉS del COMMIT, a partir de la fila que
+    la propia transacción confirmó.
+
+    Un rechazo no cambia el estado operativo de ninguna tarea: ni el
+    estado, ni el propietario, ni los intentos. Sí puede haber quedado
+    antes el trabajo de incorporación que hacen `cargar` y
+    `sincronizar_lista`, que registran en la base las fichas JSON que
+    todavía no conocía. Eso es bootstrap de definiciones, no la toma, y
+    ocurre igual aunque nadie reclame nada.
     """
     ficha = cargar(raiz, identificador)
-
-    if ficha.estado not in ESTADOS_TOMABLES:
-        raise ErrorSupervisor(
-            "No se puede tomar una tarea en estado '"
-            + str(ficha.estado)
-            + "'."
-        )
 
     # Sin ámbito declarado no hay forma de garantizar un solo escritor.
     if not ficha.ambito_archivos:
@@ -824,46 +913,137 @@ def tomar(
             "repositorio. Patrones inválidos: " + ", ".join(invalidos) + "."
         )
 
-    conflictos = conflictos_de_ambito(raiz, ficha)
-
-    if conflictos:
-        detalle = "; ".join(
-            uno["tarea"]
-            + " ("
-            + ", ".join(
-                par["propio"] + " <-> " + par["ajeno"] for par in uno["pares"]
-            )
-            + ")"
-            for uno in conflictos
-        )
-
-        raise ErrorSolapamiento(
-            "Ámbito en conflicto con tareas activas: "
-            + detalle
-            + ". Un solo escritor por archivo."
-        )
-
     momento = (ahora or ahora_datetime()).isoformat(timespec="seconds")
 
-    ficha.trabajador_id = trabajador_id or nuevo_trabajador_id()
-    ficha.pid = pid if pid is not None else os.getpid()
-    ficha.iniciado_en = momento
-    ficha.ultimo_latido = momento
+    aspirante = trabajador_id or nuevo_trabajador_id()
+    proceso = pid if pid is not None else os.getpid()
 
-    if not ficha.rama:
-        ficha.rama = PREFIJO_RAMA + ficha.id
+    rama = ficha.rama or PREFIJO_RAMA + ficha.id
 
-    if git is not None and ficha.commit_inicial is None:
-        ficha.commit_inicial = git.hash_actual()
+    commit_inicial = ficha.commit_inicial
 
-    transicionar(
-        ficha,
-        Estado.EN_EJECUCION,
-        "Tarea tomada por " + ficha.trabajador_id + ".",
-        ORIGEN_AUTOMATICO,
-    )
+    if git is not None and commit_inicial is None:
+        commit_inicial = git.hash_actual()
 
-    persistir(raiz, ficha)
+    # El árbol de trabajo y Git se leen ANTES de abrir la transacción.
+    definiciones, ilegibles = listar_con_errores(raiz)
+
+    with global_.conexion(raiz) as con:
+        # `solo_importar`: se incorporan las tareas que la base todavía no
+        # conoce (sin ellas, la comprobación de ámbitos se interrumpiría),
+        # pero NO se refresca la definición de las que ya están.
+        #
+        # Refrescarlas reescribiría `ambito_archivos`, que es justo el dato
+        # del que depende la regla de un solo escritor, y lo haría con la
+        # definición de ESTA rama aunque la tarea esté en ejecución en otro
+        # worktree con otro ámbito. La toma siguiente ya no vería el
+        # solapamiento y dos trabajadores acabarían escribiendo los mismos
+        # archivos. El refresco por huella es de `sincronizar-definiciones`.
+        #
+        # La definición de la tarea que se toma sí está al día: `cargar`
+        # la sincronizó al principio.
+        global_.sincronizar_lista(con, definiciones, solo_importar=True)
+
+        with global_.transaccion(con):
+            filas = global_.listar_tareas(con)
+
+            # Estado previo tal como lo ve ESTA transacción. Sólo sirve
+            # para explicar el rechazo y documentar el evento: quien
+            # concede la toma es el WHERE del UPDATE, no esta lectura.
+            previa = next(
+                (fila for fila in filas if fila["id"] == ficha.id), None
+            )
+
+            # Si el estado ya no admite toma, se dice ESO y no otra cosa.
+            # Sin esta comprobación, una tarea aprobada o rechazada cuyo
+            # ámbito además se solape se rechazaría por "ámbito en
+            # conflicto", mandando a quien la pidió a esperar a que se
+            # libere un ámbito que no la desbloquearía nunca.
+            #
+            # No reintroduce ninguna ventana: se decide sobre la fila leída
+            # DENTRO de la transacción, y la toma la sigue concediendo el
+            # UPDATE condicional, no esta lectura.
+            if previa is not None and previa["estado"] not in {
+                str(estado) for estado in ESTADOS_TOMABLES
+            }:
+                raise ErrorToma(
+                    global_.rechazo(
+                        previa, ficha.id, aspirante, momento, ESTADOS_TOMABLES
+                    )
+                )
+
+            conflictos = conflictos_de_ambito(ficha, filas, ilegibles)
+
+            if conflictos:
+                detalle = "; ".join(
+                    uno["tarea"]
+                    + " ("
+                    + ", ".join(
+                        par["propio"] + " <-> " + par["ajeno"]
+                        for par in uno["pares"]
+                    )
+                    + ")"
+                    for uno in conflictos
+                )
+
+                raise ErrorSolapamiento(
+                    "Ámbito en conflicto con tareas activas: "
+                    + detalle
+                    + ". Un solo escritor por archivo."
+                )
+
+            informe = global_.reclamar(
+                con,
+                ficha.id,
+                trabajador_id=aspirante,
+                pid=proceso,
+                momento=momento,
+                estados_reclamables=ESTADOS_TOMABLES,
+                estado_destino=str(Estado.EN_EJECUCION),
+                campos_extra={
+                    "rama": rama,
+                    "commit_inicial": commit_inicial,
+                    "actualizado_en": ahora_utc(),
+                },
+            )
+
+            if informe["resultado"] != global_.CLAIM_OTORGADO:
+                raise ErrorToma(informe)
+
+            evento = {
+                "fecha": momento,
+                "tipo": global_.EVENTO_TRANSICION,
+                "estado_anterior": previa["estado"] if previa else None,
+                "estado_nuevo": str(Estado.EN_EJECUCION),
+                "motivo": "Tarea tomada por " + aspirante + ".",
+                "origen": ORIGEN_AUTOMATICO,
+                "datos": {"trabajador_id": aspirante, "pid": proceso},
+            }
+
+            # Una tarea reclamable no debería conservar propietario. Si lo
+            # conserva (ficha V1 importada a medias), la toma lo desplaza y
+            # lo deja anotado: todo cambio tiene que ser trazable.
+            if previa and previa.get("trabajador_id"):
+                evento["datos"]["propietario_desplazado"] = previa[
+                    "trabajador_id"
+                ]
+
+            global_.insertar_evento(con, ficha.id, evento)
+
+            # La fila se lee DENTRO de la transacción, no después: así lo
+            # que se devuelve es exactamente lo que el COMMIT confirmó. Si
+            # se leyera fuera, otra operación podría colarse en medio y
+            # `tomar` devolvería una ficha que ya no es de quien la pidió.
+            fila = global_.obtener_tarea(con, ficha.id)
+
+    global_.aplicar_fila(ficha, fila)
+
+    # El historial del JSON no se reconstruye desde SQLite: se le añade el
+    # evento que la transacción acaba de confirmar.
+    ficha.registrar_evento(evento)
+    ficha.eventos_pendientes.clear()
+
+    _regenerar_espejo(raiz, ficha)
 
     _registrar_en_git(git, ficha, "Tarea tomada.")
 

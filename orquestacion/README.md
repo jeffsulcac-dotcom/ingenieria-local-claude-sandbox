@@ -26,7 +26,7 @@ Programa local de línea de comandos:
 | `tarea.py` | Contrato de la ficha, escritura atómica, lectura tolerante a fallos |
 | `pruebas.py` | Corredor único de pruebas y veredicto OK / FALLO / INDETERMINADO |
 | `supervisor.py` | Máquina de estados, ámbitos, recuperación, límites de commit |
-| `estado_global.py` | Base SQLite global: ubicación, esquema, transacciones, bootstrap, diagnóstico (A2) |
+| `estado_global.py` | Base SQLite global: ubicación, esquema, transacciones, bootstrap, diagnóstico (A2) y toma atómica (A3.1) |
 | `__main__.py` | Interfaz de línea de comandos, en español |
 
 Estado persistente (desde A2, ver la sección siguiente):
@@ -98,15 +98,286 @@ y reanudar. `estado`, `ver`, la API y el tablero `/desarrollo` leen SQLite.
 - Borrar una ficha JSON no borra la tarea del estado global: el
   identificador queda reservado, la tarea sigue visible marcada como
   "definición no legible" y no puede volver a crearse con el mismo id.
-- La comprobación de solapamiento de ámbitos y la escritura de `tomar` no
-  son atómicas entre procesos.
 - `verificar` ejecuta las pruebas sobre la raíz indicada, no sobre el
   worktree registrado de la tarea.
 - `latido` y `reanudar` siguen siendo órdenes manuales.
 
+(La atomicidad de `tomar` entre procesos era también una limitación de A2;
+la resuelve A3.1, en la sección siguiente.)
+
 Prueba correspondiente:
 
     pruebas/orquestacion/prueba_estado_global.py
+
+### A3.1 — Toma atómica de tareas
+
+**Qué resuelve.** Hasta A2, `tomar` leía el estado, comprobaba si la tarea
+estaba libre y escribía, cada paso con una conexión distinta y con un
+UPDATE incondicional. Dos trabajadores que competían por la misma tarea
+pasaban ambos la comprobación y el segundo pisaba al primero: **doble
+propietario**. Era un TOCTOU real, no teórico.
+
+**Cómo se resuelve.** Todo lo que decide la toma ocurre dentro de UNA sola
+transacción `BEGIN IMMEDIATE` sobre la base global:
+
+    comprobación de estado  ->  comprobación de ámbitos
+    ->  UPDATE condicional  ->  evento  ->  COMMIT
+
+La comprobación de estado que abre la secuencia SÍ deniega: es la que, en
+la práctica, rechaza al perdedor de una carrera, porque al leerse la fila
+dentro de esta misma transacción ya ve el estado que la toma anterior dejó.
+Está ahí para que el motivo sea el verdadero y no "ámbito en conflicto"
+cuando el problema es que la tarea está aprobada. Lo que NO hace es
+conceder: eso lo sigue decidiendo el UPDATE condicional.
+
+Por qué no puede haber dos ganadores. No es un mecanismo, son tres, y
+conviene saber cuál actúa dónde:
+
+1. `BEGIN IMMEDIATE` pide el bloqueo de escritura en el primer instante de
+   la transacción. SQLite admite un solo escritor: la segunda toma espera
+   (`busy_timeout = 5000 ms`) a que la primera confirme o anule. **Éste es
+   el que sostiene la garantía en `tomar`**: cuando la segunda transacción
+   por fin entra, lee la fila ya cambiada y se rechaza.
+2. El estado esperado viaja en la propia cláusula `WHERE` del UPDATE. El
+   motor lo comprueba contra la fila REAL en el momento de escribir, no
+   contra una lectura anterior: no queda ventana entre comprobar y escribir.
+3. La decisión se toma con `rowcount`, el número de filas que el motor
+   modificó de verdad. 1 = ganó; 0 = alguien se adelantó. No se deduce de
+   ninguna lectura hecha por Python.
+
+Los mecanismos 2 y 3 son la garantía de `estado_global.reclamar`, el
+primitivo, y se ejercitan de lleno en la carrera entre conexiones, que lo
+llama directamente. Desde `tomar`, en cambio, el perdedor ya se rechaza en
+la comprobación de estado, así que el `rowcount = 0` no llega a ocurrir:
+el UPDATE condicional queda de red de seguridad, no de primera línea. Se
+dice porque es la verdad medible, y porque quien use `reclamar` por su
+cuenta sí depende de los tres.
+
+Además, conceder la toma cambia el estado a uno que ya no es reclamable, de
+modo que el propio cambio cierra la puerta al siguiente aspirante.
+
+**Qué se añadió.**
+
+| Dónde | Qué |
+|---|---|
+| `estado_global.reclamar` | Primitivo de toma atómica: UPDATE condicional resuelto por `rowcount`. Un conflicto NO es excepción, se devuelve descrito |
+| `estado_global.rechazo` | Describe por qué no se concede una toma, siempre con el mismo formato, venga del UPDATE o de la comprobación previa |
+| `supervisor.ErrorToma` | Rechazo controlado con tarea, motivo, estado, propietario y si la tarea ya era propia. Hereda de `ErrorSupervisor` |
+| `supervisor.conflictos_de_ambito` | Pasa a ser función pura, para poder ejecutarse dentro de la transacción de la toma |
+| `supervisor.tomar` | Reescrita alrededor de la transacción única |
+| `__main__.py` | Código de salida 3 para la toma rechazada |
+
+**Leer el árbol y consultar Git quedan FUERA de la transacción a
+propósito**: son esperas de disco, no deciden nada, y sostener el bloqueo de
+escritura mientras tanto castigaría a los demás trabajadores. El UPDATE
+vuelve a validar lo único que importa.
+
+**Códigos de salida de `tomar`** (la orden de la línea de comandos):
+
+| Código | Significado | Ejemplo |
+|---|---|---|
+| 0 | Tarea tomada | — |
+| 2 | Error del Supervisor | ficha inexistente o inválida, ámbito en conflicto con otra tarea activa, base ilegible |
+| 3 | **Toma rechazada** | otro trabajador se adelantó, o el estado de la tarea no admite toma (`propuesto`, `aprobado`, `bloqueado`…) |
+
+El 3 distingue "perdí la carrera" de "el Supervisor está roto". Un
+orquestador (n8n, un script) puede pasar a otra tarea ante un 3 y detenerse
+ante un 2.
+
+El ámbito en conflicto sale por el 2 a propósito: no es una carrera que se
+pueda reintentar, sino una tarea que no se podrá tomar mientras la otra
+siga activa.
+
+**Decisión de diseño.** El `WHERE` condiciona sólo por `estado`, no por
+`trabajador_id IS NULL`. Añadir esa condición dejaría permanentemente
+intomable una fila que estuviera en estado reclamable pero conservara un
+propietario residual (ficha V1 importada a medias, edición externa), y la
+recuperación automática está fuera del alcance de A3.1. En su lugar la toma
+desplaza al residual y lo anota en el evento
+(`datos.propietario_desplazado`), para que el cambio sea trazable.
+
+El invariante en el que se apoya esto —que un estado reclamable (`nuevo`,
+`reabierto`, `requiere_revision`) no conserva propietario— se cumple para
+toda fila que escribe el propio Supervisor, porque `verificar`, `devolver`
+y `reanudar` liberan al trabajador. NO se cumple para las que llegan por
+importación de una ficha V1 o por una edición externa de la base, y esas
+son justamente las que la condición extra habría dejado intomables para
+siempre. Medido sobre el uso normal: 43.035 muestras de un vigilante
+durante ciclos concurrentes de toma, latido y devolución, sin una sola
+violación.
+
+**Hasta dónde llega la garantía.** A3.1 hace atómica LA TOMA. No hace
+atómico el resto del ciclo de vida, y conviene tenerlo claro porque la
+diferencia importa:
+
+| Situación | ¿Garantizado? |
+|---|---|
+| Varios trabajadores reclaman la misma tarea a la vez | Sí: gana exactamente uno |
+| Dos tareas con ámbitos solapados reclamadas a la vez | Sí: se concede una sola |
+| El propietario que ganó sobrevive a las demás órdenes | **No**: ver abajo |
+
+`latido`, `devolver`, `verificar` y las órdenes humanas siguen escribiendo
+con `persistir`, cuyo UPDATE es incondicional. Una de esas órdenes que
+llegue con una lectura vieja puede sobrescribir al trabajador que acababa
+de ganar la toma. Ejemplo medido: A emite un latido; antes de que su
+escritura llegue, un humano devuelve la tarea y C la toma legítimamente; la
+escritura de A pisa entonces a C y la fila vuelve a decir A. Resolverlo
+exige que cada orden exija ser el propietario (UPDATE condicional también
+en `persistir`), que es A3.2. No se adelantó aquí para no rehacer las nueve
+órdenes del ciclo dentro de una etapa cuyo alcance es la toma.
+
+**Limitaciones conocidas de A3.1 (por diseño).**
+
+- La unicidad de propietario está garantizada para la toma, no para el
+  resto del ciclo de vida (ver la tabla anterior). Es la deuda principal
+  que hereda A3.2.
+- `latido` y `verificar` no comprueban que quien llama sea el propietario
+  de la tarea: cualquiera puede latir o verificar una tarea ajena. La
+  propiedad efectiva del claim pertenece a A3.2.
+- `reanudar` puede arrebatar una tarea a un trabajador vivo si su latido
+  vence; la política de expiración pertenece a A3.2.
+- No hay latidos automáticos, expiración de trabajadores, detección de
+  trabajadores muertos ni recuperación automática de tareas abandonadas.
+- El espejo JSON se escribe DESPUÉS del COMMIT, con lo que la transacción
+  confirmó. Si otra orden se cruza en esa ventana (de microsegundos), el
+  JSON queda desfasado respecto de SQLite hasta la siguiente operación
+  sobre esa tarea, y el commit automático de la ficha puede dejar ese
+  valor obsoleto en Git. SQLite es la autoridad: `cargar`, la API y el
+  tablero leen de ahí, así que nadie decide nada con el JSON atrasado.
+
+  La ventana existe igual en `persistir`, que también escribe el espejo
+  después del COMMIT: dos órdenes concurrentes pueden confirmar en un
+  orden y escribir el JSON en el contrario. La diferencia es otra. Al
+  pisar la base con un UPDATE incondicional, `persistir` deja base y
+  espejo de acuerdo en un valor que puede ser el equivocado; `tomar`, que
+  no pisa, deja el espejo atrasado respecto de un valor correcto. Preferir
+  lo segundo es deliberado. La ventana se cierra sola con A3.2: cuando
+  ninguna orden pueda tocar una tarea ajena, nada podrá cruzarse ahí.
+
+  Si el proceso muere justo en esa ventana, el estado operativo está a
+  salvo: está comprobado que la toma sobrevive, que la base no queda
+  bloqueada y que la orden siguiente pone el JSON al día.
+- Crear la base desde cero con varios procesos a la vez sigue fallando en
+  los perdedores con "table tareas already exists" (deuda declarada de A2,
+  en `inicializar()`). Está comprobado que no produce dos propietarios:
+  falla de forma explícita, sin corromper nada. Basta con crear la base
+  una vez (`inicializar-estado`) antes de lanzar trabajadores. Comprobado
+  a mano con 6 procesos, un solo ganador en 8 de 8 rondas; no hay prueba
+  automática que lo cubra, porque corregirlo es A3.2.
+- **El refresco de definiciones todavía puede pisar el ámbito de una tarea
+  viva, por la puerta de `cargar`.** A3.1 cerró la puerta ancha: `tomar` ya
+  no refresca las definiciones de las demás tareas. Pero `cargar`, que es
+  de A2, sigue refrescando la definición de la tarea que se pide, sin
+  mirar si está en ejecución en manos de otro. Reproducido: con T-0001 en
+  ejecución y su ficha declarando otro ámbito en esta rama, basta un
+  `tomar T-0001` —que se RECHAZA por estar tomada— para dejarle el ámbito
+  encogido; la toma siguiente de otra tarea ya no ve el solapamiento y
+  quedan dos escritores sobre el mismo archivo.
+
+  No es nuevo de A3.1: el mismo caso se reproduce igual sobre el código
+  anterior (`b5578d2b`). Cerrarlo del todo exige que la definición de una
+  tarea que retiene ámbito no se refresque mientras lo retiene, y eso vive
+  en `sincronizar_ficha`, que es de A2 y la usan también el bootstrap y la
+  orden `sincronizar-definiciones`. Queda como deuda de A3.2.
+- En contrapartida de lo anterior, **ampliar el ámbito de una tarea que ya
+  está viva no se tiene en cuenta hasta que la tarea deje de estarlo** (o
+  hasta que se ejecute `sincronizar-definiciones`). Cambiar el ámbito de
+  una tarea en marcha es, justamente, lo que rompe la garantía; el sistema
+  prefiere quedarse con el ámbito que la tarea declaraba cuando se tomó.
+
+Prueba correspondiente:
+
+    pruebas/orquestacion/prueba_toma_atomica.py
+
+Admite `--carreras N` para una corrida de estrés; el valor por omisión está
+calibrado para el tiempo límite del corredor único.
+
+**Verificación en Windows.** La evidencia de concurrencia registrada en
+`ESTADO.md` se obtuvo en Linux. Windows es el entorno final real y hay
+cuatro cosas que pueden comportarse distinto: `multiprocessing` sólo tiene
+`spawn` (la prueba ya lo fuerza en Linux, así que ejercita el mismo
+camino), el bloqueo de SQLite usa otra API del sistema, un archivo abierto
+no se puede borrar mientras alguna conexión siga viva, y arrancar procesos
+es bastante más lento.
+
+Lo que sí se pudo descartar aquí: la prueba pasa con Python 3.11, 3.12 y
+3.13, así que la rama de limpieza propia de 3.12 (`shutil.rmtree` con
+`onexc`, que es la que usará esta PC) está ejercitada y no es una
+incógnita. Tampoco quedan recursos sin cerrar: la corrida en modo
+desarrollo (`python -X dev -W error::ResourceWarning`) no emite ni un
+aviso, y un detector que instrumenta `sqlite3.connect` da cero conexiones
+vivas al terminar las 23 comprobaciones. Es la condición que en Windows
+decide si los temporales se pueden borrar.
+
+Desde `C:\INGENIERIA_LOCAL\motor`, en PowerShell:
+
+    $env:PYTHONPATH = "$PWD;$PWD\nucleo;$PWD\orquestacion"
+    $env:PYTHONUTF8 = "1"
+    $env:PYTHONIOENCODING = "utf-8"
+    $env:PYTHONDONTWRITEBYTECODE = "1"
+
+    # 1. La prueba de la toma atómica, sola y cronometrada.
+    Measure-Command { python .\pruebas\orquestacion\prueba_toma_atomica.py } |
+        Select-Object TotalSeconds
+    python .\pruebas\orquestacion\prueba_toma_atomica.py
+
+    # 2. Corrida de estrés (100 carreras por configuración).
+    python .\pruebas\orquestacion\prueba_toma_atomica.py --carreras 100
+
+    # 3. Regresión completa por el corredor único.
+    python -m orquestacion.ingenieria_supervisor pruebas --detalle
+
+    # 4. Que no quedaron temporales ni procesos huérfanos (Windows no borra
+    #    archivos abiertos: si aparece alguno, algo quedó vivo).
+    Get-ChildItem $env:TEMP -Directory -Filter "toma_atomica_*"
+    Get-Process git, python -ErrorAction SilentlyContinue |
+        Where-Object { $_.StartTime -gt (Get-Date).AddMinutes(-5) }
+
+PowerShell no se detiene cuando una orden nativa falla, así que después de
+cada ejecución hay que mirar el código de salida; si no, una prueba que
+muere con un error se ve igual que una que pasó:
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "FALLO: codigo $LASTEXITCODE" -ForegroundColor Red
+    }
+
+Criterio para decidir que Windows pasó, los cuatro a la vez:
+
+1. La corrida (1) imprime `PRUEBA_TOMA_ATOMICA=OK`, sale con código 0 y
+   reporta 0 dobles tomas.
+2. Tarda claramente por debajo de los 120 s (ver el apartado anterior).
+3. La (3) da 6 de 6 archivos de prueba en OK.
+4. La (4) no devuelve nada: ni temporales ni procesos huérfanos.
+
+**Qué esperar del cronómetro, y qué mirar si se agota.** Ésta es la parte
+con riesgo real, y conviene contarla con las cifras medidas, no con la
+intuición.
+
+En Linux la corrida por omisión tarda unos 7 s. Los 22 procesos que arranca
+`multiprocessing` no son el coste dominante: lo es **Git**. Cada operación
+del Supervisor resuelve la ubicación de la base con
+`git rev-parse --git-common-dir`, así que la tanda completa lanza unas 550
+invocaciones de `git` sólo en el proceso padre (455 de ellas son ese mismo
+`rev-parse`), más las de los procesos hijos. En Linux cada una cuesta unos
+2 ms y no se nota. En Windows, arrancar `git.exe` con Defender vigilando la
+carpeta del repositorio cuesta entre 50 y 250 ms, de modo que el
+presupuesto pasa a medirse en decenas de segundos y **el límite de 120 s
+del corredor único entra genuinamente en juego**.
+
+Por eso el paso 1 de la comprobación es cronometrar. Si la corrida se
+acerca al límite:
+
+- Bajar `--carreras` ayuda, pero sólo hasta cierto punto: cada unidad de
+  `--carreras` cuesta unas 38 invocaciones de `git` sobre un suelo fijo de
+  unas 525 que no se toca reduciéndolas.
+- El remedio que de verdad lo resuelve es memorizar el resultado de
+  `git rev-parse --git-common-dir` por raíz dentro de
+  `estado_global.git_common_dir`. Medido en una copia: las invocaciones de
+  `git` bajan de unas 830 a unas 147, un 82 % menos, con la tanda igual de
+  verde. No se ha aplicado porque `git_common_dir` es código de A2 y
+  cambiarlo excede el alcance de A3.1; queda anotado como lo primero que
+  hay que hacer si Windows se acerca al límite, y como mejora evidente
+  para todo el Supervisor, no sólo para la prueba.
 
 ### Implementado y probado
 
@@ -132,11 +403,20 @@ Prueba correspondiente:
   ruta de V1 `GET /api/desarrollo/tareas`; indicador "Base global SQLite"
   en el tablero; órdenes `diagnostico`, `inicializar-estado` y
   `sincronizar-definiciones`.
+- (A3.1) Toma atómica de tareas: compitan los trabajadores que compitan por
+  la misma tarea, gana exactamente uno. Comprobado con carreras reales
+  entre procesos y entre conexiones, y con una prueba de control que pasa
+  por el mismo arnés una toma deliberadamente ingenua —con una ventana de
+  10 ms entre leer y escribir— y EXIGE dobles tomas: si ni con esa ventana
+  colisionara, el arnés estaría roto y el verde de todo lo demás no
+  significaría nada. Que el arnés detecta el defecto REAL, sin ventana
+  artificial, se comprobó aparte por mutación del código.
 
 Pruebas correspondientes:
 
     pruebas/orquestacion/prueba_supervisor.py
     pruebas/orquestacion/prueba_estado_global.py
+    pruebas/orquestacion/prueba_toma_atomica.py
 
 ### Cómo se invoca
 
@@ -158,19 +438,21 @@ Desde la raíz del repositorio:
 
 ## QUÉ NO EXISTE TODAVÍA
 
-### A3/B — pendiente, NO implementado
+### A3.2/B — pendiente, NO implementado
 
-- Toma atómica concurrente de tareas.
-- Locks.
 - Latidos automáticos.
-- Detección avanzada de trabajadores huérfanos.
+- Expiración de trabajadores y detección avanzada de huérfanos.
+- Recuperación automática de tareas abandonadas.
+- Propiedad efectiva del claim: que `latido` y `verificar` exijan ser el
+  propietario de la tarea.
 - `verificar()` ejecutando dentro del worktree de la tarea.
 - Lanzamiento de trabajadores (Claude) y varios trabajadores simultáneos.
 - Creación y destrucción automática de worktrees de Git.
 - Cola automática de tareas.
 
-A2 deja la base para todo eso (una sola fuente operativa compartida por los
-worktrees, transacciones y `busy_timeout`), pero no lo adelanta.
+A2 y A3.1 dejan la base para todo eso (una sola fuente operativa compartida
+por los worktrees, transacciones, `busy_timeout` y una toma que no admite
+dos ganadores), pero no lo adelantan.
 
 El campo `worktree` de la tarea ya existe en SQLite y hoy permanece vacío:
 está reservado para el paralelismo. La detección de solapamiento de
