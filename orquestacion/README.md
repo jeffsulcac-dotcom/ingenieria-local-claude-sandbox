@@ -120,7 +120,12 @@ propietario**. Era un TOCTOU real, no teórico.
 **Cómo se resuelve.** Todo lo que decide la toma ocurre dentro de UNA sola
 transacción `BEGIN IMMEDIATE` sobre la base global:
 
-    comprobación de ámbitos  ->  UPDATE condicional  ->  evento  ->  COMMIT
+    comprobación de estado  ->  comprobación de ámbitos
+    ->  UPDATE condicional  ->  evento  ->  COMMIT
+
+La comprobación de estado que abre la secuencia no concede ni deniega nada
+por su cuenta: está para que el rechazo diga el motivo verdadero, y no
+"ámbito en conflicto" cuando el problema es que la tarea está aprobada.
 
 Por qué no puede haber dos ganadores. No es un mecanismo, son tres:
 
@@ -142,6 +147,7 @@ modo que el propio cambio cierra la puerta al siguiente aspirante.
 | Dónde | Qué |
 |---|---|
 | `estado_global.reclamar` | Primitivo de toma atómica: UPDATE condicional resuelto por `rowcount`. Un conflicto NO es excepción, se devuelve descrito |
+| `estado_global.rechazo` | Describe por qué no se concede una toma, siempre con el mismo formato, venga del UPDATE o de la comprobación previa |
 | `supervisor.ErrorToma` | Rechazo controlado con tarea, motivo, estado, propietario y si la tarea ya era propia. Hereda de `ErrorSupervisor` |
 | `supervisor.conflictos_de_ambito` | Pasa a ser función pura, para poder ejecutarse dentro de la transacción de la toma |
 | `supervisor.tomar` | Reescrita alrededor de la transacción única |
