@@ -854,7 +854,7 @@ def _reescribir_titulo(raiz: Path, identificador: str, titulo: str):
 
 
 def prueba_h_cargar_no_estrecha_el_ambito_de_una_tarea_viva():
-    print("  8. `cargar` no estrecha el ámbito de una tarea viva:", end=" ")
+    print("  9. `cargar` no estrecha el ámbito de una tarea viva:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -918,7 +918,7 @@ def prueba_h_cargar_no_estrecha_el_ambito_de_una_tarea_viva():
 
 
 def prueba_i_una_toma_rechazada_tampoco_pisa_el_ambito():
-    print("  9. una toma RECHAZADA tampoco pisa el ámbito:", end=" ")
+    print(" 10. una toma RECHAZADA tampoco pisa el ámbito:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -962,7 +962,7 @@ def prueba_i_una_toma_rechazada_tampoco_pisa_el_ambito():
 
 
 def prueba_j_una_sincronizacion_inocua_no_rompe_una_tarea_viva():
-    print(" 10. un cambio declarativo inocuo sí se sincroniza:", end=" ")
+    print(" 11. un cambio declarativo inocuo sí se sincroniza:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1004,7 +1004,7 @@ def prueba_j_una_sincronizacion_inocua_no_rompe_una_tarea_viva():
 
 
 def prueba_k_el_ambito_se_refresca_cuando_la_tarea_deja_de_estar_viva():
-    print(" 11. el ámbito congelado se refresca al cerrarse la tarea:", end=" ")
+    print(" 12. el ámbito congelado se refresca al cerrarse la tarea:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1194,7 +1194,7 @@ def _ronda_bootstrap(procesos: int) -> dict:
 
 def prueba_l_bootstrap_concurrente():
     print(
-        " 12. bootstrap concurrente ("
+        " 13. bootstrap concurrente ("
         + str(PROCESOS_BOOTSTRAP)
         + " procesos x "
         + str(RONDAS_BOOTSTRAP)
@@ -1258,7 +1258,7 @@ def prueba_l2_el_journal_no_se_reconvierte_en_cada_apertura():
     sirve de gate. Aquí se comprueba la mitad determinista; la otra la
     respalda aquella observación, anotada en orquestacion/README.md.
     """
-    print(" 13. una base ya en WAL no se reconvierte al abrirla:", end=" ")
+    print(" 14. una base ya en WAL no se reconvierte al abrirla:", end=" ")
 
     raiz = crear_repositorio("wal_")
 
@@ -1320,7 +1320,7 @@ def prueba_l2_el_journal_no_se_reconvierte_en_cada_apertura():
 
 
 def prueba_m_codigo_de_salida_por_propiedad():
-    print(" 14. la CLI devuelve 4 al rechazar por propiedad:", end=" ")
+    print(" 15. la CLI devuelve 4 al rechazar por propiedad:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1397,7 +1397,7 @@ def prueba_m_codigo_de_salida_por_propiedad():
 # ----------------------------------------------------------------------
 
 def prueba_n_reanudar_respeta_una_toma_reciente():
-    print(" 15. `reanudar` no arrebata una tarea recién tomada:", end=" ")
+    print(" 16. `reanudar` no arrebata una tarea recién tomada:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1456,7 +1456,7 @@ def prueba_n_reanudar_respeta_una_toma_reciente():
 
 def prueba_o_estres_de_ordenes_rezagadas(rezagadas: int):
     print(
-        " 23. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
+        " 24. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
         "dueño vigente:",
         end=" ",
     )
@@ -1563,7 +1563,7 @@ def prueba_u_la_toma_graba_el_ambito_que_valido():
     escritores sobre los mismos archivos, que es exactamente lo que la
     guarda existe para impedir.
     """
-    print(" 16. la toma graba el ámbito que acaba de validar:", end=" ")
+    print(" 17. la toma graba el ámbito que acaba de validar:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1654,7 +1654,7 @@ def prueba_u2_el_ambito_vigente_no_miente_al_trabajador():
     la declaración que una persona acababa de escribir. Se comprobó
     rompiéndolo.
     """
-    print(" 17. el ámbito vigente no le miente al trabajador:", end=" ")
+    print(" 18. el ámbito vigente no le miente al trabajador:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1726,7 +1726,7 @@ def prueba_v_reordenar_el_ambito_no_congela_nada():
     congelaría toda la definición y bloquearía de paso cualquier arreglo
     que viajara en la misma edición.
     """
-    print(" 18. reordenar el ámbito no congela la definición:", end=" ")
+    print(" 19. reordenar el ámbito no congela la definición:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1783,7 +1783,7 @@ def prueba_w_el_ambito_congelado_no_pide_el_bloqueo_de_escritura():
     de toda la base para no escribir nada; bajo concurrencia eso convierte
     una consulta en una espera que acaba en "database is locked".
     """
-    print(" 19. una consulta sobre tarea congelada no pide el candado:", end=" ")
+    print(" 20. una consulta sobre tarea congelada no pide el candado:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1861,7 +1861,7 @@ def prueba_r_la_generacion_no_sale_de_sqlite():
     podía volver a hacer indistinguibles dos ejecuciones, que es justo el
     problema ABA que la columna existe para cerrar.
     """
-    print(" 20. la generación no se puede falsificar desde el JSON:", end=" ")
+    print(" 21. la generación no se puede falsificar desde el JSON:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1944,6 +1944,101 @@ def prueba_r_la_generacion_no_sale_de_sqlite():
 
         assert fila_de(raiz, "T-0901")["generacion"] == tomada.generacion
 
+        # (e) `fila_desde_ficha` graba cero aunque la ficha traiga otra cosa,
+        #     porque alimenta al ALTA de una tarea que la base no conocía.
+        suelta = fichas.leer(raiz, "T-0901")
+        suelta.generacion = 777
+
+        assert estado_global.fila_desde_ficha(suelta)["generacion"] == 0, (
+            "`fila_desde_ficha` copió la generación de la ficha en vez de "
+            "empezar el contador de cero."
+        )
+
+        # (f) `reclamar` no deja fijarla por la puerta de `campos_extra`.
+        con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+        try:
+            with estado_global.transaccion(con):
+                estado_global.reclamar(
+                    con,
+                    "T-0902",
+                    trabajador_id="worker-X",
+                    pid=1,
+                    momento="2030-01-01T00:00:00+00:00",
+                    estados_reclamables={Estado.NUEVO},
+                    estado_destino=str(Estado.EN_EJECUCION),
+                    campos_extra={"generacion": 900},
+                )
+        except estado_global.ErrorEstadoGlobal:
+            pass
+        else:
+            raise AssertionError(
+                "`reclamar` aceptó fijar la generación desde campos_extra."
+            )
+        finally:
+            con.close()
+
+        # (g) Y `persistir` no puede tocarla, porque no es columna operativa.
+        assert "generacion" not in nucleo.COLUMNAS_OPERATIVAS, (
+            "`generacion` entró en COLUMNAS_OPERATIVAS: cualquier orden del "
+            "ciclo podría reescribirla con lo que trajera su ficha."
+        )
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+def prueba_s2_la_misma_ficha_se_puede_persistir_dos_veces():
+    """
+    Una ficha ya escrita sigue sirviendo para la siguiente escritura.
+
+    Es la cara amable de la precondición de estado: tras confirmar, lo que
+    se acaba de escribir pasa a ser "lo leído". Sin eso, la segunda
+    escritura sobre la MISMA ficha en memoria seguiría exigiendo el estado
+    anterior a la primera y se rechazaría a sí misma. La precondición debe
+    detener órdenes rezagadas, no al propietario legítimo trabajando.
+    """
+    print("  8. la misma ficha admite dos escrituras seguidas:", end=" ")
+
+    raiz = crear_repositorio()
+
+    try:
+        ficha_minima(raiz, "T-0901")
+        ficha = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+
+        assert ficha.estado_leido == Estado.EN_EJECUCION, (
+            "La toma tiene que dejar la ficha sabiendo en qué estado quedó."
+        )
+
+        # Dos latidos seguidos con la MISMA ficha en memoria.
+        for marca in ("2030-01-01T00:00:00+00:00", "2030-01-02T00:00:00+00:00"):
+            ficha.ultimo_latido = marca
+            nucleo.persistir(
+                raiz,
+                ficha,
+                exigir_propietario="worker-A",
+                exigir_generacion=ficha.generacion,
+            )
+            METRICAS["ORDENES_TOTALES"] += 1
+            METRICAS["ORDENES_ACEPTADAS"] += 1
+
+            assert fila_de(raiz, "T-0901")["ultimo_latido"] == marca
+
+        # Y una transición sobre esa misma ficha también entra.
+        nucleo._liberar_trabajador(ficha)
+        nucleo.transicionar(
+            ficha, Estado.REABIERTO, "Devuelta.", nucleo.ORIGEN_AUTOMATICO
+        )
+        nucleo.persistir(raiz, ficha)
+        METRICAS["ORDENES_TOTALES"] += 1
+        METRICAS["ORDENES_ACEPTADAS"] += 1
+
+        assert fila_de(raiz, "T-0901")["estado"] == str(Estado.REABIERTO)
+        assert ficha.estado_leido == Estado.REABIERTO
+
         comprobar_integridad(raiz)
     finally:
         borrar(raiz)
@@ -1966,7 +2061,7 @@ def prueba_s_orden_humana_rezagada_no_revierte_una_transicion():
     Lo cierra la tercera precondición: la escritura exige que la fila siga
     en el estado que tenía cuando se leyó.
     """
-    print(" 21. una orden humana rezagada no revierte el ciclo:", end=" ")
+    print(" 22. una orden humana rezagada no revierte el ciclo:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2020,7 +2115,7 @@ def prueba_t_el_ambito_congelado_se_informa():
     función importante produzca un resultado visible y verificable, y un
     cambio en espera es justo eso.
     """
-    print(" 22. el ámbito congelado se informa, no se disimula:", end=" ")
+    print(" 23. el ámbito congelado se informa, no se disimula:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2152,7 +2247,7 @@ def prueba_p_estres_concurrente(emisores: int, ordenes: int):
     órdenes entre. Una sola aceptada es un fallo, y se nombra cuál fue.
     """
     print(
-        " 24. estrés concurrente: " + str(emisores) + " procesos x "
+        " 25. estrés concurrente: " + str(emisores) + " procesos x "
         + str(ordenes) + " órdenes rezagadas:",
         end=" ",
     )
@@ -2262,6 +2357,7 @@ COMPROBACIONES = (
     prueba_e_solo_el_nombre_no_basta,
     prueba_f_otro_trabajador_es_rechazado,
     prueba_g_orden_sobre_tarea_sin_dueno,
+    prueba_s2_la_misma_ficha_se_puede_persistir_dos_veces,
     prueba_h_cargar_no_estrecha_el_ambito_de_una_tarea_viva,
     prueba_i_una_toma_rechazada_tampoco_pisa_el_ambito,
     prueba_j_una_sincronizacion_inocua_no_rompe_una_tarea_viva,
