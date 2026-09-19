@@ -483,6 +483,13 @@ frena lo que rompería la garantía.
 
 Tres detalles que costaron una ronda de auditoría cada uno:
 
+- Hay DOS sitios que escriben `ambito_archivos`, no uno, y conviene
+  decirlo porque el argumento de seguridad depende de ello:
+  `sincronizar_ficha`, que es donde vive la guarda, y `reclamar`, por la
+  toma. El segundo no pasa por la guarda y no debe: la toma es el momento
+  en que el ámbito se valida contra todas las demás tareas dentro de la
+  misma transacción, así que ahí escribir es lo correcto. Cualquier tercer
+  escritor que aparezca sí tendría que pasar por la guarda.
 - El ámbito se compara por CONTENIDO, no por orden. `solapamientos` recorre
   el producto cartesiano, así que `['a','b']` y `['b','a']` garantizan lo
   mismo; comparar las listas tal cual congelaba toda la definición al
@@ -583,7 +590,12 @@ el proceso padre: `prueba_propiedad_ciclo.py` pasa de 355 a 21
 invocaciones de `git rev-parse --git-common-dir`, y `prueba_toma_atomica.py`
 de unas 455 a 23 — una por repositorio temporal, el mínimo posible. No es
 una caché global ni persistente, y antes de devolver lo memorizado
-comprueba que el directorio siga existiendo.
+comprueba dos cosas: que el directorio siga existiendo y que la raíz siga
+perteneciendo al MISMO repositorio, comparando el inodo de su `.git`. Lo
+segundo detecta el caso que lo primero deja pasar —borrar una carpeta y
+volver a `git init` en ella—, que devolvía la base global equivocada. Sin
+mtime a propósito: cambia cada vez que se escribe dentro de `.git`, la
+propia base incluida, y con él la memoria no ahorraba nada.
 
 **Lo que NO cierra A3.2, dicho con precisión.** `persistir` reescribe las
 dieciséis columnas operativas con la foto que `cargar` leyó. Las tres

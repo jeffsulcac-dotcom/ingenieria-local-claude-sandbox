@@ -232,22 +232,37 @@ class ErrorEstadoGlobal(Exception):
 # ----------------------------------------------------------------------
 
 # Directorio común de Git ya resuelto, por raíz. Ver `git_common_dir`.
+#
+# Cada entrada guarda la ruta resuelta Y la identidad del `.git` de esa raíz
+# en el momento de resolverla, para poder detectar que la raíz dejó de
+# pertenecer al mismo repositorio.
 _COMUNES_RESUELTOS: dict = {}
 
 
-def olvidar_git_common_dir(raiz: Path | None = None) -> None:
+def _identidad_git(raiz: Path):
     """
-    Descarta lo memorizado por `git_common_dir`.
+    Identidad del `.git` de una raíz: inodo y dispositivo.
 
-    Sin argumento lo olvida todo. Existe para que una prueba pueda volver al
-    estado de partida sin depender del orden en que se ejecute.
+    Sirve para saber si la ruta sigue siendo el MISMO repositorio y no sólo
+    si sigue existiendo algo ahí. `.git` puede ser un directorio o, en un
+    worktree enlazado, un archivo; `stat` vale para los dos.
+
+    Deliberadamente SIN mtime. Se probó con él y la memoria se invalidaba
+    casi en cada llamada, porque el mtime de `.git` cambia cada vez que se
+    escribe algo dentro —empezando por la propia base SQLite, que vive
+    ahí—: la memorización dejaba de ahorrar nada. El inodo identifica al
+    directorio, no a su contenido, que es justo lo que hace falta.
+
+    Devuelve None si no hay `.git` en esa raíz (por ejemplo, si `raiz` es un
+    subdirectorio del repositorio). En ese caso no se memoriza nada: mejor
+    pagar la llamada a Git que arriesgarse a devolver la base equivocada.
     """
-    if raiz is None:
-        _COMUNES_RESUELTOS.clear()
+    try:
+        datos = (raiz / ".git").stat()
+    except OSError:
+        return None
 
-        return
-
-    _COMUNES_RESUELTOS.pop(str(Path(raiz).resolve()), None)
+    return (datos.st_ino, datos.st_dev)
 
 
 def git_common_dir(raiz: Path) -> Path:
@@ -281,14 +296,25 @@ def git_common_dir(raiz: Path) -> Path:
     """
     raiz = Path(raiz)
     clave = str(raiz.resolve())
+    identidad = _identidad_git(raiz)
 
     memorizado = _COMUNES_RESUELTOS.get(clave)
 
     if memorizado is not None:
-        if memorizado.is_dir():
-            return memorizado
+        comun_memorizado, identidad_memorizada = memorizado
 
-        # El repositorio ya no está donde estaba: lo memorizado no vale.
+        # Dos condiciones, y las dos hacen falta. `is_dir` detecta que el
+        # repositorio desapareció; la identidad detecta algo más sutil y más
+        # peligroso: que en esa MISMA ruta hay ahora otro repositorio. Pasa
+        # de verdad —borrar una carpeta y volver a `git init` en ella—, y sin
+        # esta comprobación se devolvería la base global equivocada.
+        if (
+            identidad is not None
+            and identidad == identidad_memorizada
+            and comun_memorizado.is_dir()
+        ):
+            return comun_memorizado
+
         _COMUNES_RESUELTOS.pop(clave, None)
 
     try:
@@ -327,7 +353,10 @@ def git_common_dir(raiz: Path) -> Path:
 
     comun = comun.resolve()
 
-    _COMUNES_RESUELTOS[clave] = comun
+    # Sin `.git` en la raíz no hay con qué comprobar después que sigue
+    # siendo el mismo repositorio, así que no se memoriza.
+    if identidad is not None:
+        _COMUNES_RESUELTOS[clave] = (comun, identidad)
 
     return comun
 
@@ -1869,7 +1898,39 @@ def sincronizar_lista(
         ficha.id for ficha in fichas if ficha not in pendientes
     ]
 
+    # Las congeladas se apartan ANTES de decidir si hace falta el candado.
+    #
+    # Mientras el ámbito está congelado la huella no avanza a propósito, así
+    # que esas fichas entran siempre en `pendientes` y, sin esto, una tanda
+    # en la que TODO está congelado abría un BEGIN IMMEDIATE sobre la base
+    # entera para no escribir nada. Es el mismo atajo que ya tiene
+    # `asegurar_ficha`, aplicado donde también hacía falta.
+    congeladas = []
+    restantes = []
+
+    for ficha in pendientes:
+        existente = obtener_tarea(con, ficha.id)
+
+        if existente is not None and ambito_congelado(existente, ficha):
+            congeladas.append(informe_ambito_congelado(existente, ficha))
+        else:
+            restantes.append(ficha)
+
+    for resultado in congeladas:
+        informe["ambito_congelado"].append(
+            {
+                "id": resultado["id"],
+                "estado": resultado["estado"],
+                "detalle": resultado["detalle"],
+            }
+        )
+
+    pendientes = restantes
+
     if not pendientes:
+        informe["sin_cambios"].sort()
+        informe["ambito_congelado"].sort(key=lambda uno: uno["id"])
+
         return informe
 
     with transaccion(con):

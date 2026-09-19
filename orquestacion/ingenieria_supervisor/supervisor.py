@@ -2039,6 +2039,7 @@ def resumen_de_tarea(fila: dict, definicion: Ficha | None) -> dict:
         "decisiones_totales": len(decisiones),
         "requiere_decision_humana": bool(pendientes),
         "trabajador_id": fila.get("trabajador_id"),
+        "generacion": fila.get("generacion"),
         "pid": fila.get("pid"),
         "iniciado_en": fila.get("iniciado_en"),
         "ultimo_latido": fila.get("ultimo_latido"),

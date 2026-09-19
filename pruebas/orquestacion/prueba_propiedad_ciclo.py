@@ -1451,8 +1451,106 @@ def prueba_l4_una_migracion_ajena_a_mitad_no_pasa_inadvertida():
     print("OK")
 
 
+def prueba_l5_la_memoria_de_git_no_confunde_repositorios():
+    """
+    Memorizar la ubicación de la base no puede devolver la de otro.
+
+    A3.2 memoriza `git rev-parse --git-common-dir` por raíz para no pagar
+    cientos de procesos `git` por tanda. Validar lo memorizado con "¿sigue
+    existiendo el directorio?" detecta que el repositorio desapareció, pero
+    no algo más sutil y más peligroso: que esa MISMA ruta pertenece ahora a
+    otro repositorio.
+
+    El escenario lo reproduce con lo que de verdad lo provoca: una ruta que
+    primero es un WORKTREE enlazado de otro repositorio —y cuyo directorio
+    común está, por tanto, en otro sitio— y que después pasa a ser un
+    repositorio independiente. Si la memoria no lo detectara, todas las
+    operaciones en esa ruta seguirían escribiendo en la base del primero.
+
+    Se comprueba además que la memoria sigue ahorrando: invalidarla en cada
+    llamada arreglaría un problema creando otro.
+    """
+    print(" 17. la memoria de git no confunde repositorios:", end=" ")
+
+    principal = crear_repositorio("memoria_")
+    aparte = Path(tempfile.mkdtemp(prefix="memoria_wt_"))
+    enlazado = aparte / "arbol"
+
+    try:
+        # El worktree necesita al menos un commit en el repositorio madre.
+        (principal / "semilla.txt").write_text("x", encoding="utf-8")
+        _git(principal, "add", "-A")
+        hecho = _git(principal, "commit", "-q", "-m", "semilla")
+        assert hecho.returncode == 0, hecho.stderr
+
+        creado = _git(
+            principal, "worktree", "add", "-q", str(enlazado), "-b", "rama-wt"
+        )
+        assert creado.returncode == 0, creado.stderr
+
+        comun_madre = estado_global.git_common_dir(principal)
+        comun_enlazado = estado_global.git_common_dir(enlazado)
+
+        assert comun_enlazado == comun_madre, (
+            "Un worktree enlazado comparte el directorio común con su "
+            "repositorio madre: " + str(comun_enlazado) + " vs "
+            + str(comun_madre)
+        )
+
+        # Segunda llamada: debe salir de la memoria, sin lanzar `git`.
+        llamadas = {"n": 0}
+        original = subprocess.run
+
+        def contar(*argumentos, **claves):
+            orden = argumentos[0] if argumentos else claves.get("args")
+
+            try:
+                if orden and str(orden[0]).endswith("git"):
+                    llamadas["n"] += 1
+            except Exception:
+                pass
+
+            return original(*argumentos, **claves)
+
+        subprocess.run = contar
+
+        try:
+            assert estado_global.git_common_dir(enlazado) == comun_enlazado
+        finally:
+            subprocess.run = original
+
+        assert llamadas["n"] == 0, (
+            "La memoria no ahorró nada: se volvió a invocar `git` "
+            + str(llamadas["n"]) + " vez/veces."
+        )
+
+        # Esa misma ruta pasa a ser un repositorio INDEPENDIENTE.
+        (enlazado / ".git").unlink()
+
+        aparte_init = _git(enlazado, "init", "-q", "-b", "main")
+        assert aparte_init.returncode == 0, aparte_init.stderr
+
+        ahora = estado_global.git_common_dir(enlazado)
+
+        assert ahora != comun_madre, (
+            "La memoria devolvió el directorio común del repositorio "
+            "ANTERIOR: todas las operaciones en esa ruta escribirían en la "
+            "base equivocada. Devolvió " + str(ahora) + "."
+        )
+        assert ahora == (enlazado / ".git").resolve(), (
+            "No se resolvió el directorio común del repositorio que hay "
+            "ahora en esa ruta: " + str(ahora)
+        )
+    finally:
+        _git(principal, "worktree", "prune")
+        borrar(aparte)
+        borrar(principal)
+
+    print("OK")
+
+
 def prueba_m_codigo_de_salida_por_propiedad():
-    print(" 17. la CLI devuelve 4 al rechazar por propiedad:", end=" ")
+    print(" 18. la CLI devuelve 4 al rechazar por propiedad:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1529,7 +1627,7 @@ def prueba_m_codigo_de_salida_por_propiedad():
 # ----------------------------------------------------------------------
 
 def prueba_n_reanudar_respeta_una_toma_reciente():
-    print(" 18. `reanudar` no arrebata una tarea recién tomada:", end=" ")
+    print(" 19. `reanudar` no arrebata una tarea recién tomada:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1588,7 +1686,7 @@ def prueba_n_reanudar_respeta_una_toma_reciente():
 
 def prueba_o_estres_de_ordenes_rezagadas(rezagadas: int):
     print(
-        " 28. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
+        " 29. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
         "dueño vigente:",
         end=" ",
     )
@@ -1695,7 +1793,7 @@ def prueba_u_la_toma_graba_el_ambito_que_valido():
     escritores sobre los mismos archivos, que es exactamente lo que la
     guarda existe para impedir.
     """
-    print(" 19. la toma graba el ámbito que acaba de validar:", end=" ")
+    print(" 20. la toma graba el ámbito que acaba de validar:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1779,7 +1877,7 @@ def prueba_u3_retomar_con_ambito_encogido_no_libera_el_terreno():
     anterior, que hacía que la toma grabara el ámbito declarado sin mirar
     si ampliaba o encogía. Ahora reclama la UNIÓN.
     """
-    print(" 20. retomar con ámbito encogido no libera el terreno:", end=" ")
+    print(" 21. retomar con ámbito encogido no libera el terreno:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1852,7 +1950,7 @@ def prueba_u2_el_ambito_vigente_no_miente_al_trabajador():
     la declaración que una persona acababa de escribir. Se comprobó
     rompiéndolo.
     """
-    print(" 21. el ámbito vigente no le miente al trabajador:", end=" ")
+    print(" 22. el ámbito vigente no le miente al trabajador:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1924,7 +2022,7 @@ def prueba_v_reordenar_el_ambito_no_congela_nada():
     congelaría toda la definición y bloquearía de paso cualquier arreglo
     que viajara en la misma edición.
     """
-    print(" 22. reordenar el ámbito no congela la definición:", end=" ")
+    print(" 23. reordenar el ámbito no congela la definición:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1981,7 +2079,7 @@ def prueba_w_el_ambito_congelado_no_pide_el_bloqueo_de_escritura():
     de toda la base para no escribir nada; bajo concurrencia eso convierte
     una consulta en una espera que acaba en "database is locked".
     """
-    print(" 23. una consulta sobre tarea congelada no pide el candado:", end=" ")
+    print(" 24. una consulta sobre tarea congelada no pide el candado:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2059,7 +2157,7 @@ def prueba_w2_la_salida_rapida_nunca_escribe_fuera_de_transaccion():
     intercala una lectura que devuelve la tarea ya cerrada, que es justo
     lo que vería el segundo vistazo si otro proceso la cerrara en medio.
     """
-    print(" 24. la salida rápida no escribe fuera de transacción:", end=" ")
+    print(" 25. la salida rápida no escribe fuera de transacción:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2157,7 +2255,7 @@ def prueba_r_la_generacion_no_sale_de_sqlite():
     podía volver a hacer indistinguibles dos ejecuciones, que es justo el
     problema ABA que la columna existe para cerrar.
     """
-    print(" 25. la generación no se puede falsificar desde el JSON:", end=" ")
+    print(" 26. la generación no se puede falsificar desde el JSON:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2357,7 +2455,7 @@ def prueba_s_orden_humana_rezagada_no_revierte_una_transicion():
     Lo cierra la tercera precondición: la escritura exige que la fila siga
     en el estado que tenía cuando se leyó.
     """
-    print(" 26. una orden humana rezagada no revierte el ciclo:", end=" ")
+    print(" 27. una orden humana rezagada no revierte el ciclo:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2411,7 +2509,7 @@ def prueba_t_el_ambito_congelado_se_informa():
     función importante produzca un resultado visible y verificable, y un
     cambio en espera es justo eso.
     """
-    print(" 27. el ámbito congelado se informa, no se disimula:", end=" ")
+    print(" 28. el ámbito congelado se informa, no se disimula:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2426,7 +2524,36 @@ def prueba_t_el_ambito_congelado_se_informa():
 
         _reescribir_ambito(raiz, "T-0901", ["modulos/comun/uno.py"])
 
-        informe = estado_global.sincronizar_definiciones(raiz)
+        # Si TODO lo pendiente está congelado, tampoco aquí hace falta el
+        # candado de escritura: sería pedir el bloqueo de la base entera
+        # para no escribir nada, igual que pasaba en `asegurar_ficha`.
+        sentencias = []
+        conectar = sqlite3.connect
+
+        def conectar_vigilado(*argumentos, **claves):
+            con_nueva = conectar(*argumentos, **claves)
+            con_nueva.set_trace_callback(
+                lambda sentencia: sentencias.append(str(sentencia))
+            )
+
+            return con_nueva
+
+        sqlite3.connect = conectar_vigilado
+
+        try:
+            informe = estado_global.sincronizar_definiciones(raiz)
+        finally:
+            sqlite3.connect = conectar
+
+        candados = [
+            una for una in sentencias if "BEGIN IMMEDIATE" in una.upper()
+        ]
+
+        assert not candados, (
+            "La sincronización pidió el bloqueo de escritura "
+            + str(len(candados)) + " vez/veces con todo lo pendiente "
+            "congelado, es decir sin nada que escribir."
+        )
 
         congelados = informe.get("ambito_congelado") or []
 
@@ -2543,7 +2670,7 @@ def prueba_p_estres_concurrente(emisores: int, ordenes: int):
     órdenes entre. Una sola aceptada es un fallo, y se nombra cuál fue.
     """
     print(
-        " 29. estrés concurrente: " + str(emisores) + " procesos x "
+        " 30. estrés concurrente: " + str(emisores) + " procesos x "
         + str(ordenes) + " órdenes rezagadas:",
         end=" ",
     )
@@ -2662,6 +2789,7 @@ COMPROBACIONES = (
     prueba_l2_el_journal_no_se_reconvierte_en_cada_apertura,
     prueba_l3_el_diagnostico_distingue_ocupada_de_sin_wal,
     prueba_l4_una_migracion_ajena_a_mitad_no_pasa_inadvertida,
+    prueba_l5_la_memoria_de_git_no_confunde_repositorios,
     prueba_m_codigo_de_salida_por_propiedad,
     prueba_n_reanudar_respeta_una_toma_reciente,
     prueba_u_la_toma_graba_el_ambito_que_valido,

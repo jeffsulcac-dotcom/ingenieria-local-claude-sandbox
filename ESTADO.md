@@ -584,7 +584,7 @@ Evidencia medida en Linux (Python 3.11.15):
 - Corredor completo: 7/7 OK, unos 13 s. Repetido 11 veces seguidas sin un
   solo fallo, después de que una corrida expusiera el fallo intermitente
   del WAL.
-- Batería de A3.2: 29 comprobaciones, unos 2 s.
+- Batería de A3.2: 30 comprobaciones, unos 3,7 s.
 - Corrida ampliada (--rezagadas 500 --emisores 12 --ordenes 60): 1245
   órdenes, 1239 rechazadas, 0 escrituras indebidas, 0 errores SQLite,
   0 excepciones inesperadas, integridad 31/31.
@@ -596,7 +596,7 @@ Evidencia medida en Linux (Python 3.11.15):
 - Coste en Git: 105 invocaciones en el proceso padre, 21 de ellas
   `rev-parse --git-common-dir` (una por repositorio temporal), frente a las
   439 y 355 de antes de memorizarlo.
-- Mutaciones: 19 de 19 detectadas por la batería. La del bootstrap
+- Mutaciones: 21 de 21 detectadas por la batería. La del bootstrap
   reprodujo el error original literal ("table tareas already exists").
 
 Auditoría adversarial: 8 revisores de sólo lectura sobre copias protegidas.
@@ -629,7 +629,13 @@ introducidas por las propias correcciones, y también están cerradas:
   una unidad de red se reportaba como si otro proceso tuviera la base
   ocupada (medio);
 - la guarda de "esquema más nuevo" no se evaluaba cuando no había ninguna
-  migración que aplicar, que es el camino normal de cada orden (bajo).
+  migración que aplicar, que es el camino normal de cada orden (bajo);
+- la memoria de `git_common_dir` distinguía si el directorio había
+  desaparecido, pero no si esa ruta pertenecía ya a OTRO repositorio, y
+  entonces devolvía la base global equivocada (bajo);
+- `sincronizar_lista` pedía el bloqueo de escritura aunque todo lo
+  pendiente estuviera congelado (bajo);
+- la generación no tenía salida legible por máquina (bajo).
 
 Y una equivocación propia, corregida con la medición delante: se retiró el
 reintento de la conversión a WAL por considerarlo no verificado, y la
