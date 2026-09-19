@@ -65,8 +65,10 @@ de crear una base local que pudiera divergir.
 | Historial de eventos | Operativo | SQLite (tabla `eventos`) |
 
 Los campos operativos que siguen presentes en el JSON son un **espejo
-derivado**: cada operación confirma primero la transacción SQLite y sólo
-después regenera el JSON con la escritura atómica de V1. Al cargar una
+derivado**: cada operación del ciclo confirma primero la transacción
+SQLite y sólo después regenera el JSON con la escritura atómica de V1.
+La excepción es `crear`, que escribe antes el JSON porque la definición es
+el contrato: sin ficha versionada no hay tarea que registrar. Al cargar una
 tarea, SQLite se superpone a lo que diga el JSON, de modo que editar el
 JSON a mano no cambia el estado operativo. El espejo se conserva para que
 el commit automático de la ficha siga dejando rastro en Git y para que las
@@ -85,9 +87,7 @@ diccionario; nunca se edita una versión publicada, se añade la siguiente.
 las fichas JSON legibles que aún no estén en la base copiando, una única
 vez, el estado operativo que traían; después sólo refresca la definición
 cuando su huella cambia. Es idempotente, no escribe JSON, no ejecuta
-tareas, no cambia estados y no resuelve decisiones. T-0001 y T-0002
-quedaron en la base tal como estaban: NUEVO, sin ejecutar, con las tres
-decisiones humanas de T-0001 pendientes.
+tareas, no cambia estados y no resuelve decisiones.
 
 **Qué escribe en SQLite.** Todas las operaciones del ciclo: crear, tomar,
 latido, devolver, verificar, decidir, aprobar, rechazar, reabrir, bloquear
@@ -128,9 +128,9 @@ Prueba correspondiente:
 - Commit automático estrictamente limitado a la ficha de la tarea, dentro
   de la rama de la tarea, nunca en `main`.
 - Tablero web de sólo lectura en `/desarrollo`.
-- (A2) Estado operativo en la base SQLite global; API
-  `GET /api/desarrollo/estado`; indicador "Base global SQLite" en el
-  tablero; órdenes `diagnostico`, `inicializar-estado` y
+- (A2) Estado operativo en la base SQLite global, servido por la misma
+  ruta de V1 `GET /api/desarrollo/tareas`; indicador "Base global SQLite"
+  en el tablero; órdenes `diagnostico`, `inicializar-estado` y
   `sincronizar-definiciones`.
 
 Pruebas correspondientes:
@@ -140,7 +140,7 @@ Pruebas correspondientes:
 
 ### Cómo se invoca
 
-Desde la raíz del repositorio (forma canónica, sin alias):
+Desde la raíz del repositorio:
 
     python -m orquestacion.ingenieria_supervisor estado
     python -m orquestacion.ingenieria_supervisor diagnostico
@@ -172,17 +172,17 @@ Desde la raíz del repositorio (forma canónica, sin alias):
 A2 deja la base para todo eso (una sola fuente operativa compartida por los
 worktrees, transacciones y `busy_timeout`), pero no lo adelanta.
 
+El campo `worktree` de la tarea ya existe en SQLite y hoy permanece vacío:
+está reservado para el paralelismo. La detección de solapamiento de
+ámbitos ya está implementada y probada, porque es el requisito previo para
+poder trabajar en paralelo sin corromper nada.
+
 ### Queda para V2
 
 - Acciones desde el tablero web: hoy es de sólo lectura.
 - Aprobación y rechazo desde la interfaz gráfica.
 - Priorización automática entre tareas pendientes.
 - Notificaciones.
-
-El campo `worktree` de la tarea ya existe en SQLite y hoy permanece vacío:
-está reservado para el paralelismo. La detección de solapamiento de
-ámbitos ya está implementada y probada, porque es el requisito previo para
-poder trabajar en paralelo sin corromper nada.
 
 ### Queda para n8n
 

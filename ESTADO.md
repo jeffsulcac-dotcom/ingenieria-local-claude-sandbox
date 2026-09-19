@@ -269,10 +269,10 @@ Componentes:
 - supervisor.py: todas las operaciones del ciclo persisten en SQLite
 - __main__.py: `estado` y `ver` leen SQLite; nuevas órdenes `diagnostico`,
   `inicializar-estado`, `sincronizar-definiciones`
-- servidor.py: `GET /api/desarrollo/estado` (se conserva
-  `/api/desarrollo/tareas`)
-- desarrollo.html: indicador "Base global SQLite", nuevas, última
-  actividad global, última verificación y decisión humana por tarea
+- servidor.py: `GET /api/desarrollo/tareas` sirve el estado desde SQLite
+  (misma ruta de V1, sin endpoints nuevos)
+- desarrollo.html: indicador "Base global SQLite", última actividad
+  global, última verificación y decisión humana por tarea
 
 Bootstrap verificado sobre el repositorio real:
 - T-0001: NUEVO, 0 intentos, sin trabajador, 3 decisiones pendientes
@@ -280,22 +280,35 @@ Bootstrap verificado sobre el repositorio real:
 - T-0002: NUEVO, 0 intentos, sin trabajador, sin decisiones
 - repetir el bootstrap no duplica ni altera nada; los JSON no se reescriben
 
-Pruebas:
-- PRUEBA_ESTADO_GLOBAL=OK   (16 comprobaciones nuevas, herméticas,
-  incluida la resolución de la misma base desde dos worktrees)
-- PRUEBA_SUPERVISOR=OK      (31 comprobaciones; dos adaptadas a la nueva
-  autoridad, con la misma intención)
-- PRUEBA_API=OK             (13 comprobaciones; API y tablero desde SQLite)
+Pruebas ejecutadas (Python 3.11.15, una corrida por archivo):
 - PRUEBA_NUCLEO=OK
 - PRUEBA_VIGA_RAPIDA=OK
+- PRUEBA_SUPERVISOR=OK        31 de 31 comprobaciones
+- PRUEBA_ESTADO_GLOBAL=OK     16 de 16 comprobaciones
+- PRUEBA_API=OK               12 de 12 comprobaciones
 
-Corredor único: 5 de 5 pruebas en OK.
+5 de 5 archivos de prueba en OK.
+
+Comprobación adicional del estado compartido, fuera de las pruebas: sobre
+un clon con dos worktrees, ambos resuelven la misma ruta de base; el
+worktree B crea y toma una tarea y el árbol A la ve en EN_EJECUCION sin
+tener siquiera su ficha JSON; un JSON alterado a mano no cambia el estado.
 
 NO implementado en A2 (reservado a A3/B): toma atómica concurrente, locks,
 latidos automáticos, detección avanzada de huérfanos, verificar() en el
 worktree de la tarea, lanzamiento de Claude, workers paralelos, worktrees
 automáticos, cola automática, n8n ejecutando tareas, Redis como cola,
 PostgreSQL como estado.
+
+Deuda conocida de A2, no corregida por quedar fuera de su alcance:
+- `inicializar()` lee la versión del esquema antes de abrir la
+  transacción. Dos procesos que creen la base a la vez pueden intentar la
+  misma migración; el segundo falla con error explícito, sin corromper
+  nada. La concurrencia pertenece a A3/B.
+- Borrar una ficha JSON no borra la tarea del estado global: el
+  identificador queda reservado y no puede volver a crearse.
+- `prueba_api.py` lee el repositorio real, de modo que ejecutarla crea la
+  base global en `.git/` si no existía. No modifica ninguna tarea.
 
 T-0001 y T-0002 siguen sin ejecutar. wip/columnas-pre-supervisor intacta.
 
