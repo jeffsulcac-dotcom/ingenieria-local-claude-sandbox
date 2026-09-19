@@ -239,6 +239,26 @@ en `persistir`), que es A3.2. No se adelantó aquí para no rehacer las nueve
   en `inicializar()`). Está comprobado que no produce dos propietarios:
   falla de forma explícita, sin corromper nada. Basta con crear la base
   una vez (`inicializar-estado`) antes de lanzar trabajadores.
+- **El refresco de definiciones todavía puede pisar el ámbito de una tarea
+  viva, por la puerta de `cargar`.** A3.1 cerró la puerta ancha: `tomar` ya
+  no refresca las definiciones de las demás tareas. Pero `cargar`, que es
+  de A2, sigue refrescando la definición de la tarea que se pide, sin
+  mirar si está en ejecución en manos de otro. Reproducido: con T-0001 en
+  ejecución y su ficha declarando otro ámbito en esta rama, basta un
+  `tomar T-0001` —que se RECHAZA por estar tomada— para dejarle el ámbito
+  encogido; la toma siguiente de otra tarea ya no ve el solapamiento y
+  quedan dos escritores sobre el mismo archivo.
+
+  No es nuevo de A3.1: el mismo caso se reproduce igual sobre el código
+  anterior (`b5578d2b`). Cerrarlo del todo exige que la definición de una
+  tarea que retiene ámbito no se refresque mientras lo retiene, y eso vive
+  en `sincronizar_ficha`, que es de A2 y la usan también el bootstrap y la
+  orden `sincronizar-definiciones`. Queda como deuda de A3.2.
+- En contrapartida de lo anterior, **ampliar el ámbito de una tarea que ya
+  está viva no se tiene en cuenta hasta que la tarea deje de estarlo** (o
+  hasta que se ejecute `sincronizar-definiciones`). Cambiar el ámbito de
+  una tarea en marcha es, justamente, lo que rompe la garantía; el sistema
+  prefiere quedarse con el ámbito que la tarea declaraba cuando se tomó.
 
 Prueba correspondiente:
 

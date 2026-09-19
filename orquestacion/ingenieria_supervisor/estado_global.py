@@ -896,6 +896,13 @@ def rechazo(
     """
     estados = tuple(sorted({str(estado) for estado in estados_reclamables}))
 
+    # La misma guarda que `reclamar`: sin estados reclamables, el detalle
+    # terminaría en "La admiten: ." y el usuario leería ese sinsentido.
+    if not estados:
+        raise ErrorEstadoGlobal(
+            "No se indicó ningún estado desde el cual se pueda reclamar."
+        )
+
     if fila is None:
         return {
             "resultado": CLAIM_RECHAZADO,

@@ -19,9 +19,9 @@ Reglas duras que este módulo hace cumplir:
    global (`estado_global.py`). Toda operación que cambia estado persiste
    primero en SQLite y sólo después regenera la ficha JSON como espejo.
 
-6. Desde A3.1, `tomar` es ATÓMICA: comprobación de ámbitos y toma ocurren
-   en una sola transacción BEGIN IMMEDIATE y la concede un UPDATE
-   condicional resuelto por rowcount. Compitan los trabajadores que
+6. Desde A3.1, `tomar` es ATÓMICA: comprobación de estado, comprobación
+   de ámbitos y toma ocurren en una sola transacción BEGIN IMMEDIATE, y la
+   concede un UPDATE condicional resuelto por rowcount. Compitan los trabajadores que
    compitan por la misma tarea, la gana exactamente uno.
 
    El alcance de esa garantía es la TOMA, no el ciclo de vida entero. Las

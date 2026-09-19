@@ -1799,6 +1799,22 @@ def prueba_m_datos_mal_formados():
             ),
         ]
 
+        # `rechazo` es pública y se llama también desde fuera de `reclamar`:
+        # tiene que defender su propio contrato, no fiarse de quien la use.
+        try:
+            estado_global.rechazo(
+                None, "T-0901", "equipo/valido/1",
+                nucleo.ahora_datetime().isoformat(timespec="seconds"),
+                (),
+            )
+        except estado_global.ErrorEstadoGlobal:
+            pass
+        else:
+            raise AssertionError(
+                "Sin estados reclamables, el rechazo describiría un motivo "
+                "imposible: debe fallar."
+            )
+
         for etiqueta, cambios in malos:
             try:
                 _reclamar_suelto(raiz, "T-0901", **cambios)

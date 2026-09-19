@@ -334,7 +334,8 @@ Defecto corregido:
 Solución:
 - Toda la decisión de la toma ocurre dentro de UNA sola transacción
   BEGIN IMMEDIATE sobre la base global:
-  comprobación de ámbitos -> UPDATE condicional -> evento -> COMMIT.
+  comprobación de estado -> comprobación de ámbitos ->
+  UPDATE condicional -> evento -> COMMIT.
 
 Por qué no admite dos ganadores (tres mecanismos, no uno):
 1. BEGIN IMMEDIATE toma el bloqueo de escritura en el primer instante de la
@@ -460,6 +461,20 @@ Deuda conocida de A3.1, no corregida por quedar fuera de su alcance:
   explícita, sin corromper nada, y NUNCA produjo doble propietario (un solo
   ganador en 8 de 8 rondas). Basta con crear la base una vez antes de
   lanzar trabajadores.
+- El refresco de definiciones todavía puede pisar el ámbito de una tarea
+  viva por la puerta de `cargar`. A3.1 cerró la puerta ancha (que `tomar`
+  refrescara las definiciones de las demás tareas), pero `cargar` sigue
+  refrescando la de la tarea que se pide sin mirar si otro la tiene en
+  ejecución. Reproducido: un `tomar T-0001` RECHAZADO por estar ya tomada
+  basta para encoger su ámbito registrado, y la toma siguiente de otra
+  tarea deja dos escritores sobre el mismo archivo. COMPROBADO que NO lo
+  introdujo A3.1: el mismo caso se reproduce idéntico sobre b5578d2b.
+  Cerrarlo exige que `sincronizar_ficha` (de A2, compartida con el
+  bootstrap y con `sincronizar-definiciones`) congele el ámbito mientras la
+  tarea lo retiene. Pertenece a A3.2.
+- Como contrapartida, ampliar el ámbito de una tarea ya viva no se tiene en
+  cuenta hasta que deje de estarlo o hasta ejecutar
+  `sincronizar-definiciones`.
 - La deuda de A2 sigue vigente salvo la atomicidad de `tomar`, ya resuelta.
 
 Pendiente de ejecución en Windows: es el entorno final real y esta corrida
