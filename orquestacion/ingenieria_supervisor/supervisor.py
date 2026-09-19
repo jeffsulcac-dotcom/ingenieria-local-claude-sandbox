@@ -570,6 +570,7 @@ def persistir(
     ficha: Ficha,
     exigir_propietario: str | None = None,
     estados_admitidos=None,
+    exigir_generacion: int | None = None,
 ) -> Ficha:
     """
     Confirma el estado operativo de la ficha, si la propiedad sigue vigente.
@@ -629,7 +630,11 @@ def persistir(
                     con,
                     ficha.id,
                     campos,
-                    generacion=int(ficha.generacion or 0),
+                    generacion=(
+                        int(ficha.generacion or 0)
+                        if exigir_generacion is None
+                        else int(exigir_generacion)
+                    ),
                     momento=ficha.actualizado_en,
                     trabajador_id=exigir_propietario,
                     estados_admitidos=estados_admitidos,
@@ -654,21 +659,74 @@ def persistir(
     return ficha
 
 
-def credencial_de(ficha: Ficha, orden: str) -> str:
+def credencial_de(
+    ficha: Ficha,
+    orden: str,
+    trabajador_id: str | None = None,
+    generacion: int | None = None,
+) -> tuple:
     """
-    Identidad que una orden del ciclo debe acreditar para escribir.
+    Credencial (propietario, generación) que una orden debe acreditar.
 
-    Se toma ANTES de que la orden modifique la ficha: `devolver` y
-    `verificar` liberan al trabajador como parte de su trabajo, y si la
-    credencial se leyera después iría vacía y la condición no exigiría nada.
+    Se resuelve ANTES de que la orden modifique la ficha: `devolver` y
+    `verificar` liberan al trabajador como parte de su trabajo, y si se
+    leyera después iría vacía y la condición no exigiría nada.
+
+    Dos formas de acreditarse, y la diferencia importa
+    --------------------------------------------------
+    DECLARADA (`trabajador_id`, y opcionalmente `generacion`): quien llama
+    dice quién es. Es la única forma que detiene de verdad a una orden
+    rezagada, porque la orden vieja lleva SU identidad y SU generación, no
+    las que haya ahora en la base. Un emisor que releyera la fila para
+    saber quién es no estaría acreditándose: estaría suplantando al dueño
+    actual, y ninguna condición podría distinguirlo.
+
+    IMPLÍCITA (nada): se toma la de la ficha recién leída. Es lo que hacía
+    V1 y se conserva para no romper a quien ya llamaba así. Protege contra
+    el caso en que la propiedad cambie ENTRE esta lectura y la escritura,
+    que no es poco, pero no contra un emisor que ya había perdido la tarea
+    antes de leer.
+
+    Lo declarado NO se comprueba aquí contra la base: eso sería volver a
+    comprobar antes de escribir (TOCTOU). Viaja tal cual al WHERE, y decide
+    el motor.
     """
+    if trabajador_id is not None:
+        if not str(trabajador_id).strip():
+            raise ErrorSupervisor(
+                "La identidad declarada para '" + orden + "' está vacía."
+            )
+
+        declarada = str(trabajador_id).strip()
+
+        if generacion is None:
+            # Sin generación declarada se usa la de la lectura actual. Basta
+            # para distinguir a otro trabajador, no para distinguir dos
+            # ejecuciones del mismo: para eso hay que declararla.
+            return (declarada, int(ficha.generacion or 0))
+
+        if isinstance(generacion, bool) or not isinstance(generacion, int):
+            raise ErrorSupervisor(
+                "La generación declarada para '" + orden + "' debe ser un "
+                "entero; se recibió: " + repr(generacion) + "."
+            )
+
+        return (declarada, generacion)
+
+    if generacion is not None:
+        raise ErrorSupervisor(
+            "No se puede declarar una generación para '" + orden + "' sin "
+            "declarar también el trabajador: la generación por sí sola no "
+            "identifica a nadie."
+        )
+
     if not ficha.trabajador_id:
         raise ErrorSupervisor(
             "La tarea '" + ficha.id + "' no tiene propietario, así que nadie "
             "puede emitir '" + orden + "' sobre ella."
         )
 
-    return ficha.trabajador_id
+    return (ficha.trabajador_id, int(ficha.generacion or 0))
 
 
 def _regenerar_espejo(raiz: Path, ficha: Ficha) -> None:
@@ -1147,6 +1205,8 @@ def latido(
     raiz: Path,
     identificador: str,
     ahora: datetime | None = None,
+    trabajador_id: str | None = None,
+    generacion: int | None = None,
 ) -> Ficha:
     """
     Señal de vida del trabajador que sostiene la tarea.
@@ -1165,7 +1225,9 @@ def latido(
             "Sólo una tarea en ejecución puede emitir latido."
         )
 
-    propietario = credencial_de(ficha, "latido")
+    propietario, esperada = credencial_de(
+        ficha, "latido", trabajador_id, generacion
+    )
 
     ficha.ultimo_latido = (
         ahora or ahora_datetime()
@@ -1176,6 +1238,7 @@ def latido(
         ficha,
         exigir_propietario=propietario,
         estados_admitidos={Estado.EN_EJECUCION},
+        exigir_generacion=esperada,
     )
 
     return ficha
@@ -1186,6 +1249,8 @@ def devolver(
     identificador: str,
     motivo: str = "Tarea devuelta por el trabajador.",
     git=None,
+    trabajador_id: str | None = None,
+    generacion: int | None = None,
 ) -> Ficha:
     """
     El trabajador suelta la tarea sin haberla terminado.
@@ -1202,7 +1267,9 @@ def devolver(
         )
 
     # Antes de liberar: después, la ficha ya no sabe de quién era.
-    propietario = credencial_de(ficha, "devolver")
+    propietario, esperada = credencial_de(
+        ficha, "devolver", trabajador_id, generacion
+    )
 
     _liberar_trabajador(ficha)
 
@@ -1213,6 +1280,7 @@ def devolver(
         ficha,
         exigir_propietario=propietario,
         estados_admitidos={Estado.EN_EJECUCION},
+        exigir_generacion=esperada,
     )
 
     _registrar_en_git(git, ficha, motivo)
@@ -1233,6 +1301,8 @@ def verificar(
     tiempo_limite_s: int = corredor.TIEMPO_LIMITE_S,
     ejecutable: str | None = None,
     git=None,
+    trabajador_id: str | None = None,
+    generacion: int | None = None,
 ) -> dict:
     """
     Corre el filtro completo y decide el estado resultante.
@@ -1259,7 +1329,9 @@ def verificar(
 
     # Se acredita ANTES de correr las pruebas, que es la espera más larga
     # del sistema y por tanto la ventana más ancha para perder la tarea.
-    propietario = credencial_de(ficha, "verificar")
+    propietario, esperada = credencial_de(
+        ficha, "verificar", trabajador_id, generacion
+    )
 
     corrida = corredor.ejecutar_todas(raiz, tiempo_limite_s, ejecutable)
 
@@ -1372,6 +1444,7 @@ def verificar(
         ficha,
         exigir_propietario=propietario,
         estados_admitidos={Estado.EN_EJECUCION},
+        exigir_generacion=esperada,
     )
 
     registro = _registrar_en_git(git, ficha, motivo)

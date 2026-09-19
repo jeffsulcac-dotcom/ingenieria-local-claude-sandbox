@@ -469,6 +469,14 @@ def orden_crear(raiz: Path, argumentos) -> int:
 # Código de salida propio de una toma rechazada: no es una avería del
 # Supervisor, es el resultado normal de perder una carrera. Quien invoque
 # la orden (una persona, un guion o n8n) puede distinguirla de un error.
+AYUDA_TRABAJADOR = (
+    "Identidad con la que se acredita quien ordena. Sin ella se usa la del propietario que figure en la base, que NO detiene a una orden rezagada: quien la lee estaría suplantando al dueño actual."
+)
+
+AYUDA_GENERACION = (
+    "Generación de propiedad con la que se acredita la orden. Es lo único que distingue dos ejecuciones del MISMO trabajador. La imprime 'tomar'."
+)
+
 CODIGO_TOMA_RECHAZADA = 3
 
 # Código propio de una orden rechazada por propiedad (A3.2): quien la emitió
@@ -507,13 +515,19 @@ def orden_tomar(raiz: Path, argumentos) -> int:
     print("Tarea tomada: " + ficha.id)
     print("Estado: " + str(ficha.estado))
     print("Trabajador: " + str(ficha.trabajador_id))
+    print("Generación: " + str(ficha.generacion))
     print("Rama exigida: " + str(ficha.rama))
 
     return 0
 
 
 def orden_latido(raiz: Path, argumentos) -> int:
-    ficha = nucleo.latido(raiz, argumentos.tarea)
+    ficha = nucleo.latido(
+        raiz,
+        argumentos.tarea,
+        trabajador_id=argumentos.trabajador,
+        generacion=argumentos.generacion,
+    )
 
     print("Latido registrado: " + str(ficha.ultimo_latido))
 
@@ -526,6 +540,8 @@ def orden_devolver(raiz: Path, argumentos) -> int:
         argumentos.tarea,
         argumentos.motivo or "Tarea devuelta por el trabajador.",
         git=_git(raiz, argumentos),
+        trabajador_id=argumentos.trabajador,
+        generacion=argumentos.generacion,
     )
 
     print("Tarea devuelta: " + ficha.id + " -> " + str(ficha.estado))
@@ -538,6 +554,8 @@ def orden_verificar(raiz: Path, argumentos) -> int:
         raiz,
         argumentos.tarea,
         git=_git(raiz, argumentos),
+        trabajador_id=argumentos.trabajador,
+        generacion=argumentos.generacion,
     )
 
     _titulo("VERIFICACIÓN DE " + argumentos.tarea)
@@ -788,17 +806,23 @@ def construir_analizador() -> argparse.ArgumentParser:
 
     latido = ordenes.add_parser("latido", help="Señal de vida del trabajador.")
     latido.add_argument("tarea")
+    latido.add_argument("--trabajador", help=AYUDA_TRABAJADOR)
+    latido.add_argument("--generacion", type=int, help=AYUDA_GENERACION)
     latido.set_defaults(funcion=orden_latido)
 
     devolver = ordenes.add_parser("devolver", help="Soltar una tarea tomada.")
     devolver.add_argument("tarea")
     devolver.add_argument("--motivo")
+    devolver.add_argument("--trabajador", help=AYUDA_TRABAJADOR)
+    devolver.add_argument("--generacion", type=int, help=AYUDA_GENERACION)
     devolver.set_defaults(funcion=orden_devolver)
 
     verificar = ordenes.add_parser(
         "verificar", help="Ejecutar el filtro de pruebas y decidir el estado."
     )
     verificar.add_argument("tarea")
+    verificar.add_argument("--trabajador", help=AYUDA_TRABAJADOR)
+    verificar.add_argument("--generacion", type=int, help=AYUDA_GENERACION)
     verificar.set_defaults(funcion=orden_verificar)
 
     decidir = ordenes.add_parser(
