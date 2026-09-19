@@ -1046,6 +1046,10 @@ def aplicar_fila(ficha: Ficha, fila: dict) -> Ficha:
 # Lectura y escritura de tareas y eventos
 # ----------------------------------------------------------------------
 
+# Columnas que una orden puede INCREMENTAR en vez de fijar, para que el
+# valor lo resuelva el motor y no una lectura anterior (ver A3.3).
+COLUMNAS_NUMERICAS = ("intentos",)
+
 COLUMNAS_TAREA = (
     "id", "titulo", "estado", "rama", "worktree", "intentos", "max_intentos",
     "trabajador_id", "pid", "iniciado_en", "ultimo_latido", "creado_en",
@@ -1352,6 +1356,7 @@ def actualizar_si_propietario(
     momento: str,
     trabajador_id: str | None = None,
     estados_admitidos=None,
+    incrementos=None,
 ) -> dict:
     """
     Escritura CONDICIONADA a que quien ordena siga siendo el dueño vigente.
@@ -1377,10 +1382,29 @@ def actualizar_si_propietario(
     `reclamar`. Y no escribe nada: ni estado, ni intentos, ni marcas de
     tiempo. Quien llama decide si lo convierte en error.
     """
-    if not campos:
+    incrementos = tuple(incrementos or ())
+
+    if not campos and not incrementos:
         raise ErrorEstadoGlobal(
             "Una escritura condicionada necesita al menos una columna."
         )
+
+    for columna in incrementos:
+        # Un incremento se resuelve DENTRO del motor, sobre el valor real de
+        # la fila en el instante de escribir. Calcularlo en Python a partir
+        # de una lectura anterior es un lost update de manual: dos órdenes
+        # que hubieran leído el mismo valor escribirían el mismo resultado y
+        # una de las dos se perdería sin que nadie se enterase.
+        if columna not in COLUMNAS_NUMERICAS:
+            raise ErrorEstadoGlobal(
+                "No se puede incrementar la columna '" + str(columna) + "'."
+            )
+
+        if columna in campos:
+            raise ErrorEstadoGlobal(
+                "La columna '" + str(columna) + "' no puede fijarse y "
+                "además incrementarse en la misma escritura."
+            )
 
     for columna in campos:
         if columna not in COLUMNAS_TAREA or columna in ("id", "generacion"):
@@ -1426,10 +1450,12 @@ def actualizar_si_propietario(
         )
         parametros.extend(estados)
 
-    asignaciones = ", ".join(columna + " = ?" for columna in campos)
+    partes = [columna + " = ?" for columna in campos]
+    partes += [columna + " = " + columna + " + 1" for columna in incrementos]
 
     cursor = con.execute(
-        "UPDATE tareas SET " + asignaciones + " WHERE " + " AND ".join(condiciones),
+        "UPDATE tareas SET " + ", ".join(partes)
+        + " WHERE " + " AND ".join(condiciones),
         tuple(parametros),
     )
 

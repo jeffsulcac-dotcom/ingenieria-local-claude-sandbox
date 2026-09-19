@@ -558,6 +558,50 @@ COLUMNAS_OPERATIVAS = (
 )
 
 
+# Campos que cada orden POSEE, es decir los únicos que puede escribir.
+#
+# A3.2 protegió QUIÉN escribe y DESDE QUÉ momento; no QUÉ. `persistir`
+# reescribía las dieciséis columnas operativas en bloque a partir de la foto
+# que `cargar` había leído, así que dos órdenes perfectamente válidas de la
+# misma generación, propietario y estado —un latido y una decisión humana,
+# por ejemplo— se pisaban campo a campo: la segunda devolvía a la columna
+# de la primera el valor que tenía cuando ella leyó. Un lost update de
+# manual, y silencioso.
+#
+# Desde A3.3 cada orden declara lo suyo y no toca nada más.
+# `actualizado_en` se añade siempre: es la marca de "algo cambió aquí", la
+# escribe con derecho cualquier orden que confirme, y que dos la pisen no
+# pierde información de estado.
+CAMPOS_LATIDO = ("ultimo_latido",)
+
+# Soltar al trabajador: lo hacen todas las órdenes que cierran un turno.
+CAMPOS_LIBERACION = ("trabajador_id", "pid", "iniciado_en", "ultimo_latido")
+
+CAMPOS_TRANSICION = ("estado",)
+
+CAMPOS_DEVOLVER = CAMPOS_TRANSICION + CAMPOS_LIBERACION
+
+CAMPOS_VERIFICAR = (
+    CAMPOS_TRANSICION
+    + CAMPOS_LIBERACION
+    + ("ultima_falla", "ultima_verificacion", "ejecuciones")
+)
+
+CAMPOS_DECIDIR = ("decisiones", "requiere_decision_humana")
+
+# `reabrir` devuelve además el presupuesto de intentos, que es un valor
+# fijo (cero) y no un incremento.
+CAMPOS_REABRIR = CAMPOS_TRANSICION + CAMPOS_LIBERACION + ("intentos",)
+
+# `reanudar` cierra la ejecución interrumpida: la anota en `ejecuciones`,
+# deja constancia en `ultima_falla` y devuelve la tarea al circuito.
+CAMPOS_RECUPERAR = (
+    CAMPOS_TRANSICION
+    + CAMPOS_LIBERACION
+    + ("ejecuciones", "ultima_falla")
+)
+
+
 def cargar(raiz: Path, identificador: str) -> Ficha:
     """
     Tarea completa: definición desde el JSON, estado operativo desde SQLite.
@@ -584,6 +628,8 @@ def persistir(
     exigir_propietario: str | None = None,
     estados_admitidos=None,
     exigir_generacion: int | None = None,
+    campos_propios=None,
+    incrementos=None,
 ) -> Ficha:
     """
     Confirma el estado operativo de la ficha, si la propiedad sigue vigente.
@@ -643,7 +689,32 @@ def persistir(
         ficha.creado_en = ficha.actualizado_en
 
     fila = global_.fila_desde_ficha(ficha, ficha.actualizado_en)
-    campos = {columna: fila[columna] for columna in COLUMNAS_OPERATIVAS}
+
+    # Sólo lo que esta orden posee (A3.3). Sin `campos_propios` se escriben
+    # las dieciséis, que es lo que hacía A3.2 y lo que abre la puerta al
+    # lost update: queda disponible para quien deba escribir de verdad todo
+    # el estado operativo, pero ninguna orden del ciclo lo usa ya.
+    propios = tuple(
+        COLUMNAS_OPERATIVAS if campos_propios is None else campos_propios
+    )
+
+    incrementos = tuple(incrementos or ())
+
+    for columna in propios + incrementos:
+        if columna not in COLUMNAS_OPERATIVAS:
+            raise ErrorSupervisor(
+                "'" + str(columna) + "' no es una columna operativa: una "
+                "orden no puede declararla como suya."
+            )
+
+    campos = {columna: fila[columna] for columna in propios}
+
+    # La marca de actualización la escribe cualquier orden que confirme.
+    campos["actualizado_en"] = fila["actualizado_en"]
+
+    for columna in incrementos:
+        campos.pop(columna, None)
+
     eventos = list(ficha.eventos_pendientes)
 
     if estados_admitidos is None and ficha.estado_leido is not None:
@@ -664,6 +735,7 @@ def persistir(
                     momento=ficha.actualizado_en,
                     trabajador_id=exigir_propietario,
                     estados_admitidos=estados_admitidos,
+                    incrementos=incrementos,
                 )
 
                 if informe["resultado"] != global_.ESCRITURA_ACEPTADA:
@@ -671,6 +743,12 @@ def persistir(
 
                 for evento in eventos:
                     global_.insertar_evento(con, ficha.id, evento)
+
+                # La fila se relee DENTRO de la transacción para que la
+                # ficha refleje lo que el COMMIT confirma, incluidos los
+                # incrementos que resolvió el motor y los campos que esta
+                # orden NO escribió y que otra pudo haber cambiado.
+                confirmada = global_.obtener_tarea(con, ficha.id)
     except ErrorPropiedad:
         # La ficha en memoria vuelve a ser el reflejo de lo que hay grabado:
         # nada cambió, y sus marcas de tiempo no deben sugerir lo contrario.
@@ -679,6 +757,15 @@ def persistir(
         raise
 
     ficha.eventos_pendientes.clear()
+
+    # La ficha vuelve a ser el reflejo de la fila, no de lo que esta orden
+    # creía. Sin esto, escribir sólo lo propio dejaría en memoria los
+    # valores viejos de las columnas ajenas, y el espejo JSON los volcaría
+    # a disco: se habría cambiado un lost update en SQLite por otro en el
+    # archivo.
+    historial = list(ficha.historial)
+    global_.aplicar_fila(ficha, confirmada)
+    ficha.historial = historial
 
     # Lo que se acaba de confirmar es, a partir de ahora, lo leído: si la
     # misma ficha se persiste otra vez, la precondición tiene que ser el
@@ -1319,6 +1406,7 @@ def latido(
         exigir_propietario=propietario,
         estados_admitidos={Estado.EN_EJECUCION},
         exigir_generacion=esperada,
+        campos_propios=CAMPOS_LATIDO,
     )
 
     return ficha
@@ -1361,6 +1449,7 @@ def devolver(
         exigir_propietario=propietario,
         estados_admitidos={Estado.EN_EJECUCION},
         exigir_generacion=esperada,
+        campos_propios=CAMPOS_DEVOLVER,
     )
 
     _registrar_en_git(git, ficha, motivo)
@@ -1415,6 +1504,8 @@ def verificar(
 
     corrida = corredor.ejecutar_todas(raiz, tiempo_limite_s, ejecutable)
 
+    consume_intento = False
+
     problemas = []
 
     if corrida["resultado"] != corredor.RESULTADO_APROBADO:
@@ -1458,6 +1549,12 @@ def verificar(
     )
 
     if problemas:
+        # El intento lo incrementa el MOTOR en el propio UPDATE
+        # (`incrementos`), no Python: sumar uno sobre una lectura anterior
+        # es un lost update en cuanto haya dos verificaciones. Aquí sólo se
+        # anota que esta orden lo consume, y el valor real se relee de la
+        # fila confirmada.
+        consume_intento = True
         ficha.intentos = ficha.intentos + 1
 
         ficha.ultima_falla = {
@@ -1525,6 +1622,8 @@ def verificar(
         exigir_propietario=propietario,
         estados_admitidos={Estado.EN_EJECUCION},
         exigir_generacion=esperada,
+        campos_propios=CAMPOS_VERIFICAR,
+        incrementos=("intentos",) if consume_intento else (),
     )
 
     registro = _registrar_en_git(git, ficha, motivo)
@@ -1597,7 +1696,7 @@ def decidir(
         }
     )
 
-    persistir(raiz, ficha)
+    persistir(raiz, ficha, campos_propios=CAMPOS_DECIDIR)
 
     return ficha
 
@@ -1635,7 +1734,7 @@ def aprobar(
         ORIGEN_HUMANO,
     )
 
-    persistir(raiz, ficha)
+    persistir(raiz, ficha, campos_propios=CAMPOS_TRANSICION)
 
     _registrar_en_git(git, ficha, "Aprobación humana.")
 
@@ -1658,7 +1757,7 @@ def rechazar(
 
     transicionar(ficha, Estado.RECHAZADO, motivo, ORIGEN_HUMANO)
 
-    persistir(raiz, ficha)
+    persistir(raiz, ficha, campos_propios=CAMPOS_DEVOLVER)
 
     _registrar_en_git(git, ficha, motivo)
 
@@ -1686,7 +1785,7 @@ def reabrir(
 
     transicionar(ficha, Estado.REABIERTO, motivo, ORIGEN_HUMANO)
 
-    persistir(raiz, ficha)
+    persistir(raiz, ficha, campos_propios=CAMPOS_REABRIR)
 
     _registrar_en_git(git, ficha, motivo)
 
@@ -1710,7 +1809,7 @@ def bloquear(
 
     transicionar(ficha, Estado.BLOQUEADO, motivo, origen)
 
-    persistir(raiz, ficha)
+    persistir(raiz, ficha, campos_propios=CAMPOS_DEVOLVER)
 
     _registrar_en_git(git, ficha, motivo)
 
@@ -1958,7 +2057,7 @@ def reanudar(
             # la tarea, la generación ya no casa y se rechaza. Es lo
             # correcto: una tarea recién reclamada NO está abandonada, y
             # devolverla a REABIERTO se la quitaría a su nuevo dueño.
-            persistir(raiz, ficha)
+            persistir(raiz, ficha, campos_propios=CAMPOS_RECUPERAR)
         except ErrorPropiedad as rechazo:
             informe["reclamadas_mientras_tanto"].append(
                 {
