@@ -226,16 +226,21 @@ exige que cada orden exija ser el propietario (UPDATE condicional también
 en `persistir`), que es A3.2. No se adelantó aquí para no rehacer las nueve
 órdenes del ciclo dentro de una etapa cuyo alcance es la toma.
 
+**Esto quedó RESUELTO EN A3.2**, que es la sección siguiente. Lo que se
+describe arriba es cómo estaba el sistema al cerrar A3.1.
+
 **Limitaciones conocidas de A3.1 (por diseño).**
 
 - La unicidad de propietario está garantizada para la toma, no para el
   resto del ciclo de vida (ver la tabla anterior). Es la deuda principal
-  que hereda A3.2.
+  que hereda A3.2. **RESUELTA EN A3.2**: ver la sección siguiente.
 - `latido` y `verificar` no comprueban que quien llama sea el propietario
   de la tarea: cualquiera puede latir o verificar una tarea ajena. La
-  propiedad efectiva del claim pertenece a A3.2.
+  propiedad efectiva del claim pertenece a A3.2. **RESUELTO EN A3.2**.
 - `reanudar` puede arrebatar una tarea a un trabajador vivo si su latido
-  vence; la política de expiración pertenece a A3.2.
+  vence. **PARCIALMENTE RESUELTO EN A3.2**: ya no puede arrebatársela a
+  quien la tomó entre su lectura y su escritura. La política de expiración
+  temporal sigue pendiente, y pasa a A3.3.
 - No hay latidos automáticos, expiración de trabajadores, detección de
   trabajadores muertos ni recuperación automática de tareas abandonadas.
 - El espejo JSON se escribe DESPUÉS del COMMIT, con lo que la transacción
@@ -259,11 +264,9 @@ en `persistir`), que es A3.2. No se adelantó aquí para no rehacer las nueve
   bloqueada y que la orden siguiente pone el JSON al día.
 - Crear la base desde cero con varios procesos a la vez sigue fallando en
   los perdedores con "table tareas already exists" (deuda declarada de A2,
-  en `inicializar()`). Está comprobado que no produce dos propietarios:
-  falla de forma explícita, sin corromper nada. Basta con crear la base
-  una vez (`inicializar-estado`) antes de lanzar trabajadores. Comprobado
-  a mano con 6 procesos, un solo ganador en 8 de 8 rondas; no hay prueba
-  automática que lo cubra, porque corregirlo es A3.2.
+  en `inicializar()`). **RESUELTO EN A3.2**, con prueba automática de 6
+  procesos por ronda. A3.2 encontró además un segundo modo de fallo que
+  aquí no estaba declarado: la conversión inicial a WAL.
 - **El refresco de definiciones todavía puede pisar el ámbito de una tarea
   viva, por la puerta de `cargar`.** A3.1 cerró la puerta ancha: `tomar` ya
   no refresca las definiciones de las demás tareas. Pero `cargar`, que es
@@ -275,10 +278,11 @@ en `persistir`), que es A3.2. No se adelantó aquí para no rehacer las nueve
   quedan dos escritores sobre el mismo archivo.
 
   No es nuevo de A3.1: el mismo caso se reproduce igual sobre el código
-  anterior (`b5578d2b`). Cerrarlo del todo exige que la definición de una
-  tarea que retiene ámbito no se refresque mientras lo retiene, y eso vive
-  en `sincronizar_ficha`, que es de A2 y la usan también el bootstrap y la
-  orden `sincronizar-definiciones`. Queda como deuda de A3.2.
+  anterior (`b5578d2b`). **RESUELTO EN A3.2** con una guarda en
+  `sincronizar_ficha`, que es el punto único donde se escribe
+  `ambito_archivos`. A3.2 comprobó además que el agujero era más ancho de
+  lo descrito: bastaba una orden de sólo lectura, o cambiar sólo el
+  título.
 - En contrapartida de lo anterior, **ampliar el ámbito de una tarea que ya
   está viva no se tiene en cuenta hasta que la tarea deje de estarlo** (o
   hasta que se ejecute `sincronizar-definiciones`). Cambiar el ámbito de
@@ -372,12 +376,213 @@ acerca al límite:
   unas 525 que no se toca reduciéndolas.
 - El remedio que de verdad lo resuelve es memorizar el resultado de
   `git rev-parse --git-common-dir` por raíz dentro de
-  `estado_global.git_common_dir`. Medido en una copia: las invocaciones de
-  `git` bajan de unas 830 a unas 147, un 82 % menos, con la tanda igual de
-  verde. No se ha aplicado porque `git_common_dir` es código de A2 y
-  cambiarlo excede el alcance de A3.1; queda anotado como lo primero que
-  hay que hacer si Windows se acerca al límite, y como mejora evidente
-  para todo el Supervisor, no sólo para la prueba.
+  `estado_global.git_common_dir`. **APLICADO EN A3.2**, porque su batería
+  es la que acercó la corrida al límite. Medido después: este archivo pasa
+  de unas 455 invocaciones a 23 en el proceso padre.
+
+### A3.2 — Propiedad efectiva durante el ciclo
+
+A3.1 garantizaba que una tarea sólo pudiera ser TOMADA por un trabajador.
+A3.2 garantiza lo siguiente: que después de la toma, sólo el propietario
+VIGENTE pueda modificar el estado operativo de esa ejecución.
+
+**Qué es una orden rezagada.** No es una llamada nueva que relee la base:
+la que relee ve al dueño actual y, si se acreditara con eso, lo estaría
+suplantando. Es la orden COMPUESTA contra una lectura anterior y que llega
+después, llevando la identidad y la generación que tenía entonces. Ese es
+el caso que A3.2 cierra.
+
+**El identificador de propiedad: `tareas.generacion`.**
+
+Un entero por tarea. Sólo lo incrementa `reclamar`, con
+`generacion = generacion + 1` dentro del mismo UPDATE condicional que
+concede la toma, resuelto por el motor y no en Python: dos tomas que
+partieran del mismo valor leído no pueden repetir número. La pareja
+`(trabajador_id, generacion)` identifica una EJECUCIÓN, no un trabajador.
+
+Por qué un contador y no otra cosa:
+
+- `trabajador_id` solo no distingue una ejecución vieja de una nueva del
+  MISMO trabajador. Ése es el problema ABA, y es el caso que un control
+  por identidad deja pasar.
+- El reloj no sirve: `iniciado_en` está truncado a segundos, así que dos
+  tomas del mismo trabajador en el mismo segundo dejaban idénticas las
+  cinco columnas de propiedad.
+- El PID no sirve: el sistema los reutiliza, y la línea de órdenes
+  registra el de un mandato que muere en el acto.
+- No hace falta criptografía: la base es local y de una sola PC. Un
+  entero es lo más simple que funciona, y es determinista y comprobable.
+
+**Escrituras condicionadas.** `estado_global.actualizar_si_propietario`
+lleva la precondición en el WHERE del UPDATE y decide por `rowcount`, sin
+comprobación previa en Python. `supervisor.persistir` la usa siempre:
+
+| Precondición | Cuándo se exige |
+|---|---|
+| `generacion = ?` | SIEMPRE, con la generación con la que se leyó la ficha |
+| `trabajador_id = ?` | En `latido`, `devolver` y `verificar` |
+| `estado IN (...)` | Cuando la orden sólo vale desde ciertos estados |
+
+La generación se exige también en las órdenes humanas, que no tienen
+propietario pero tampoco deben pisar una ejecución que empezó mientras su
+emisor decidía.
+
+**Cómo se acredita quien ordena.** Dos formas, y la diferencia importa:
+
+- DECLARADA: `--trabajador` y `--generacion`, los valores que imprimió
+  `tomar`. Es la única forma que detiene de verdad a una orden rezagada,
+  porque la orden vieja lleva SU credencial, no la que haya ahora.
+- IMPLÍCITA: sin argumentos, se toma la de la ficha recién leída. Es lo
+  que hacía V1 y se conserva por compatibilidad. Protege del cambio de
+  propiedad ENTRE la lectura y la escritura, que no es poco, pero no de
+  un emisor que ya había perdido la tarea antes de leer.
+
+**Qué pasa en un rechazo.** Se lanza `ErrorPropiedad` DENTRO de la
+transacción, así que el ROLLBACK deshace todo: no se escribe el estado, no
+se escriben los eventos pendientes (siguen en la ficha, sin consumirse), no
+se gasta un intento, no se regenera el espejo JSON y `actualizado_en`
+vuelve a su valor anterior. Un rechazo no deja rastro de haber pasado.
+
+En la línea de órdenes, el rechazo por propiedad sale con **código 4**,
+atendido en `principal` para que valga en todas las órdenes. Los demás
+códigos siguen significando lo mismo: 0 éxito, 1 resultado no deseado,
+2 error controlado (y también error de uso de argparse), 3 toma rechazada.
+
+**Ámbito de una tarea viva.** La regla de un solo escritor se comprueba
+contra el ámbito GRABADO, y `sincronizar_ficha` lo reescribía desde el JSON
+sin mirar el estado operativo. Como `cargar` llama ahí y encabeza casi
+todas las órdenes, bastaba editar el JSON y ejecutar una orden de SÓLO
+LECTURA —o una toma que terminara RECHAZADA, o cambiar únicamente el
+título— para estrechar el ámbito de una tarea ya tomada; la toma siguiente
+no veía el solapamiento y quedaban dos escritores sobre el mismo archivo.
+
+Ahora, mientras el estado de la tarea retenga su ámbito
+(`en_ejecucion`, `requiere_revision`, `propuesto`), un cambio de ámbito no
+se aplica y la huella de definición NO avanza. Eso último es lo que impide
+que el refresco se pierda en silencio: vuelve a intentarse solo en cuanto
+la tarea deja de estar viva. Un cambio declarativo inocuo —el título, la
+descripción de una decisión— sigue sincronizándose con normalidad: sólo se
+frena lo que rompería la garantía.
+
+**Bootstrap concurrente.** Dos carreras, las dos reproducidas y las dos
+corregidas:
+
+- `inicializar` leía la versión de esquema en autocommit y migraba
+  después, así que el perdedor ejecutaba `CREATE TABLE tareas` sobre una
+  base que ya la tenía y moría con "table tareas already exists". Ahora la
+  relee DENTRO de la transacción, con el bloqueo de escritura ya tomado.
+  Añadir `IF NOT EXISTS` no bastaba: sólo desplazaba el error al INSERT
+  contra la clave primaria de `esquema`.
+- La conversión inicial `delete` -> `wal` necesita un bloqueo exclusivo
+  momentáneo y SQLite no invoca el manejador de ocupado para ese cambio,
+  de modo que `busy_timeout` no lo cubría. Ahora sólo se pide el cambio si
+  la base no está ya en WAL, y si hay que convertir se reintenta de forma
+  acotada releyendo el modo entre intentos.
+
+**Rendimiento.** Se aplicó la mitigación que A3.1 dejó medida y anotada:
+`git_common_dir` memoriza su resultado por raíz y por proceso. Medido, en
+el proceso padre: `prueba_propiedad_ciclo.py` pasa de 355 a 21
+invocaciones de `git rev-parse --git-common-dir`, y `prueba_toma_atomica.py`
+de unas 455 a 23 — una por repositorio temporal, el mínimo posible. No es
+una caché global ni persistente, y antes de devolver lo memorizado
+comprueba que el directorio siga existiendo.
+
+**Limitaciones conocidas de A3.2 (por diseño).**
+
+- La credencial IMPLÍCITA sigue disponible, y un emisor que pueda quedarse
+  rezagado debe declarar la suya. La prueba 5 de la batería lo demuestra
+  en vez de esconderlo: con sólo el nombre, una orden del mismo trabajador
+  entra; con la generación declarada, cae.
+- Las órdenes humanas (`decidir`, `aprobar`, `rechazar`, `reabrir`,
+  `bloquear`) exigen generación pero no identidad: no tienen propietario
+  que acreditar. Eso es correcto para una persona, y significa que una
+  persona puede intervenir una tarea viva a propósito.
+- `reanudar` sigue juzgando por PID y latido. Ahora no puede arrebatarle
+  la tarea a quien la tomó entre su lectura y su escritura (la anota en
+  `reclamadas_mientras_tanto`), pero la política de expiración temporal
+  sigue siendo de A3.3.
+- La ventana del espejo JSON descrita en A3.1 se estrecha mucho —ninguna
+  orden ajena puede ya cruzarse—, pero sigue existiendo entre dos órdenes
+  legítimas del mismo propietario.
+- `verificar` sigue ejecutando las pruebas sobre `raiz` y no sobre el
+  worktree de la tarea. Eso es A3.3.
+
+**Verificación en Windows (PENDIENTE DE EJECUTAR).** La evidencia de arriba
+se obtuvo en Linux. Windows es el entorno final real y lo que puede
+comportarse distinto es lo mismo que en A3.1: `multiprocessing` sólo tiene
+`spawn` (la prueba ya lo fuerza, así que ejercita el mismo camino), el
+bloqueo de SQLite usa otra API del sistema, un archivo abierto no se puede
+borrar mientras alguna conexión siga viva, y arrancar procesos es más lento.
+
+Lo que sí se pudo descartar aquí, que es justo la condición que en Windows
+decide si los temporales se pueden borrar: la corrida con
+`python -X dev -W error::ResourceWarning` sale con código 0 sin emitir un
+solo aviso, y un detector que instrumenta `sqlite3.connect` cuenta 352
+conexiones abiertas durante la tanda y **0 vivas al terminar**.
+
+Sobre el cronómetro: el riesgo que A3.1 dejó anotado ya no aplica igual,
+porque A3.2 memoriza `git_common_dir`. Este archivo hace 105 invocaciones
+de `git` en el proceso padre, 21 de ellas de `rev-parse`. Aun en el peor
+caso medido en esa PC (250 ms por invocación de `git`), eso son unos 26 s
+de un límite de 120 s, y el resto de la corrida es SQLite local.
+
+Desde `C:\INGENIERIA_LOCAL\motor`, en PowerShell 7:
+
+    $env:PYTHONPATH = "$PWD;$PWD\nucleo;$PWD\orquestacion"
+    $env:PYTHONUTF8 = "1"
+    $env:PYTHONIOENCODING = "utf-8"
+    $env:PYTHONDONTWRITEBYTECODE = "1"
+
+    # 1. La batería de propiedad, sola y cronometrada.
+    Measure-Command { python .\pruebas\orquestacion\prueba_propiedad_ciclo.py } |
+        Select-Object TotalSeconds
+    python .\pruebas\orquestacion\prueba_propiedad_ciclo.py
+    if ($LASTEXITCODE -ne 0) { Write-Host "FALLO: codigo $LASTEXITCODE" -ForegroundColor Red }
+
+    # 2. Corrida de estrés ampliada.
+    python .\pruebas\orquestacion\prueba_propiedad_ciclo.py --rezagadas 400 --emisores 10 --ordenes 60
+    if ($LASTEXITCODE -ne 0) { Write-Host "FALLO: codigo $LASTEXITCODE" -ForegroundColor Red }
+
+    # 3. Recursos sin cerrar (lo que decide si Windows puede borrar).
+    python -X dev -W error::ResourceWarning .\pruebas\orquestacion\prueba_propiedad_ciclo.py
+    if ($LASTEXITCODE -ne 0) { Write-Host "FALLO: codigo $LASTEXITCODE" -ForegroundColor Red }
+
+    # 4. Regresión completa por el corredor único (incluye A3.1).
+    python -m orquestacion.ingenieria_supervisor pruebas --detalle
+    if ($LASTEXITCODE -ne 0) { Write-Host "FALLO: codigo $LASTEXITCODE" -ForegroundColor Red }
+
+    # 5. El código de salida 4, comprobado a mano de punta a punta.
+    python -m orquestacion.ingenieria_supervisor tomar T-9001 --trabajador W1
+    #    (anotar la generación que imprime; suponiendo que sea 1)
+    python -m orquestacion.ingenieria_supervisor devolver T-9001 --trabajador W1 --generacion 1
+    python -m orquestacion.ingenieria_supervisor tomar T-9001 --trabajador W2
+    python -m orquestacion.ingenieria_supervisor latido T-9001 --trabajador W1 --generacion 1
+    Write-Host "Codigo esperado 4, obtenido: $LASTEXITCODE"
+
+    # 6. Que no quedaron temporales ni procesos huérfanos.
+    Get-ChildItem $env:TEMP -Directory -Filter "propiedad_ciclo_*"
+    Get-ChildItem $env:TEMP -Directory -Filter "bootstrap_*"
+    Get-ChildItem $env:TEMP -Directory -Filter "estres_propiedad_*"
+    Get-Process git, python -ErrorAction SilentlyContinue |
+        Where-Object { $_.StartTime -gt (Get-Date).AddMinutes(-5) }
+
+El paso 5 usa una tarea de usar y tirar (`T-9001`); créala antes con
+`crear` y bórrala después. **No se debe ejecutar sobre T-0001 ni T-0002**,
+que tienen que seguir en estado NUEVA y sin ejecutar.
+
+Criterio para decidir que Windows pasó, los seis a la vez:
+
+1. La corrida (1) imprime `PRUEBA_PROPIEDAD_CICLO=OK`, sale con código 0 y
+   reporta `ESCRITURAS_INDEBIDAS = 0`.
+2. Tarda claramente por debajo de los 120 s.
+3. La (2) reporta 0 aceptadas, 0 errores SQLite y 0 excepciones.
+4. La (3) sale con código 0, sin avisos.
+5. La (4) da 7 de 7 archivos de prueba en OK.
+6. La (5) devuelve exactamente 4, y la (6) no devuelve nada.
+
+Prueba correspondiente:
+
+    pruebas/orquestacion/prueba_propiedad_ciclo.py
 
 ### Implementado y probado
 
@@ -411,12 +616,20 @@ acerca al límite:
   colisionara, el arnés estaría roto y el verde de todo lo demás no
   significaría nada. Que el arnés detecta el defecto REAL, sin ventana
   artificial, se comprobó aparte por mutación del código.
+- (A3.2) Propiedad efectiva durante el ciclo: una orden emitida por un
+  propietario anterior no entra, ni siquiera si es el mismo trabajador en
+  una ejecución posterior. El ámbito de una tarea viva ya no se puede
+  cambiar por la puerta de `cargar`. El arranque concurrente de la base ya
+  no falla. Comprobado con órdenes rezagadas reales, con estrés
+  concurrente entre procesos y con cinco mutaciones del código que la
+  batería detecta.
 
 Pruebas correspondientes:
 
     pruebas/orquestacion/prueba_supervisor.py
     pruebas/orquestacion/prueba_estado_global.py
     pruebas/orquestacion/prueba_toma_atomica.py
+    pruebas/orquestacion/prueba_propiedad_ciclo.py
 
 ### Cómo se invoca
 
@@ -429,7 +642,9 @@ Desde la raíz del repositorio:
     python -m orquestacion.ingenieria_supervisor ver T-0001
     python -m orquestacion.ingenieria_supervisor pruebas --detalle
     python -m orquestacion.ingenieria_supervisor tomar T-0001
-    python -m orquestacion.ingenieria_supervisor verificar T-0001
+    python -m orquestacion.ingenieria_supervisor latido T-0001 --trabajador W --generacion 3
+    python -m orquestacion.ingenieria_supervisor devolver T-0001 --trabajador W --generacion 3
+    python -m orquestacion.ingenieria_supervisor verificar T-0001 --trabajador W --generacion 3
     python -m orquestacion.ingenieria_supervisor reanudar
     python -m orquestacion.ingenieria_supervisor aprobar T-0001
     python -m orquestacion.ingenieria_supervisor rechazar T-0001 --motivo "..."
@@ -438,21 +653,23 @@ Desde la raíz del repositorio:
 
 ## QUÉ NO EXISTE TODAVÍA
 
-### A3.2/B — pendiente, NO implementado
+### A3.3 — pendiente, NO implementado
 
 - Latidos automáticos.
-- Expiración de trabajadores y detección avanzada de huérfanos.
+- Expiración temporal de trabajadores y detección avanzada de huérfanos.
 - Recuperación automática de tareas abandonadas.
-- Propiedad efectiva del claim: que `latido` y `verificar` exijan ser el
-  propietario de la tarea.
 - `verificar()` ejecutando dentro del worktree de la tarea.
+
+### C — pendiente, NO implementado
+
 - Lanzamiento de trabajadores (Claude) y varios trabajadores simultáneos.
 - Creación y destrucción automática de worktrees de Git.
-- Cola automática de tareas.
+- Cola automática de tareas y priorización.
 
-A2 y A3.1 dejan la base para todo eso (una sola fuente operativa compartida
-por los worktrees, transacciones, `busy_timeout` y una toma que no admite
-dos ganadores), pero no lo adelantan.
+A2, A3.1 y A3.2 dejan la base para todo eso (una sola fuente operativa
+compartida por los worktrees, transacciones, `busy_timeout`, una toma que
+no admite dos ganadores y una propiedad que sobrevive a todo el ciclo),
+pero no lo adelantan.
 
 El campo `worktree` de la tarea ya existe en SQLite y hoy permanece vacío:
 está reservado para el paralelismo. La detección de solapamiento de
