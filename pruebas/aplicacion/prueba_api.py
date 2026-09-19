@@ -260,7 +260,7 @@ def _comprobar_estado_desarrollo() -> dict:
 
     assert base["estado"] == "ACTIVA", base
     assert base["ruta"].endswith("ingenieria-supervisor.sqlite3")
-    assert base["version_esquema"] == 1
+    assert base["version_esquema"] == 2
     assert base["journal_mode"] == "wal"
 
     # La base vive en el directorio común de Git, nunca en el árbol.

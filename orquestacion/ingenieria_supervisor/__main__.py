@@ -267,6 +267,10 @@ def mostrar_diagnostico(raiz: Path) -> int:
         if informe["desactualizadas"]
         else "ninguna",
     )
+    _linea(
+        "Definición congelada (tarea viva)",
+        ", ".join(informe.get("congeladas") or []) or "ninguna",
+    )
 
     if informe["fichas_ilegibles"]:
         print("")
@@ -295,8 +299,32 @@ def mostrar_ficha(raiz: Path, identificador: str) -> int:
     _linea("Creada", ficha.creado_en)
     _linea("Actualizada", ficha.actualizado_en)
     _linea("Trabajador", ficha.trabajador_id)
+    # La generación se muestra aquí porque es la credencial con la que una
+    # orden se acredita, y hasta ahora sólo la imprimía `tomar`. Si esa
+    # salida se perdía —consola cerrada, guion que no la capturó, retoma
+    # tras un apagón— no había forma de recuperarla, y la vía declarada,
+    # que es la única que detiene a una orden rezagada, quedaba inservible.
+    _linea("Generación", ficha.generacion)
     _linea("PID", ficha.pid)
     _linea("Último latido", ficha.ultimo_latido)
+
+    # Si la ficha declara un ámbito que la base no aplicó por estar la tarea
+    # viva, hay que decirlo aquí: quien trabaje la tarea posee lo que la
+    # base concedió, no lo que diga el archivo que acaba de editar.
+    if (
+        ficha.ambito_vigente is not None
+        and set(ficha.ambito_vigente) != set(ficha.ambito_archivos)
+    ):
+        print("")
+        print("  AVISO: la ficha declara un ámbito distinto del vigente.")
+        print("      Vigente (lo que la base concedió y lo único que cuenta")
+        print("      para la regla de un solo escritor):")
+        for patron in ficha.ambito_vigente:
+            print("          · " + patron)
+        print("      Declarado en el JSON, en espera de que la tarea deje de")
+        print("      estar viva:")
+        for patron in ficha.ambito_archivos:
+            print("          · " + patron)
 
     print("")
     print("  Objetivo:")
@@ -437,6 +465,16 @@ def orden_sincronizar_definiciones(raiz: Path, argumentos) -> int:
     _linea("Actualizadas", ", ".join(informe["actualizadas"]) or "ninguna")
     _linea("Sin cambios", ", ".join(informe["sin_cambios"]) or "ninguna")
 
+    # A3.2: no se puede informar como "sin cambios" una edición que está
+    # esperando. El usuario editó el ámbito y tiene que saber que no se
+    # aplicó, por qué, y que se aplicará sola cuando la tarea se cierre.
+    if informe.get("ambito_congelado"):
+        print("")
+        print("  ÁMBITO NO APLICADO (tareas vivas):")
+        for uno in informe["ambito_congelado"]:
+            print("      · " + uno["id"] + " [" + str(uno["estado"]) + "]: "
+                  + uno["detalle"])
+
     if informe["fichas_ilegibles"]:
         print("")
         print("  FICHAS ILEGIBLES:")
@@ -469,7 +507,26 @@ def orden_crear(raiz: Path, argumentos) -> int:
 # Código de salida propio de una toma rechazada: no es una avería del
 # Supervisor, es el resultado normal de perder una carrera. Quien invoque
 # la orden (una persona, un guion o n8n) puede distinguirla de un error.
+AYUDA_TRABAJADOR = (
+    "Identidad con la que se acredita quien ordena. Sin ella se usa la del propietario que figure en la base, que NO detiene a una orden rezagada: quien la lee estaría suplantando al dueño actual."
+)
+
+AYUDA_GENERACION = (
+    "Generación de propiedad con la que se acredita la orden. Es lo único que distingue dos ejecuciones del MISMO trabajador. La imprime 'tomar'."
+)
+
 CODIGO_TOMA_RECHAZADA = 3
+
+# Código propio de una orden rechazada por propiedad (A3.2): quien la emitió
+# ya no es el dueño vigente de la ejecución, o su generación quedó atrás.
+#
+# Tampoco es una avería: es el resultado normal de llegar tarde, y quien
+# invoque la orden necesita distinguirlo del error genérico (2), de la toma
+# perdida (3) y del "resultado no deseado" (1).
+#
+# Se elige el 4 porque 0, 1, 2 y 3 ya están tomados, y el 2 lo está dos
+# veces: también lo usa argparse ante un error de uso.
+CODIGO_PROPIEDAD_INVALIDA = 4
 
 
 def orden_tomar(raiz: Path, argumentos) -> int:
@@ -496,13 +553,19 @@ def orden_tomar(raiz: Path, argumentos) -> int:
     print("Tarea tomada: " + ficha.id)
     print("Estado: " + str(ficha.estado))
     print("Trabajador: " + str(ficha.trabajador_id))
+    print("Generación: " + str(ficha.generacion))
     print("Rama exigida: " + str(ficha.rama))
 
     return 0
 
 
 def orden_latido(raiz: Path, argumentos) -> int:
-    ficha = nucleo.latido(raiz, argumentos.tarea)
+    ficha = nucleo.latido(
+        raiz,
+        argumentos.tarea,
+        trabajador_id=argumentos.trabajador,
+        generacion=argumentos.generacion,
+    )
 
     print("Latido registrado: " + str(ficha.ultimo_latido))
 
@@ -515,6 +578,8 @@ def orden_devolver(raiz: Path, argumentos) -> int:
         argumentos.tarea,
         argumentos.motivo or "Tarea devuelta por el trabajador.",
         git=_git(raiz, argumentos),
+        trabajador_id=argumentos.trabajador,
+        generacion=argumentos.generacion,
     )
 
     print("Tarea devuelta: " + ficha.id + " -> " + str(ficha.estado))
@@ -527,6 +592,8 @@ def orden_verificar(raiz: Path, argumentos) -> int:
         raiz,
         argumentos.tarea,
         git=_git(raiz, argumentos),
+        trabajador_id=argumentos.trabajador,
+        generacion=argumentos.generacion,
     )
 
     _titulo("VERIFICACIÓN DE " + argumentos.tarea)
@@ -651,6 +718,7 @@ def orden_reanudar(raiz: Path, argumentos) -> int:
         ("huerfanas", "HUÉRFANAS RECUPERADAS"),
         ("inconsistentes", "INCONSISTENTES RECUPERADAS"),
         ("sin_definicion", "SIN DEFINICIÓN EN ESTE ÁRBOL (no modificadas)"),
+        ("reclamadas_mientras_tanto", "RECLAMADAS DURANTE LA RECUPERACIÓN"),
     ):
         if informe[grupo]:
             print("")
@@ -777,17 +845,23 @@ def construir_analizador() -> argparse.ArgumentParser:
 
     latido = ordenes.add_parser("latido", help="Señal de vida del trabajador.")
     latido.add_argument("tarea")
+    latido.add_argument("--trabajador", help=AYUDA_TRABAJADOR)
+    latido.add_argument("--generacion", type=int, help=AYUDA_GENERACION)
     latido.set_defaults(funcion=orden_latido)
 
     devolver = ordenes.add_parser("devolver", help="Soltar una tarea tomada.")
     devolver.add_argument("tarea")
     devolver.add_argument("--motivo")
+    devolver.add_argument("--trabajador", help=AYUDA_TRABAJADOR)
+    devolver.add_argument("--generacion", type=int, help=AYUDA_GENERACION)
     devolver.set_defaults(funcion=orden_devolver)
 
     verificar = ordenes.add_parser(
         "verificar", help="Ejecutar el filtro de pruebas y decidir el estado."
     )
     verificar.add_argument("tarea")
+    verificar.add_argument("--trabajador", help=AYUDA_TRABAJADOR)
+    verificar.add_argument("--generacion", type=int, help=AYUDA_GENERACION)
     verificar.set_defaults(funcion=orden_verificar)
 
     decidir = ordenes.add_parser(
@@ -846,6 +920,24 @@ def principal(argumentos_crudos: list[str] | None = None) -> int:
 
     try:
         return argumentos.funcion(raiz, argumentos)
+    except nucleo.ErrorPropiedad as rechazo:
+        # Antes que el genérico: ErrorPropiedad hereda de ErrorSupervisor y
+        # si no se capturase aquí colapsaría en el código 2, indistinguible
+        # de una avería. Se atiende en un solo sitio para que TODAS las
+        # órdenes del ciclo den el mismo código, no sólo las que hoy existen.
+        print("")
+        print("  ORDEN RECHAZADA: " + str(rechazo))
+        print("")
+        _linea("Tarea", rechazo.tarea)
+        _linea("Motivo", rechazo.motivo)
+        _linea("Estado actual", rechazo.estado)
+        _linea("Propietario que ordenó", rechazo.propietario)
+        _linea("Propietario vigente", rechazo.propietario_vigente)
+        _linea("Generación de la orden", rechazo.generacion)
+        _linea("Generación vigente", rechazo.generacion_vigente)
+        print("")
+
+        return CODIGO_PROPIEDAD_INVALIDA
     except (
         nucleo.ErrorSupervisor,
         ErrorFicha,

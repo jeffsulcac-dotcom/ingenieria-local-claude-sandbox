@@ -512,22 +512,164 @@ Deuda conocida de A3.1, no corregida por quedar fuera de su alcance:
   `sincronizar-definiciones`.
 - La deuda de A2 sigue vigente salvo la atomicidad de `tomar`, ya resuelta.
 
-Pendiente de ejecución en Windows: es el entorno final real y esta corrida
-fue en Linux. Los comandos y el criterio de decisión están en
-orquestacion/README.md.
+Verificación en Windows: EJECUTADA Y APROBADA. PowerShell 7.6.6,
+Python 3.12.4. Carrera nominal código 0 en unos 29,29 s. Estrés de 100
+carreras código 0 en unos 82,99 s. Métricas acumuladas: 360 carreras,
+360 tomas concedidas, 1520 rechazadas, 0 dobles tomas reales, 0 errores
+SQLite, 0 excepciones inesperadas, integridad 8/8. Corredor completo 6/6 OK
+en unos 45,99 s. Mutación TOCTOU detectada. Mutación de UPDATE incondicional
+detectada. Carrera concurrente posterior a la integración: 84 carreras,
+84 tomas, 508 rechazos, 0 dobles tomas, integridad 8/8.
 
-Riesgo identificado y medido para esa ejecución: la tanda lanza unas 550
-invocaciones de `git` sólo en el proceso padre (455 de ellas son el
-`git rev-parse --git-common-dir` que cada operación del Supervisor repite),
-más las de los procesos hijos. En Linux cuestan unos 2 ms cada una y no se
-notan; en Windows, con Defender vigilando la carpeta, cuestan entre 50 y
-250 ms, así que el límite de 120 s del corredor único entra en juego. La
-mitigación está identificada y medida —memorizar `git_common_dir` por raíz
-baja las invocaciones de unas 830 a unas 147— pero NO se aplicó: esa
-función es de A2 y cambiarla excede el alcance de A3.1. Es lo primero que
-hay que hacer si mañana la corrida se acerca al límite.
+El riesgo de rendimiento que A3.1 dejó anotado —las invocaciones repetidas
+de `git rev-parse --git-common-dir`— quedó RESUELTO en A3.2, que es la
+etapa cuya batería acercó la corrida al límite.
 
 T-0001 y T-0002 siguen sin ejecutar. wip/columnas-pre-supervisor intacta.
 
 Estado:
-A3.1 = IMPLEMENTADO_PENDIENTE_DE_VERIFICACION_EN_WINDOWS
+A3.1 = CERRADO_Y_APROBADO
+
+Integrado en main como 629b3a4 "Integrar A3.1 toma atomica de tareas".
+
+## Supervisor — A3.2: propiedad efectiva durante el ciclo
+
+Base: 629b3a4.
+
+A3.1 garantizaba que una tarea sólo pudiera ser TOMADA por un trabajador.
+A3.2 garantiza que, después de la toma, sólo el propietario VIGENTE pueda
+modificar el estado operativo de esa ejecución durante todo su ciclo.
+
+El problema que cierra: A toma una tarea, la pierde, B pasa a ser el
+propietario, y una orden que A había compuesto ANTES llega después. Antes de
+A3.2 esa orden entraba, porque las nueve órdenes del ciclo escribían con
+`persistir`, cuyo UPDATE era `WHERE id = ?` y nada más.
+
+Mecanismo elegido:
+
+- Columna nueva `tareas.generacion` (migración de esquema 2, desde la 1).
+- Sólo la incrementa `reclamar`, con `generacion = generacion + 1` dentro
+  del mismo UPDATE condicional que concede la toma, resuelto por el motor.
+- La pareja (trabajador_id, generacion) identifica una EJECUCIÓN, no un
+  trabajador. Por eso distingue "worker-01 ejecución vieja" de "worker-01
+  ejecución nueva", que es el problema ABA.
+- No se eligió el reloj porque `iniciado_en` está truncado a segundos, ni
+  el PID porque el sistema los reutiliza. No hace falta criptografía: la
+  base es local y de una sola PC.
+
+Operaciones protegidas:
+
+- `latido`, `devolver` y `verificar` exigen identidad Y generación.
+- Todas las órdenes, incluidas las humanas, exigen la generación con la que
+  se leyó la ficha: tampoco deben pisar una ejecución que empezó mientras
+  su emisor decidía.
+- Un rechazo lanza ErrorPropiedad dentro de la transacción: no escribe
+  estado, ni eventos, ni intentos, ni espejo JSON, ni marcas de tiempo.
+- Código de salida 4 en la línea de órdenes, atendido en un solo sitio para
+  que valga en todas las órdenes.
+
+Además:
+
+- El ámbito de una tarea viva ya no se puede cambiar por la puerta de
+  `cargar`. La huella no avanza mientras el cambio está congelado, así que
+  el refresco se aplica solo cuando la tarea deja de estar viva.
+- El arranque concurrente de la base ya no falla. Se corrigieron las dos
+  carreras: la del esquema (la versión se relee dentro de la transacción) y
+  la de la conversión inicial a WAL, que no estaba declarada en ninguna
+  parte.
+- Se aplicó la mitigación de `git_common_dir` que A3.1 dejó medida.
+
+Evidencia medida en Linux (Python 3.11.15):
+
+- Corredor completo: 7/7 OK, unos 13 s. Repetido 11 veces seguidas sin un
+  solo fallo, después de que una corrida expusiera el fallo intermitente
+  del WAL.
+- Batería de A3.2: 31 comprobaciones, unos 3 s.
+- Corrida ampliada (--rezagadas 500 --emisores 12 --ordenes 60): 1245
+  órdenes, 1239 rechazadas, 0 escrituras indebidas, 0 errores SQLite,
+  0 excepciones inesperadas, integridad 31/31.
+- Estrés concurrente: 12 procesos disparando a la vez órdenes rezagadas
+  contra el dueño vigente. 720 emitidas, 720 rechazadas, 0 aceptadas.
+- Bootstrap concurrente: 6 procesos por ronda, 3 rondas, 0 fallos.
+- Recursos: 352 conexiones SQLite abiertas, 0 vivas al terminar, y código 0
+  bajo `-X dev -W error::ResourceWarning`.
+- Coste en Git: 105 invocaciones en el proceso padre, 21 de ellas
+  `rev-parse --git-common-dir` (una por repositorio temporal), frente a las
+  439 y 355 de antes de memorizarlo.
+- Mutaciones: 25 de 25 detectadas por la batería. La del bootstrap
+  reprodujo el error original literal ("table tareas already exists").
+
+Auditoría adversarial: 8 revisores de sólo lectura sobre copias protegidas.
+Encontraron cuatro defectos REALES de esta misma etapa, todos corregidos y
+todos con prueba propia:
+
+- el testigo de propiedad se serializaba al JSON y por tanto era
+  falsificable (crítico);
+- la generación sola no cubría el avance del ciclo, y una orden humana
+  rezagada revertía una transición ya confirmada (crítico);
+- la toma no grababa el ámbito que acababa de validar, y por
+  `requiere_revision` volvían a quedar dos escritores (crítico);
+- la ruta de sólo lectura pedía el bloqueo de escritura de toda la base
+  para no escribir nada (medio);
+- la guarda de ámbito estaba a medias: la base no grababa el ámbito nuevo
+  de una tarea viva, pero `cargar` seguía devolviendo el del JSON, así que
+  el trabajador creía poseer archivos que nadie le concedió y otra tarea
+  podía tomar legítimamente esa parte (crítico).
+
+La ronda FOCALIZADA sobre esas correcciones encontró dos regresiones más,
+introducidas por las propias correcciones, y también están cerradas:
+
+- la salida rápida de `asegurar_ficha` delegaba y podía acabar escribiendo
+  en autocommit, fuera de toda transacción (alto);
+- la retoma grababa el ámbito declarado sin mirar si encogía, soltando el
+  terreno que la retención protegía (alto);
+- el reintento de la conversión a WAL estaba acotado en número de intentos
+  pero no en tiempo: su peor caso real era de unos 41 s (medio);
+- el diagnóstico de "no admite WAL" vivía en una rama inalcanzable, así que
+  una unidad de red se reportaba como si otro proceso tuviera la base
+  ocupada (medio);
+- la guarda de "esquema más nuevo" no se evaluaba cuando no había ninguna
+  migración que aplicar, que es el camino normal de cada orden (bajo);
+- la memoria de `git_common_dir` distinguía si el directorio había
+  desaparecido, pero no si esa ruta pertenecía ya a OTRO repositorio, y
+  entonces devolvía la base global equivocada (bajo);
+- `sincronizar_lista` pedía el bloqueo de escritura aunque todo lo
+  pendiente estuviera congelado (bajo);
+- la generación no tenía salida legible por máquina (bajo);
+- borrar del JSON una decisión humana PENDIENTE le quitaba el freno a una
+  tarea viva, desde una orden de sólo lectura: la misma clase que el
+  ámbito, en otro campo (medio);
+- `diagnostico` metía en la misma lista una definición que todavía no se ha
+  aplicado y otra que NO SE VA A aplicar mientras la tarea siga viva, lo
+  que deja al operador esperando un refresco que no va a llegar (bajo);
+- la cuarta puerta del testigo de propiedad, el veto de
+  `actualizar_si_propietario`, era la única sin prueba: estaba puesta, pero
+  la batería no se enteraba si alguien la quitaba (bajo).
+
+Y una equivocación propia, corregida con la medición delante: se retiró el
+reintento de la conversión a WAL por considerarlo no verificado, y la
+corrida completa del corredor lo desmintió en el acto (1 de 6 procesos
+murió con "database is locked"). El reintento volvió.
+
+Falso positivo descartado ejecutándolo: `cargar` NO borra una decisión
+humana resuelta; `fusionar_decisiones` la conserva.
+
+Lo que A3.2 NO cierra, dicho con precisión: `persistir` escribe las
+dieciséis columnas operativas en bloque, así que dos órdenes con la misma
+generación, identidad y estado siguen pudiendo pisarse campo a campo.
+Pertenece a A3.3.
+
+Pendiente de ejecución en Windows: es el entorno final real y esta corrida
+fue en Linux. Los comandos están en orquestacion/README.md.
+
+NO implementado en A3.2, reservado a A3.3: latidos automáticos, expiración
+temporal de trabajadores, detección avanzada de huérfanos, recuperación
+automática, `verificar()` dentro del worktree de la tarea.
+
+NO implementado en A3.2, reservado a C: trabajadores paralelos, worktrees
+automáticos, lanzador, cola y priorización.
+
+T-0001 y T-0002 siguen sin ejecutar, en estado NUEVA.
+
+Estado:
+A3.2 = IMPLEMENTADO_PENDIENTE_DE_VERIFICACION_EN_WINDOWS

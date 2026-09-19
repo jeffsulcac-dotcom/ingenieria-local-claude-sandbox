@@ -24,19 +24,26 @@ Reglas duras que este módulo hace cumplir:
    concede un UPDATE condicional resuelto por rowcount. Compitan los trabajadores que
    compitan por la misma tarea, la gana exactamente uno.
 
-   El alcance de esa garantía es la TOMA, no el ciclo de vida entero. Las
-   demás órdenes (`latido`, `devolver`, `verificar` y las humanas) siguen
-   escribiendo con `persistir`, cuyo UPDATE es incondicional: una de ellas
-   que llegue con una lectura vieja puede pisar al ganador de una toma
-   posterior. Corregirlo exige propiedad efectiva del claim, que es A3.2
-   (ver "Limitaciones conocidas de A3.1" en orquestacion/README.md).
+7. Desde A3.2 esa garantía alcanza al CICLO ENTERO. `persistir` escribe
+   con un UPDATE condicionado y una orden sólo entra si sigue siendo suya:
 
-Lo que NO hace este módulo (reservado para A3.2/B): propiedad efectiva del
-claim (que cada orden exija ser el propietario), latidos automáticos,
-expiración de trabajadores, detección automática de trabajadores muertos,
-recuperación automática de tareas abandonadas, cola o planificador de
-tareas, verificación dentro del worktree de la tarea, lanzamiento de
-trabajadores.
+   - la generación de propiedad con la que se leyó la ficha, siempre;
+   - la identidad, en `latido`, `devolver` y `verificar`;
+   - el estado que la fila tenía cuando se leyó, por omisión.
+
+   Las tres hacen falta. La generación sola no basta, porque las
+   transiciones no la mueven y una orden humana lenta revertía un cambio
+   ya confirmado. La identidad sola tampoco, porque no distingue dos
+   ejecuciones del mismo trabajador.
+
+   Un rechazo lanza `ErrorPropiedad` dentro de la transacción: nada se
+   escribe, ni el estado, ni los eventos, ni el espejo JSON.
+
+Lo que NO hace este módulo (reservado para A3.3/C): latidos automáticos,
+expiración temporal de trabajadores, detección automática de trabajadores
+muertos, recuperación automática de tareas abandonadas, cola o
+planificador de tareas, verificación dentro del worktree de la tarea,
+lanzamiento de trabajadores.
 
 Este módulo no realiza cálculos de ingeniería.
 """
@@ -99,11 +106,11 @@ ESTADOS_TOMABLES = frozenset(
 
 # Estados en los que una tarea RETIENE su ámbito de archivos.
 #
-# No basta con EN_EJECUCION: una tarea que quedó en requiere_revision o en
-# propuesto conserva cambios sin confirmar en el árbol de trabajo, así que
-# sigue siendo la dueña de esos archivos hasta que un humano la cierre.
+# La lista canónica vive en `estado_global`, porque allí está la guarda que
+# impide cambiarle el ámbito a una tarea viva (A3.2). Aquí se reexporta con
+# los miembros de `Estado`, que es como la usa el resto de este módulo.
 ESTADOS_QUE_RETIENEN_AMBITO = frozenset(
-    {Estado.EN_EJECUCION, Estado.REQUIERE_REVISION, Estado.PROPUESTO}
+    Estado(texto) for texto in global_.ESTADOS_QUE_RETIENEN_AMBITO
 )
 
 # Subconjunto de la máquina de estados común utilizado por el Supervisor V1.
@@ -154,6 +161,31 @@ class ErrorTransicion(ErrorSupervisor):
 
 class ErrorSolapamiento(ErrorSupervisor):
     """Dos tareas activas quieren escribir sobre el mismo ámbito."""
+
+
+class ErrorPropiedad(ErrorSupervisor):
+    """
+    Una orden del ciclo llegó sin ser ya la dueña de la ejecución.
+
+    Lleva el informe de `estado_global.rechazo_propiedad`, que dice si el
+    motivo fue otro propietario, una generación vencida (el mismo trabajador
+    en una ejecución posterior) o un estado incompatible. Nada se escribió.
+    """
+
+    def __init__(self, informe: dict):
+        super().__init__(
+            informe.get("detalle") or "La orden no pertenece al propietario "
+            "vigente."
+        )
+
+        self.informe = dict(informe)
+        self.tarea = informe.get("tarea")
+        self.motivo = informe.get("motivo")
+        self.estado = informe.get("estado")
+        self.propietario = informe.get("propietario")
+        self.propietario_vigente = informe.get("propietario_vigente")
+        self.generacion = informe.get("generacion")
+        self.generacion_vigente = informe.get("generacion_vigente")
 
 
 class ErrorToma(ErrorSupervisor):
@@ -376,6 +408,7 @@ def conflictos_de_ambito(
     filas: list[dict],
     errores: list[dict] | None = None,
     estados_activos: frozenset = ESTADOS_QUE_RETIENEN_AMBITO,
+    ambito: list[str] | None = None,
 ) -> list[dict]:
     """
     Conflictos de esta ficha contra todas las tareas que retienen ámbito.
@@ -394,8 +427,13 @@ def conflictos_de_ambito(
 
     Una ficha ilegible que la base todavía no conoce interrumpe, igual que
     en V1: sin conocer su ámbito no se puede garantizar nada.
+
+    `ambito` permite juzgar un ámbito distinto del declarado en la ficha.
+    Lo usa `tomar` para comprobar la UNIÓN del declarado con el que la
+    tarea ya retenía: hay que validar exactamente lo que se va a grabar.
     """
     conflictos = []
+    propio = list(ficha.ambito_archivos if ambito is None else ambito)
 
     errores = errores or []
 
@@ -422,7 +460,7 @@ def conflictos_de_ambito(
         if fila["estado"] not in {str(estado) for estado in estados_activos}:
             continue
 
-        pares = solapamientos(ficha.ambito_archivos, fila["ambito_archivos"])
+        pares = solapamientos(propio, fila["ambito_archivos"])
 
         if pares:
             conflictos.append(
@@ -540,20 +578,64 @@ def cargar(raiz: Path, identificador: str) -> Ficha:
     return ficha
 
 
-def persistir(raiz: Path, ficha: Ficha) -> Ficha:
+def persistir(
+    raiz: Path,
+    ficha: Ficha,
+    exigir_propietario: str | None = None,
+    estados_admitidos=None,
+    exigir_generacion: int | None = None,
+) -> Ficha:
     """
-    Confirma el estado operativo de la ficha.
+    Confirma el estado operativo de la ficha, si la propiedad sigue vigente.
 
     1. Se valida el contrato de la ficha antes de tocar nada.
-    2. Transacción SQLite: columnas operativas + eventos pendientes. COMMIT.
+    2. Transacción SQLite: UPDATE CONDICIONADO + eventos pendientes. COMMIT.
     3. Sólo entonces se regenera el JSON como espejo, con la misma marca de
        actualización, mediante la escritura atómica ya existente.
 
-    No sirve para la TOMA de una tarea: su UPDATE es incondicional y
-    pisaría al ganador de una carrera. La toma usa `estado_global.reclamar`
-    (ver `tomar`).
+    Qué condiciona la escritura (A3.2)
+    ----------------------------------
+    SIEMPRE la generación con la que se leyó la ficha (`ficha.generacion`).
+    Basta una toma nueva entre la lectura y esta escritura para que el
+    predicado deje de casar: la orden se rechaza sin tocar nada. Eso vale
+    también para las órdenes humanas, que no tienen propietario pero
+    tampoco deben pisar una ejecución que empezó mientras decidían.
+
+    ADEMÁS la identidad, cuando `exigir_propietario` la indica. Las órdenes
+    que pertenecen a una ejecución viva —`latido`, `devolver`, `verificar`—
+    la exigen: sin ella, una orden emitida después de que su emisor soltara
+    la tarea seguiría entrando mientras la generación no hubiera cambiado.
+
+    El ESTADO. Por omisión se exige que la fila siga en el estado que tenía
+    cuando se leyó (`ficha.estado_leido`). Ésta es la precondición que
+    faltaba, y sin ella la generación no bastaba: `devolver`, `bloquear`,
+    `aprobar` y las demás transiciones NO mueven la generación, así que dos
+    órdenes separadas por varias transiciones seguían teniendo el mismo
+    testigo. Comprobado: una orden humana lenta revertía a PROPUESTO una
+    tarea que entretanto había quedado BLOQUEADA, saltándose además la
+    máquina de estados, porque `transicionar` validó contra su foto vieja.
+
+    La comprobación en Python que hacen las órdenes tras `cargar` explica el
+    error con precisión; ésta cierra la ventana entre aquella lectura y esta
+    escritura. `estados_admitidos` permite ampliarlo o afinarlo; una ficha
+    que no venga de la base (`estado_leido` a None) no exige ninguno, que es
+    lo que hacía V1.
+
+    Si la orden se rechaza
+    ----------------------
+    Se lanza `ErrorPropiedad` DENTRO de la transacción, así que el ROLLBACK
+    deshace todo: no se escribe el estado, no se escriben los eventos
+    pendientes (que siguen en la ficha, sin consumir), no se regenera el
+    espejo JSON y `actualizado_en` se restaura al valor que tenía. Un
+    rechazo no deja rastro de haber pasado por aquí.
+
+    No sirve para la TOMA de una tarea: la toma es quien CONCEDE la
+    propiedad y la genera, y usa `estado_global.reclamar` (ver `tomar`).
     """
     Ficha.desde_dict(ficha.a_dict())
+
+    actualizado_previo = ficha.actualizado_en
+    creado_previo = ficha.creado_en
 
     ficha.actualizado_en = ahora_utc()
 
@@ -564,18 +646,118 @@ def persistir(raiz: Path, ficha: Ficha) -> Ficha:
     campos = {columna: fila[columna] for columna in COLUMNAS_OPERATIVAS}
     eventos = list(ficha.eventos_pendientes)
 
-    with global_.conexion(raiz) as con:
-        with global_.transaccion(con):
-            global_.actualizar_tarea(con, ficha.id, campos)
+    if estados_admitidos is None and ficha.estado_leido is not None:
+        estados_admitidos = {ficha.estado_leido}
 
-            for evento in eventos:
-                global_.insertar_evento(con, ficha.id, evento)
+    try:
+        with global_.conexion(raiz) as con:
+            with global_.transaccion(con):
+                informe = global_.actualizar_si_propietario(
+                    con,
+                    ficha.id,
+                    campos,
+                    generacion=(
+                        int(ficha.generacion or 0)
+                        if exigir_generacion is None
+                        else int(exigir_generacion)
+                    ),
+                    momento=ficha.actualizado_en,
+                    trabajador_id=exigir_propietario,
+                    estados_admitidos=estados_admitidos,
+                )
+
+                if informe["resultado"] != global_.ESCRITURA_ACEPTADA:
+                    raise ErrorPropiedad(informe)
+
+                for evento in eventos:
+                    global_.insertar_evento(con, ficha.id, evento)
+    except ErrorPropiedad:
+        # La ficha en memoria vuelve a ser el reflejo de lo que hay grabado:
+        # nada cambió, y sus marcas de tiempo no deben sugerir lo contrario.
+        ficha.actualizado_en = actualizado_previo
+        ficha.creado_en = creado_previo
+        raise
 
     ficha.eventos_pendientes.clear()
+
+    # Lo que se acaba de confirmar es, a partir de ahora, lo leído: si la
+    # misma ficha se persiste otra vez, la precondición tiene que ser el
+    # estado nuevo y no el de antes de esta escritura.
+    ficha.estado_leido = ficha.estado
 
     _regenerar_espejo(raiz, ficha)
 
     return ficha
+
+
+def credencial_de(
+    ficha: Ficha,
+    orden: str,
+    trabajador_id: str | None = None,
+    generacion: int | None = None,
+) -> tuple:
+    """
+    Credencial (propietario, generación) que una orden debe acreditar.
+
+    Se resuelve ANTES de que la orden modifique la ficha: `devolver` y
+    `verificar` liberan al trabajador como parte de su trabajo, y si se
+    leyera después iría vacía y la condición no exigiría nada.
+
+    Dos formas de acreditarse, y la diferencia importa
+    --------------------------------------------------
+    DECLARADA (`trabajador_id`, y opcionalmente `generacion`): quien llama
+    dice quién es. Es la única forma que detiene de verdad a una orden
+    rezagada, porque la orden vieja lleva SU identidad y SU generación, no
+    las que haya ahora en la base. Un emisor que releyera la fila para
+    saber quién es no estaría acreditándose: estaría suplantando al dueño
+    actual, y ninguna condición podría distinguirlo.
+
+    IMPLÍCITA (nada): se toma la de la ficha recién leída. Es lo que hacía
+    V1 y se conserva para no romper a quien ya llamaba así. Protege contra
+    el caso en que la propiedad cambie ENTRE esta lectura y la escritura,
+    que no es poco, pero no contra un emisor que ya había perdido la tarea
+    antes de leer.
+
+    Lo declarado NO se comprueba aquí contra la base: eso sería volver a
+    comprobar antes de escribir (TOCTOU). Viaja tal cual al WHERE, y decide
+    el motor.
+    """
+    if trabajador_id is not None:
+        if not str(trabajador_id).strip():
+            raise ErrorSupervisor(
+                "La identidad declarada para '" + orden + "' está vacía."
+            )
+
+        declarada = str(trabajador_id).strip()
+
+        if generacion is None:
+            # Sin generación declarada se usa la de la lectura actual. Basta
+            # para distinguir a otro trabajador, no para distinguir dos
+            # ejecuciones del mismo: para eso hay que declararla.
+            return (declarada, int(ficha.generacion or 0))
+
+        if isinstance(generacion, bool) or not isinstance(generacion, int):
+            raise ErrorSupervisor(
+                "La generación declarada para '" + orden + "' debe ser un "
+                "entero; se recibió: " + repr(generacion) + "."
+            )
+
+        return (declarada, generacion)
+
+    if generacion is not None:
+        raise ErrorSupervisor(
+            "No se puede declarar una generación para '" + orden + "' sin "
+            "declarar también el trabajador: la generación por sí sola no "
+            "identifica a nadie."
+        )
+
+    if not ficha.trabajador_id:
+        raise ErrorSupervisor(
+            "La tarea '" + ficha.id + "' no tiene propietario, así que nadie "
+            "puede emitir '" + orden + "' sobre ella."
+        )
+
+    return (ficha.trabajador_id, int(ficha.generacion or 0))
 
 
 def _regenerar_espejo(raiz: Path, ficha: Ficha) -> None:
@@ -844,11 +1026,10 @@ def tomar(
     obtiene la toma; los demás reciben `ErrorToma`, que describe quién la
     tiene y en qué estado quedó. Dos tomas nunca se conceden a la vez.
 
-    Lo que esto NO promete: que el propietario resultante sobreviva a lo
-    que hagan después las demás órdenes. `latido`, `devolver` y `verificar`
-    escriben con `persistir`, cuyo UPDATE es incondicional, así que una de
-    ellas con una lectura vieja puede sobrescribir a quien acaba de ganar.
-    Eso lo resuelve la propiedad efectiva del claim, que es A3.2.
+    Desde A3.2 la toma además CONCEDE una generación de propiedad, que es
+    lo que permite que el propietario resultante sobreviva a lo que hagan
+    después las demás órdenes: todas escriben con `persistir`, cuyo UPDATE
+    lleva ahora la precondición en el WHERE.
 
     Aquí se aplica además la regla de un solo escritor: si otra tarea activa
     declara un ámbito que se solapa, la toma se rechaza.
@@ -972,7 +1153,34 @@ def tomar(
                     )
                 )
 
-            conflictos = conflictos_de_ambito(ficha, filas, ilegibles)
+            # Ámbito que esta toma va a reclamar de verdad.
+            #
+            # Si el estado del que se viene RETENÍA ámbito, la tarea
+            # conserva cambios sin confirmar en el árbol de trabajo sobre
+            # los archivos que tenía grabados. Tomarla otra vez con un
+            # ámbito ENCOGIDO liberaría ese terreno sin que los cambios se
+            # hayan ido a ninguna parte, y otra tarea podría entrar en él:
+            # dos escritores sobre los mismos archivos.
+            #
+            # Por eso se reclama la UNIÓN de lo declarado y lo retenido.
+            # Ampliar sí se permite —el ámbito nuevo se valida aquí mismo
+            # contra las demás—; encoger no libera nada mientras la
+            # retención siga en pie. El ámbito encogido se aplicará solo
+            # cuando la tarea deje de retener, por la sincronización normal.
+            ambito_reclamado = list(ficha.ambito_archivos)
+
+            if previa is not None and previa["estado"] in {
+                str(estado) for estado in ESTADOS_QUE_RETIENEN_AMBITO
+            }:
+                retenido = list(previa["ambito_archivos"] or [])
+                ambito_reclamado = ambito_reclamado + [
+                    patron for patron in retenido
+                    if patron not in ambito_reclamado
+                ]
+
+            conflictos = conflictos_de_ambito(
+                ficha, filas, ilegibles, ambito=ambito_reclamado
+            )
 
             if conflictos:
                 detalle = "; ".join(
@@ -1004,6 +1212,29 @@ def tomar(
                     "rama": rama,
                     "commit_inicial": commit_inicial,
                     "actualizado_en": ahora_utc(),
+                    # El ámbito que esta misma transacción acaba de validar
+                    # contra todas las demás tareas activas.
+                    #
+                    # Hace falta porque `requiere_revision` es el único
+                    # estado que está a la vez en ESTADOS_TOMABLES y en
+                    # ESTADOS_QUE_RETIENEN_AMBITO: una tarea ahí puede tener
+                    # el ámbito CONGELADO —la definición del árbol dice una
+                    # cosa y la fila otra— y ser tomable al mismo tiempo. Sin
+                    # esta línea, la toma concedía la propiedad sobre el
+                    # ámbito declarado mientras la base seguía guardando el
+                    # viejo, y la siguiente toma comprobaba el solapamiento
+                    # contra un ámbito que ya no era el que nadie usaba:
+                    # dos escritores sobre los mismos archivos.
+                    #
+                    # Grabarlo aquí es coherente con la guarda: congelar
+                    # protege a una ejecución VIVA de que le cambien el
+                    # terreno debajo; una toma nueva es justamente el momento
+                    # en que empieza otra ejecución, y su ámbito acaba de
+                    # comprobarse dentro de esta transacción.
+                    # Exactamente lo que se acaba de validar arriba, ni
+                    # más ni menos: grabar otra cosa dejaría la fila
+                    # diciendo algo que nadie comprobó.
+                    "ambito_archivos": global_._a_json(ambito_reclamado),
                 },
             )
 
@@ -1054,11 +1285,18 @@ def latido(
     raiz: Path,
     identificador: str,
     ahora: datetime | None = None,
+    trabajador_id: str | None = None,
+    generacion: int | None = None,
 ) -> Ficha:
     """
     Señal de vida del trabajador que sostiene la tarea.
 
-    Es una orden manual. Los latidos automáticos pertenecen a A3/B.
+    Es una orden manual. Los latidos automáticos pertenecen a A3.3/B.
+
+    A3.2: sólo la escribe el propietario VIGENTE. Un latido rezagado del
+    dueño anterior es el caso más peligroso de todos, porque `persistir`
+    reescribe también `trabajador_id`, `pid` e `iniciado_en`: sin condición
+    resucitaría a un propietario ya desplazado.
     """
     ficha = cargar(raiz, identificador)
 
@@ -1067,11 +1305,21 @@ def latido(
             "Sólo una tarea en ejecución puede emitir latido."
         )
 
+    propietario, esperada = credencial_de(
+        ficha, "latido", trabajador_id, generacion
+    )
+
     ficha.ultimo_latido = (
         ahora or ahora_datetime()
     ).isoformat(timespec="seconds")
 
-    persistir(raiz, ficha)
+    persistir(
+        raiz,
+        ficha,
+        exigir_propietario=propietario,
+        estados_admitidos={Estado.EN_EJECUCION},
+        exigir_generacion=esperada,
+    )
 
     return ficha
 
@@ -1081,8 +1329,16 @@ def devolver(
     identificador: str,
     motivo: str = "Tarea devuelta por el trabajador.",
     git=None,
+    trabajador_id: str | None = None,
+    generacion: int | None = None,
 ) -> Ficha:
-    """El trabajador suelta la tarea sin haberla terminado."""
+    """
+    El trabajador suelta la tarea sin haberla terminado.
+
+    A3.2: sólo la devuelve el propietario VIGENTE. Una devolución rezagada
+    dejaría la tarea en REABIERTO —es decir, TOMABLE— quitándosela al dueño
+    actual sin que él se entere.
+    """
     ficha = cargar(raiz, identificador)
 
     if ficha.estado != Estado.EN_EJECUCION:
@@ -1090,11 +1346,22 @@ def devolver(
             "Sólo se puede devolver una tarea en ejecución."
         )
 
+    # Antes de liberar: después, la ficha ya no sabe de quién era.
+    propietario, esperada = credencial_de(
+        ficha, "devolver", trabajador_id, generacion
+    )
+
     _liberar_trabajador(ficha)
 
     transicionar(ficha, Estado.REABIERTO, motivo, ORIGEN_AUTOMATICO)
 
-    persistir(raiz, ficha)
+    persistir(
+        raiz,
+        ficha,
+        exigir_propietario=propietario,
+        estados_admitidos={Estado.EN_EJECUCION},
+        exigir_generacion=esperada,
+    )
 
     _registrar_en_git(git, ficha, motivo)
 
@@ -1114,6 +1381,8 @@ def verificar(
     tiempo_limite_s: int = corredor.TIEMPO_LIMITE_S,
     ejecutable: str | None = None,
     git=None,
+    trabajador_id: str | None = None,
+    generacion: int | None = None,
 ) -> dict:
     """
     Corre el filtro completo y decide el estado resultante.
@@ -1137,6 +1406,12 @@ def verificar(
             + str(ficha.estado)
             + "'."
         )
+
+    # Se acredita ANTES de correr las pruebas, que es la espera más larga
+    # del sistema y por tanto la ventana más ancha para perder la tarea.
+    propietario, esperada = credencial_de(
+        ficha, "verificar", trabajador_id, generacion
+    )
 
     corrida = corredor.ejecutar_todas(raiz, tiempo_limite_s, ejecutable)
 
@@ -1244,7 +1519,13 @@ def verificar(
 
     transicionar(ficha, destino, motivo, ORIGEN_AUTOMATICO)
 
-    persistir(raiz, ficha)
+    persistir(
+        raiz,
+        ficha,
+        exigir_propietario=propietario,
+        estados_admitidos={Estado.EN_EJECUCION},
+        exigir_generacion=esperada,
+    )
 
     registro = _registrar_en_git(git, ficha, motivo)
 
@@ -1559,6 +1840,7 @@ def reanudar(
         "sin_definicion": [],
         "temporales_eliminados": [],
         "fichas_ilegibles": [],
+        "reclamadas_mientras_tanto": [],
     }
 
     for temporal in temporales_huerfanos(raiz):
@@ -1670,7 +1952,22 @@ def reanudar(
             ORIGEN_AUTOMATICO,
         )
 
-        persistir(raiz, ficha)
+        try:
+            # A3.2: la recuperación juzga sobre una foto leída antes. Si
+            # entre aquella lectura y esta escritura alguien volvió a tomar
+            # la tarea, la generación ya no casa y se rechaza. Es lo
+            # correcto: una tarea recién reclamada NO está abandonada, y
+            # devolverla a REABIERTO se la quitaría a su nuevo dueño.
+            persistir(raiz, ficha)
+        except ErrorPropiedad as rechazo:
+            informe["reclamadas_mientras_tanto"].append(
+                {
+                    "id": ficha.id,
+                    "titulo": ficha.titulo,
+                    "motivo": rechazo.informe["detalle"],
+                }
+            )
+            continue
 
         _registrar_en_git(git, ficha, "Recuperación tras interrupción.")
 
@@ -1742,6 +2039,7 @@ def resumen_de_tarea(fila: dict, definicion: Ficha | None) -> dict:
         "decisiones_totales": len(decisiones),
         "requiere_decision_humana": bool(pendientes),
         "trabajador_id": fila.get("trabajador_id"),
+        "generacion": fila.get("generacion"),
         "pid": fila.get("pid"),
         "iniciado_en": fila.get("iniciado_en"),
         "ultimo_latido": fila.get("ultimo_latido"),
