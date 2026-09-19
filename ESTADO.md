@@ -314,3 +314,102 @@ T-0001 y T-0002 siguen sin ejecutar. wip/columnas-pre-supervisor intacta.
 
 Estado:
 A2 = IMPLEMENTADO_PENDIENTE_DE_REVISION
+
+## Supervisor — A3.1: toma atómica de tareas
+
+Tercer componente de orquestación. Corrige un defecto real de concurrencia,
+no una hipótesis.
+
+Defecto corregido:
+- `supervisor.tomar()` hacía leer -> comprobar -> escribir con TRES conexiones
+  distintas y un UPDATE incondicional. Dos trabajadores que competían por la
+  misma tarea pasaban ambos la comprobación y el segundo pisaba al primero:
+  DOBLE PROPIETARIO. Era un TOCTOU real.
+
+Solución:
+- Toda la decisión de la toma ocurre dentro de UNA sola transacción
+  BEGIN IMMEDIATE sobre la base global:
+  comprobación de ámbitos -> UPDATE condicional -> evento -> COMMIT.
+
+Por qué no admite dos ganadores (tres mecanismos, no uno):
+1. BEGIN IMMEDIATE toma el bloqueo de escritura en el primer instante de la
+   transacción. SQLite admite un solo escritor: la segunda toma espera
+   (busy_timeout = 5000 ms) a que la primera confirme o anule.
+2. El estado esperado viaja en la propia cláusula WHERE del UPDATE. El motor
+   lo comprueba contra la fila REAL en el momento de escribir, no contra una
+   lectura anterior: no queda ventana entre comprobar y escribir.
+3. La decisión se toma con `rowcount`, las filas que el motor modificó de
+   verdad. 1 = ganó; 0 = alguien se adelantó. No se deduce de ninguna
+   lectura hecha por Python.
+
+Además, conceder la toma cambia el estado a uno que ya no es reclamable, de
+modo que el propio cambio cierra la puerta al siguiente aspirante.
+
+Componentes:
+- estado_global.py: `reclamar()`, el primitivo de toma atómica; un conflicto
+  NO es excepción, se devuelve descrito
+- supervisor.py: `tomar()` reescrita, `ErrorToma`, `conflictos_de_ambito()`
+  convertida en función pura para poder ejecutarse dentro de la transacción
+- __main__.py: código de salida 3 para la toma rechazada, que distingue
+  "perdí la carrera" de "el Supervisor está roto"
+- pruebas/orquestacion/prueba_toma_atomica.py (nuevo)
+
+Sin cambios de esquema en SQLite: la garantía sale de cómo se escribe, no
+de tablas ni columnas nuevas.
+
+Evidencia de concurrencia REAL (no "PASS"), corrida de estrés medida:
+- RACE_RUNS = 360 carreras con barrera de sincronización
+- CLAIMS_SUCCESS = 360 (exactamente una toma concedida por carrera)
+- CLAIMS_REJECTED = 1520
+- DOUBLE_CLAIM_EVENTS = 0
+- SQLITE_ERRORS = 0, UNEXPECTED_EXCEPTIONS = 0
+- PRAGMA integrity_check: 6 de 6 bases en "ok", sin claves foráneas rotas
+
+El arnés se validó por MUTACIÓN del código, no por confianza:
+- reintroducido el TOCTOU en `tomar` (decisión fuera de la transacción):
+  2 de 2 y 10 de 10 contendientes ganaban a la vez; las carreras lo
+  detectaron en la primera ronda
+- quitada la condición de estado del WHERE de `reclamar`: 8 de 8 hilos
+  ganaban; lo detectaron la carrera entre conexiones y las comprobaciones
+  D, E y L
+- la propia prueba incluye un control permanente que ejecuta una toma
+  deliberadamente ingenua por el mismo arnés y EXIGE dobles tomas > 0
+
+Decisión de diseño registrada:
+- El WHERE condiciona sólo por `estado`, no por `trabajador_id IS NULL`.
+  Exigir además el dueño nulo dejaría permanentemente intomable una fila
+  reclamable con propietario residual, y la recuperación automática está
+  fuera de A3.1. En su lugar la toma desplaza al residual y lo anota en el
+  evento (datos.propietario_desplazado), para que el cambio sea trazable.
+
+Pruebas ejecutadas (Python 3.11.15, Linux):
+- PRUEBA_NUCLEO=OK
+- PRUEBA_VIGA_RAPIDA=OK
+- PRUEBA_SUPERVISOR=OK        31 comprobaciones
+- PRUEBA_ESTADO_GLOBAL=OK     16 comprobaciones
+- PRUEBA_API=OK               12 comprobaciones
+- PRUEBA_TOMA_ATOMICA=OK      18 comprobaciones (matriz A..N)
+
+6 de 6 archivos de prueba en OK.
+
+NO implementado en A3.1 (reservado a A3.2/B): latidos automáticos,
+expiración de trabajadores, detección de trabajadores muertos, recuperación
+automática de tareas abandonadas, cola o planificador, lanzamiento
+automático de trabajadores, paralelismo de agentes escritores, verificar()
+en el worktree de la tarea.
+
+Deuda conocida de A3.1, no corregida por quedar fuera de su alcance:
+- `latido()` y `verificar()` no comprueban que quien llama sea el
+  propietario de la tarea: cualquiera puede latir o verificar una tarea
+  ajena. Pertenece a A3.2 (propiedad efectiva del claim).
+- `reanudar()` puede arrebatar una tarea a un trabajador vivo si su latido
+  vence; la política de expiración es A3.2.
+- La deuda de A2 sigue vigente salvo la atomicidad de `tomar`, ya resuelta.
+
+Pendiente de ejecución en Windows: es el entorno final real y esta corrida
+fue en Linux. Ver los comandos de verificación en orquestacion/README.md.
+
+T-0001 y T-0002 siguen sin ejecutar. wip/columnas-pre-supervisor intacta.
+
+Estado:
+A3.1 = IMPLEMENTADO_PENDIENTE_DE_VERIFICACION_EN_WINDOWS
