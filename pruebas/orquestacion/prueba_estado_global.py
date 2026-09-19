@@ -104,7 +104,12 @@ def _quitar_solo_lectura(funcion, ruta, _excepcion):
 
 
 def borrar(raiz: Path) -> None:
-    shutil.rmtree(raiz, onexc=_quitar_solo_lectura, ignore_errors=False)
+    # `onexc` existe desde Python 3.12; `onerror` es la vía equivalente en
+    # 3.11 y anteriores. La función de limpieza es la misma en ambos casos.
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(raiz, onexc=_quitar_solo_lectura, ignore_errors=False)
+    else:
+        shutil.rmtree(raiz, onerror=_quitar_solo_lectura, ignore_errors=False)
 
 
 def copiar_fichas_reales(raiz: Path) -> None:
