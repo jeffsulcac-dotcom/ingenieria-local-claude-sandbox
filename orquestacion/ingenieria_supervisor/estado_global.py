@@ -27,8 +27,14 @@ de crear una base local silenciosa que pudiera divergir de la global.
 
 Sólo se usa `sqlite3` de la biblioteca estándar. Sin ORM. Sin Internet.
 
-Este módulo NO implementa toma atómica de tareas, locks, latidos automáticos
-ni detección de trabajadores concurrentes: eso queda para A3/B.
+Desde A3.1 este módulo sí implementa la TOMA ATÓMICA de una tarea
+(`reclamar`): un UPDATE condicional dentro de una transacción
+BEGIN IMMEDIATE, resuelto por `rowcount`, que garantiza un único ganador
+entre trabajadores concurrentes.
+
+Sigue sin implementar: latidos automáticos, expiración de trabajadores,
+detección de trabajadores muertos y recuperación automática de tareas
+abandonadas. Eso queda para A3.2/B.
 """
 
 from __future__ import annotations
@@ -72,6 +78,15 @@ EVENTO_DECISION = "decision"
 EVENTO_RECUPERACION = "recuperacion"
 
 ORIGEN_AUTOMATICO = "automático"
+
+# Resultados posibles de un intento de toma atómica (A3.1).
+CLAIM_OTORGADO = "otorgado"
+CLAIM_RECHAZADO = "rechazado"
+
+# Motivos por los que una toma se rechaza.
+MOTIVO_INEXISTENTE = "inexistente"
+MOTIVO_YA_RECLAMADA = "ya_reclamada"
+MOTIVO_ESTADO_NO_RECLAMABLE = "estado_no_reclamable"
 
 # Migraciones versionadas. Cada versión es una lista de sentencias que se
 # aplican dentro de una única transacción. Nunca se edita una versión ya
@@ -693,6 +708,186 @@ def actualizar_tarea(con: sqlite3.Connection, identificador: str, campos: dict) 
         raise ErrorEstadoGlobal(
             "La tarea '" + identificador + "' no existe en el estado global."
         )
+
+
+# ----------------------------------------------------------------------
+# Toma atómica de tareas (A3.1)
+# ----------------------------------------------------------------------
+
+def reclamar(
+    con: sqlite3.Connection,
+    identificador: str,
+    trabajador_id: str,
+    pid: int | None,
+    momento: str,
+    estados_reclamables,
+    estado_destino: str,
+    campos_extra: dict | None = None,
+) -> dict:
+    """
+    Toma ATÓMICA de una tarea. Un solo ganador, siempre.
+
+    DEBE ejecutarse dentro de `transaccion(con)` (BEGIN IMMEDIATE).
+
+    Por qué no puede haber dos tomas concedidas
+    -------------------------------------------
+    1. `BEGIN IMMEDIATE` pide el bloqueo de escritura en el primer instante
+       de la transacción, no a mitad de camino. SQLite admite UN solo
+       escritor a la vez sobre la base, así que dos tomas no se solapan:
+       la segunda espera (busy_timeout) a que la primera confirme o anule,
+       y sólo entonces ve la base.
+
+    2. El estado esperado viaja en la propia cláusula WHERE del UPDATE. El
+       motor comprueba la condición contra la fila REAL en el momento de
+       escribir, no contra una lectura anterior: no queda ninguna ventana
+       entre comprobar y escribir (TOCTOU).
+
+    3. La decisión se toma con `rowcount`, que es el número de filas que el
+       motor modificó de verdad. 1 = la fila seguía reclamable y ahora es
+       nuestra; 0 = alguien se adelantó. No se deduce de ninguna lectura
+       previa hecha por Python.
+
+    Conceder la toma cambia el estado a uno que YA NO es reclamable, de modo
+    que el propio cambio cierra la puerta al siguiente aspirante.
+
+    Un conflicto NO es una excepción: se devuelve descrito. Las excepciones
+    quedan para los datos mal formados y para los fallos de SQLite.
+    """
+    if not isinstance(trabajador_id, str) or not trabajador_id.strip():
+        raise ErrorEstadoGlobal(
+            "Para reclamar una tarea hace falta la identidad del trabajador."
+        )
+
+    trabajador_id = trabajador_id.strip()
+
+    if pid is not None and (
+        isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0
+    ):
+        raise ErrorEstadoGlobal(
+            "El PID del trabajador debe ser un entero positivo; se recibió: "
+            + repr(pid)
+            + "."
+        )
+
+    # Ordenados: el SQL y el mensaje de rechazo deben ser idénticos en cada
+    # ejecución, aunque quien llama pase un conjunto sin orden definido.
+    estados = tuple(sorted({str(estado) for estado in estados_reclamables}))
+
+    if not estados:
+        raise ErrorEstadoGlobal(
+            "No se indicó ningún estado desde el cual se pueda reclamar."
+        )
+
+    destino = str(estado_destino)
+
+    if destino in estados:
+        raise ErrorEstadoGlobal(
+            "El estado de destino '" + destino + "' también es reclamable: "
+            "la toma no cerraría la puerta al siguiente aspirante."
+        )
+
+    campos = {
+        "estado": destino,
+        "trabajador_id": trabajador_id,
+        "pid": pid,
+        "iniciado_en": momento,
+        "ultimo_latido": momento,
+    }
+
+    for columna, valor in (campos_extra or {}).items():
+        if columna not in COLUMNAS_TAREA or columna in ("id", "estado", "trabajador_id"):
+            raise ErrorEstadoGlobal(
+                "Columna que la toma no puede fijar: '" + str(columna) + "'."
+            )
+        campos[columna] = valor
+
+    asignaciones = ", ".join(columna + " = ?" for columna in campos)
+    marcas = ", ".join("?" for _ in estados)
+
+    cursor = con.execute(
+        "UPDATE tareas SET "
+        + asignaciones
+        + " WHERE id = ? AND estado IN ("
+        + marcas
+        + ")",
+        tuple(campos.values()) + (identificador,) + estados,
+    )
+
+    if cursor.rowcount > 1:
+        raise ErrorEstadoGlobal(
+            "La toma de '" + str(identificador) + "' modificó "
+            + str(cursor.rowcount) + " filas; 'id' debería ser única."
+        )
+
+    if cursor.rowcount == 1:
+        return {
+            "resultado": CLAIM_OTORGADO,
+            "tarea": identificador,
+            "motivo": None,
+            "estado": destino,
+            "propietario": trabajador_id,
+            "propia": True,
+            "pid": pid,
+            "momento": momento,
+            "detalle": "Toma concedida a '" + trabajador_id + "'.",
+        }
+
+    # rowcount = 0: la fila no existe o ya no estaba en un estado reclamable.
+    # El motivo se lee DENTRO de la misma transacción, así que describe
+    # exactamente el estado que rechazó esta toma, no uno posterior.
+    fila = obtener_tarea(con, identificador)
+
+    if fila is None:
+        return {
+            "resultado": CLAIM_RECHAZADO,
+            "tarea": identificador,
+            "motivo": MOTIVO_INEXISTENTE,
+            "estado": None,
+            "propietario": None,
+            "propia": False,
+            "pid": None,
+            "momento": momento,
+            "detalle": "La tarea '" + str(identificador) + "' no existe en el "
+            "estado global.",
+        }
+
+    propietario = fila.get("trabajador_id")
+    propia = bool(propietario) and propietario == trabajador_id
+
+    if propietario:
+        motivo = MOTIVO_YA_RECLAMADA
+
+        if propia:
+            detalle = (
+                "La tarea '" + str(identificador) + "' ya la tiene tomada este "
+                "mismo trabajador ('" + str(propietario) + "'), en estado '"
+                + str(fila["estado"]) + "'. No se vuelve a tomar."
+            )
+        else:
+            detalle = (
+                "La tarea '" + str(identificador) + "' ya no está disponible: "
+                "la tomó '" + str(propietario) + "' y está en estado '"
+                + str(fila["estado"]) + "'."
+            )
+    else:
+        motivo = MOTIVO_ESTADO_NO_RECLAMABLE
+        detalle = (
+            "La tarea '" + str(identificador) + "' está en estado '"
+            + str(fila["estado"]) + "', que no admite toma. La admiten: "
+            + ", ".join(estados) + "."
+        )
+
+    return {
+        "resultado": CLAIM_RECHAZADO,
+        "tarea": identificador,
+        "motivo": motivo,
+        "estado": fila["estado"],
+        "propietario": propietario,
+        "propia": propia,
+        "pid": fila.get("pid"),
+        "momento": momento,
+        "detalle": detalle,
+    }
 
 
 def insertar_evento(con: sqlite3.Connection, tarea_id: str, evento: dict) -> int:

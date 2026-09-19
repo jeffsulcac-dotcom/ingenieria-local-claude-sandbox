@@ -466,14 +466,32 @@ def orden_crear(raiz: Path, argumentos) -> int:
     return 0
 
 
+# Código de salida propio de una toma rechazada: no es una avería del
+# Supervisor, es el resultado normal de perder una carrera. Quien invoque
+# la orden (una persona, un guion o n8n) puede distinguirla de un error.
+CODIGO_TOMA_RECHAZADA = 3
+
+
 def orden_tomar(raiz: Path, argumentos) -> int:
-    ficha = nucleo.tomar(
-        raiz,
-        argumentos.tarea,
-        trabajador_id=argumentos.trabajador,
-        pid=argumentos.pid,
-        git=_git(raiz, argumentos),
-    )
+    try:
+        ficha = nucleo.tomar(
+            raiz,
+            argumentos.tarea,
+            trabajador_id=argumentos.trabajador,
+            pid=argumentos.pid,
+            git=_git(raiz, argumentos),
+        )
+    except nucleo.ErrorToma as rechazo:
+        print("")
+        print("  TOMA RECHAZADA: " + str(rechazo))
+        print("")
+        _linea("Tarea", rechazo.tarea)
+        _linea("Motivo", rechazo.motivo)
+        _linea("Estado actual", rechazo.estado)
+        _linea("Trabajador actual", rechazo.propietario)
+        print("")
+
+        return CODIGO_TOMA_RECHAZADA
 
     print("Tarea tomada: " + ficha.id)
     print("Estado: " + str(ficha.estado))
