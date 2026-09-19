@@ -581,15 +581,22 @@ Además:
 
 Evidencia medida en Linux (Python 3.11.15):
 
-- Corredor completo: 7/7 OK, 13,8 s.
-- Batería de A3.2: 16 comprobaciones, 2,25 s.
-- Corrida ampliada (--rezagadas 400 --emisores 10 --ordenes 60): 1023
-  órdenes, 1017 rechazadas, 0 escrituras indebidas, 0 errores SQLite,
-  0 excepciones inesperadas, integridad 24/24.
-- Estrés concurrente: 10 procesos disparando a la vez órdenes rezagadas
-  contra el dueño vigente. 600 emitidas, 600 rechazadas, 0 aceptadas.
+- Corredor completo: 7/7 OK, unos 13 s. Repetido 11 veces seguidas sin un
+  solo fallo, después de que una corrida expusiera el fallo intermitente
+  del WAL.
+- Batería de A3.2: 24 comprobaciones, 1,8 s.
+- Corrida ampliada (--rezagadas 500 --emisores 12 --ordenes 60): 1245
+  órdenes, 1239 rechazadas, 0 escrituras indebidas, 0 errores SQLite,
+  0 excepciones inesperadas, integridad 31/31.
+- Estrés concurrente: 12 procesos disparando a la vez órdenes rezagadas
+  contra el dueño vigente. 720 emitidas, 720 rechazadas, 0 aceptadas.
 - Bootstrap concurrente: 6 procesos por ronda, 3 rondas, 0 fallos.
-- Mutaciones: 11 de 11 detectadas por la batería. La del bootstrap
+- Recursos: 352 conexiones SQLite abiertas, 0 vivas al terminar, y código 0
+  bajo `-X dev -W error::ResourceWarning`.
+- Coste en Git: 105 invocaciones en el proceso padre, 21 de ellas
+  `rev-parse --git-common-dir` (una por repositorio temporal), frente a las
+  439 y 355 de antes de memorizarlo.
+- Mutaciones: 12 de 12 detectadas por la batería. La del bootstrap
   reprodujo el error original literal ("table tareas already exists").
 
 Auditoría adversarial: 8 revisores de sólo lectura sobre copias protegidas.
@@ -603,7 +610,16 @@ todos con prueba propia:
 - la toma no grababa el ámbito que acababa de validar, y por
   `requiere_revision` volvían a quedar dos escritores (crítico);
 - la ruta de sólo lectura pedía el bloqueo de escritura de toda la base
-  para no escribir nada (medio).
+  para no escribir nada (medio);
+- la guarda de ámbito estaba a medias: la base no grababa el ámbito nuevo
+  de una tarea viva, pero `cargar` seguía devolviendo el del JSON, así que
+  el trabajador creía poseer archivos que nadie le concedió y otra tarea
+  podía tomar legítimamente esa parte (crítico).
+
+Y una equivocación propia, corregida con la medición delante: se retiró el
+reintento de la conversión a WAL por considerarlo no verificado, y la
+corrida completa del corredor lo desmintió en el acto (1 de 6 procesos
+murió con "database is locked"). El reintento volvió.
 
 Falso positivo descartado ejecutándolo: `cargar` NO borra una decisión
 humana resuelta; `fusionar_decisiones` la conserva.
