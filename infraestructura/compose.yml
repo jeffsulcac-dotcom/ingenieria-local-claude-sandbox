@@ -1,0 +1,88 @@
+name: ingenieria-local
+
+services:
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: ingenieria-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ingenieria
+      POSTGRES_USER: ingenieria
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+
+    volumes:
+      - postgres_datos:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ingenieria -d ingenieria"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+
+  redis:
+    image: redis:7-alpine
+    container_name: ingenieria-redis
+    restart: unless-stopped
+
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+
+    volumes:
+      - redis_datos:/data
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+
+  n8n:
+    image: n8nio/n8n:latest
+    container_name: ingenieria-n8n
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:5678:5678"
+
+    environment:
+      DB_TYPE: postgresdb
+
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: ingenieria
+      DB_POSTGRESDB_USER: ingenieria
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
+
+      N8N_HOST: localhost
+      N8N_PORT: 5678
+      N8N_PROTOCOL: http
+
+      GENERIC_TIMEZONE: America/Lima
+      TZ: America/Lima
+
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_VERSION_NOTIFICATIONS_ENABLED: "false"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+      redis:
+        condition: service_healthy
+
+    volumes:
+      - n8n_datos:/home/node/.n8n
+
+
+volumes:
+  postgres_datos:
+  redis_datos:
+  n8n_datos:
