@@ -408,6 +408,7 @@ def conflictos_de_ambito(
     filas: list[dict],
     errores: list[dict] | None = None,
     estados_activos: frozenset = ESTADOS_QUE_RETIENEN_AMBITO,
+    ambito: list[str] | None = None,
 ) -> list[dict]:
     """
     Conflictos de esta ficha contra todas las tareas que retienen ámbito.
@@ -426,8 +427,13 @@ def conflictos_de_ambito(
 
     Una ficha ilegible que la base todavía no conoce interrumpe, igual que
     en V1: sin conocer su ámbito no se puede garantizar nada.
+
+    `ambito` permite juzgar un ámbito distinto del declarado en la ficha.
+    Lo usa `tomar` para comprobar la UNIÓN del declarado con el que la
+    tarea ya retenía: hay que validar exactamente lo que se va a grabar.
     """
     conflictos = []
+    propio = list(ficha.ambito_archivos if ambito is None else ambito)
 
     errores = errores or []
 
@@ -454,7 +460,7 @@ def conflictos_de_ambito(
         if fila["estado"] not in {str(estado) for estado in estados_activos}:
             continue
 
-        pares = solapamientos(ficha.ambito_archivos, fila["ambito_archivos"])
+        pares = solapamientos(propio, fila["ambito_archivos"])
 
         if pares:
             conflictos.append(
@@ -1147,7 +1153,34 @@ def tomar(
                     )
                 )
 
-            conflictos = conflictos_de_ambito(ficha, filas, ilegibles)
+            # Ámbito que esta toma va a reclamar de verdad.
+            #
+            # Si el estado del que se viene RETENÍA ámbito, la tarea
+            # conserva cambios sin confirmar en el árbol de trabajo sobre
+            # los archivos que tenía grabados. Tomarla otra vez con un
+            # ámbito ENCOGIDO liberaría ese terreno sin que los cambios se
+            # hayan ido a ninguna parte, y otra tarea podría entrar en él:
+            # dos escritores sobre los mismos archivos.
+            #
+            # Por eso se reclama la UNIÓN de lo declarado y lo retenido.
+            # Ampliar sí se permite —el ámbito nuevo se valida aquí mismo
+            # contra las demás—; encoger no libera nada mientras la
+            # retención siga en pie. El ámbito encogido se aplicará solo
+            # cuando la tarea deje de retener, por la sincronización normal.
+            ambito_reclamado = list(ficha.ambito_archivos)
+
+            if previa is not None and previa["estado"] in {
+                str(estado) for estado in ESTADOS_QUE_RETIENEN_AMBITO
+            }:
+                retenido = list(previa["ambito_archivos"] or [])
+                ambito_reclamado = ambito_reclamado + [
+                    patron for patron in retenido
+                    if patron not in ambito_reclamado
+                ]
+
+            conflictos = conflictos_de_ambito(
+                ficha, filas, ilegibles, ambito=ambito_reclamado
+            )
 
             if conflictos:
                 detalle = "; ".join(
@@ -1198,9 +1231,10 @@ def tomar(
                     # terreno debajo; una toma nueva es justamente el momento
                     # en que empieza otra ejecución, y su ámbito acaba de
                     # comprobarse dentro de esta transacción.
-                    "ambito_archivos": global_.fila_desde_ficha(ficha)[
-                        "ambito_archivos"
-                    ],
+                    # Exactamente lo que se acaba de validar arriba, ni
+                    # más ni menos: grabar otra cosa dejaría la fila
+                    # diciendo algo que nadie comprobó.
+                    "ambito_archivos": global_._a_json(ambito_reclamado),
                 },
             )
 

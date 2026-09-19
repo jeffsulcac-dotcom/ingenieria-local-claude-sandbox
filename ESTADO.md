@@ -584,7 +584,7 @@ Evidencia medida en Linux (Python 3.11.15):
 - Corredor completo: 7/7 OK, unos 13 s. Repetido 11 veces seguidas sin un
   solo fallo, después de que una corrida expusiera el fallo intermitente
   del WAL.
-- Batería de A3.2: 24 comprobaciones, 1,8 s.
+- Batería de A3.2: 27 comprobaciones, unos 2 s.
 - Corrida ampliada (--rezagadas 500 --emisores 12 --ordenes 60): 1245
   órdenes, 1239 rechazadas, 0 escrituras indebidas, 0 errores SQLite,
   0 excepciones inesperadas, integridad 31/31.
@@ -596,7 +596,7 @@ Evidencia medida en Linux (Python 3.11.15):
 - Coste en Git: 105 invocaciones en el proceso padre, 21 de ellas
   `rev-parse --git-common-dir` (una por repositorio temporal), frente a las
   439 y 355 de antes de memorizarlo.
-- Mutaciones: 12 de 12 detectadas por la batería. La del bootstrap
+- Mutaciones: 17 de 17 detectadas por la batería. La del bootstrap
   reprodujo el error original literal ("table tareas already exists").
 
 Auditoría adversarial: 8 revisores de sólo lectura sobre copias protegidas.
@@ -615,6 +615,14 @@ todos con prueba propia:
   de una tarea viva, pero `cargar` seguía devolviendo el del JSON, así que
   el trabajador creía poseer archivos que nadie le concedió y otra tarea
   podía tomar legítimamente esa parte (crítico).
+
+La ronda FOCALIZADA sobre esas correcciones encontró dos regresiones más,
+introducidas por las propias correcciones, y también están cerradas:
+
+- la salida rápida de `asegurar_ficha` delegaba y podía acabar escribiendo
+  en autocommit, fuera de toda transacción (alto);
+- la retoma grababa el ámbito declarado sin mirar si encogía, soltando el
+  terreno que la retención protegía (alto).
 
 Y una equivocación propia, corregida con la medición delante: se retiró el
 reintento de la conversión a WAL por considerarlo no verificado, y la

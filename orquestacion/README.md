@@ -487,19 +487,34 @@ Tres detalles que costaron una ronda de auditoría cada uno:
   el producto cartesiano, así que `['a','b']` y `['b','a']` garantizan lo
   mismo; comparar las listas tal cual congelaba toda la definición al
   reordenar un patrón.
-- La TOMA graba el ámbito que acaba de validar. `requiere_revision` es el
-  único estado que está a la vez en ESTADOS_TOMABLES y en
-  ESTADOS_QUE_RETIENEN_AMBITO, así que una tarea podía tener el ámbito
-  congelado y ser tomable al mismo tiempo: la toma concedía la propiedad
-  sobre el ámbito declarado mientras la fila guardaba el viejo, y la
-  siguiente toma comprobaba el solapamiento contra un ámbito que ya no
-  usaba nadie. Grabarlo en la toma es coherente: ahí empieza otra
-  ejecución y el ámbito acaba de comprobarse dentro de esa transacción.
+- La TOMA valida y graba la UNIÓN del ámbito declarado con el que la tarea
+  ya retenía. `requiere_revision` es el único estado que está a la vez en
+  ESTADOS_TOMABLES y en ESTADOS_QUE_RETIENEN_AMBITO, así que una tarea
+  podía tener el ámbito congelado y ser tomable al mismo tiempo, y ahí
+  fallaba por los dos lados:
+
+  - grabando sólo lo viejo, la toma concedía la propiedad sobre el ámbito
+    declarado mientras la fila guardaba otro, y la siguiente toma
+    comprobaba el solapamiento contra un ámbito que ya no usaba nadie;
+  - grabando sólo lo declarado, una retoma con el ámbito ENCOGIDO soltaba
+    el terreno que la retención protegía —la tarea conserva cambios sin
+    confirmar sobre esos archivos— y otra tarea podía entrar en él.
+
+  La unión resuelve los dos: ampliar se permite, porque lo nuevo se valida
+  ahí mismo contra las demás; encoger no libera nada mientras la retención
+  siga en pie, y se aplicará solo cuando la tarea deje de retener.
 - La ruta de sólo lectura no pide el bloqueo de escritura. Como la huella
   no avanza a propósito, `necesita_sincronizacion` dice que sí para
   siempre; sin un atajo, cada `cargar` —incluido el de un `ver`— abriría un
   BEGIN IMMEDIATE para no escribir nada, y bajo concurrencia eso convierte
   una consulta en "database is locked".
+
+  Ese atajo DEVUELVE el informe congelado y no delega en
+  `sincronizar_ficha`. Delegar fue una regresión de esta misma etapa: esa
+  función vuelve a leer la fila y a decidir por su cuenta, y como ahí ya no
+  hay transacción, si la tarea dejaba de estar viva entre las dos lecturas
+  acababa ejecutando su UPDATE y su evento EN AUTOCOMMIT. La salida que
+  existe para no escribir podía escribir, y sin candado.
 
 Y el resultado se informa: un ámbito congelado NO se cuenta como "sin
 cambios", que le diría al usuario justo lo contrario de lo que pasó.

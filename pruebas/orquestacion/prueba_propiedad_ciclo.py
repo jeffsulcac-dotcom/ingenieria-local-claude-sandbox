@@ -1456,7 +1456,7 @@ def prueba_n_reanudar_respeta_una_toma_reciente():
 
 def prueba_o_estres_de_ordenes_rezagadas(rezagadas: int):
     print(
-        " 25. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
+        " 26. estrés: " + str(rezagadas) + " órdenes rezagadas contra el "
         "dueño vigente:",
         end=" ",
     )
@@ -1633,6 +1633,72 @@ def prueba_u_la_toma_graba_el_ambito_que_valido():
     print("OK")
 
 
+def prueba_u3_retomar_con_ambito_encogido_no_libera_el_terreno():
+    """
+    Encoger el ámbito en el JSON no suelta lo que la tarea todavía retiene.
+
+    `requiere_revision` retiene ámbito porque la tarea conserva cambios sin
+    confirmar en el árbol de trabajo. Si al retomarla se grabara el ámbito
+    ENCOGIDO que declara el JSON, esos archivos quedarían libres sin que
+    los cambios se hubieran ido a ninguna parte, y otra tarea podría entrar
+    en ellos: dos escritores sobre los mismos archivos.
+
+    Lo encontró la ronda focalizada como regresión de la corrección
+    anterior, que hacía que la toma grabara el ámbito declarado sin mirar
+    si ampliaba o encogía. Ahora reclama la UNIÓN.
+    """
+    print(" 18. retomar con ámbito encogido no libera el terreno:", end=" ")
+
+    raiz = crear_repositorio()
+
+    try:
+        ficha_minima(
+            raiz,
+            "T-0901",
+            ambito_archivos=["modulos/comun/uno.py", "modulos/comun/dos.py"],
+        )
+        ficha_minima(raiz, "T-0902", ambito_archivos=["modulos/comun/dos.py"])
+
+        nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+        _forzar_estado(raiz, "T-0901", Estado.REQUIERE_REVISION)
+
+        # Se ENCOGE el ámbito en el JSON: se renuncia a 'dos.py'.
+        _reescribir_ambito(raiz, "T-0901", ["modulos/comun/uno.py"])
+
+        nucleo.cargar(raiz, "T-0901")
+
+        # Y se vuelve a tomar, que es legítimo desde requiere_revision.
+        nucleo.tomar(raiz, "T-0901", trabajador_id="worker-B")
+
+        grabado = sorted(fila_de(raiz, "T-0901")["ambito_archivos"])
+
+        assert grabado == ["modulos/comun/dos.py", "modulos/comun/uno.py"], (
+            "La retoma soltó el terreno que la retención protegía. Quedó "
+            "grabado: " + repr(grabado)
+        )
+
+        # Consecuencia: T-0902 sigue sin poder entrar en 'dos.py'.
+        METRICAS["ORDENES_TOTALES"] += 1
+
+        try:
+            nucleo.tomar(raiz, "T-0902", trabajador_id="worker-C")
+        except nucleo.ErrorSolapamiento:
+            METRICAS["ORDENES_RECHAZADAS"] += 1
+        else:
+            METRICAS["ORDENES_ACEPTADAS"] += 1
+            METRICAS["ESCRITURAS_INDEBIDAS"] += 1
+            raise AssertionError(
+                "Dos escritores sobre 'modulos/comun/dos.py': la retoma con "
+                "ámbito encogido liberó lo que la tarea todavía retenía."
+            )
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
 def prueba_u2_el_ambito_vigente_no_miente_al_trabajador():
     """
     Un trabajador nunca cree poseer lo que la base no le concedió.
@@ -1654,7 +1720,7 @@ def prueba_u2_el_ambito_vigente_no_miente_al_trabajador():
     la declaración que una persona acababa de escribir. Se comprobó
     rompiéndolo.
     """
-    print(" 18. el ámbito vigente no le miente al trabajador:", end=" ")
+    print(" 19. el ámbito vigente no le miente al trabajador:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1726,7 +1792,7 @@ def prueba_v_reordenar_el_ambito_no_congela_nada():
     congelaría toda la definición y bloquearía de paso cualquier arreglo
     que viajara en la misma edición.
     """
-    print(" 19. reordenar el ámbito no congela la definición:", end=" ")
+    print(" 20. reordenar el ámbito no congela la definición:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1783,7 +1849,7 @@ def prueba_w_el_ambito_congelado_no_pide_el_bloqueo_de_escritura():
     de toda la base para no escribir nada; bajo concurrencia eso convierte
     una consulta en una espera que acaba en "database is locked".
     """
-    print(" 20. una consulta sobre tarea congelada no pide el candado:", end=" ")
+    print(" 21. una consulta sobre tarea congelada no pide el candado:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1861,7 +1927,7 @@ def prueba_w2_la_salida_rapida_nunca_escribe_fuera_de_transaccion():
     intercala una lectura que devuelve la tarea ya cerrada, que es justo
     lo que vería el segundo vistazo si otro proceso la cerrara en medio.
     """
-    print(" 21. la salida rápida no escribe fuera de transacción:", end=" ")
+    print(" 22. la salida rápida no escribe fuera de transacción:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1959,7 +2025,7 @@ def prueba_r_la_generacion_no_sale_de_sqlite():
     podía volver a hacer indistinguibles dos ejecuciones, que es justo el
     problema ABA que la columna existe para cerrar.
     """
-    print(" 22. la generación no se puede falsificar desde el JSON:", end=" ")
+    print(" 23. la generación no se puede falsificar desde el JSON:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2159,7 +2225,7 @@ def prueba_s_orden_humana_rezagada_no_revierte_una_transicion():
     Lo cierra la tercera precondición: la escritura exige que la fila siga
     en el estado que tenía cuando se leyó.
     """
-    print(" 23. una orden humana rezagada no revierte el ciclo:", end=" ")
+    print(" 24. una orden humana rezagada no revierte el ciclo:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2213,7 +2279,7 @@ def prueba_t_el_ambito_congelado_se_informa():
     función importante produzca un resultado visible y verificable, y un
     cambio en espera es justo eso.
     """
-    print(" 24. el ámbito congelado se informa, no se disimula:", end=" ")
+    print(" 25. el ámbito congelado se informa, no se disimula:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -2345,7 +2411,7 @@ def prueba_p_estres_concurrente(emisores: int, ordenes: int):
     órdenes entre. Una sola aceptada es un fallo, y se nombra cuál fue.
     """
     print(
-        " 26. estrés concurrente: " + str(emisores) + " procesos x "
+        " 27. estrés concurrente: " + str(emisores) + " procesos x "
         + str(ordenes) + " órdenes rezagadas:",
         end=" ",
     )
@@ -2465,6 +2531,7 @@ COMPROBACIONES = (
     prueba_m_codigo_de_salida_por_propiedad,
     prueba_n_reanudar_respeta_una_toma_reciente,
     prueba_u_la_toma_graba_el_ambito_que_valido,
+    prueba_u3_retomar_con_ambito_encogido_no_libera_el_terreno,
     prueba_u2_el_ambito_vigente_no_miente_al_trabajador,
     prueba_v_reordenar_el_ambito_no_congela_nada,
     prueba_w_el_ambito_congelado_no_pide_el_bloqueo_de_escritura,
