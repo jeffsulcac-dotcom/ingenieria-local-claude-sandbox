@@ -238,3 +238,66 @@ Fichas creadas, ambas en estado NUEVO y sin ejecutar:
 
 Estado:
 SUPERVISOR_V1 = IMPLEMENTADO_PENDIENTE_DE_REVISION
+
+## Supervisor — A2: estado operativo global en SQLite
+
+Segundo componente de orquestación. Sustituye las fichas JSON como fuente
+del estado operativo por una única base SQLite por repositorio, compartida
+por la rama principal y por todos sus worktrees.
+
+Base:
+- ruta: `<git rev-parse --git-common-dir>/ingenieria-supervisor.sqlite3`
+  (en esta PC: C:\INGENIERIA_LOCAL\motor\.git\ingenieria-supervisor.sqlite3)
+- no versionada, no aparece en `git status`; red de seguridad en .gitignore
+- sqlite3 de la biblioteca estándar; sin ORM; sin dependencias nuevas
+- esquema versión 1: tablas `esquema`, `tareas`, `eventos`
+- journal_mode = wal, synchronous = FULL, busy_timeout = 5000 ms,
+  foreign_keys = ON
+- transacciones BEGIN IMMEDIATE / COMMIT con ROLLBACK ante error
+
+Autoridad:
+- SQLite: estado operativo (estado, rama, worktree, intentos, trabajador,
+  latido, fallas, última verificación, resolución de decisiones humanas,
+  historial de eventos)
+- JSON: definición versionada (id, título, objetivo, criterios, ámbito,
+  pruebas requeridas, decisiones humanas declaradas)
+- los campos operativos del JSON son un espejo regenerado desde SQLite
+  tras cada operación; nunca son entrada
+
+Componentes:
+- orquestacion/ingenieria_supervisor/estado_global.py (nuevo)
+- supervisor.py: todas las operaciones del ciclo persisten en SQLite
+- __main__.py: `estado` y `ver` leen SQLite; nuevas órdenes `diagnostico`,
+  `inicializar-estado`, `sincronizar-definiciones`
+- servidor.py: `GET /api/desarrollo/estado` (se conserva
+  `/api/desarrollo/tareas`)
+- desarrollo.html: indicador "Base global SQLite", nuevas, última
+  actividad global, última verificación y decisión humana por tarea
+
+Bootstrap verificado sobre el repositorio real:
+- T-0001: NUEVO, 0 intentos, sin trabajador, 3 decisiones pendientes
+  (D-1, D-2, D-3) intactas y sin resolver
+- T-0002: NUEVO, 0 intentos, sin trabajador, sin decisiones
+- repetir el bootstrap no duplica ni altera nada; los JSON no se reescriben
+
+Pruebas:
+- PRUEBA_ESTADO_GLOBAL=OK   (16 comprobaciones nuevas, herméticas,
+  incluida la resolución de la misma base desde dos worktrees)
+- PRUEBA_SUPERVISOR=OK      (31 comprobaciones; dos adaptadas a la nueva
+  autoridad, con la misma intención)
+- PRUEBA_API=OK             (13 comprobaciones; API y tablero desde SQLite)
+- PRUEBA_NUCLEO=OK
+- PRUEBA_VIGA_RAPIDA=OK
+
+Corredor único: 5 de 5 pruebas en OK.
+
+NO implementado en A2 (reservado a A3/B): toma atómica concurrente, locks,
+latidos automáticos, detección avanzada de huérfanos, verificar() en el
+worktree de la tarea, lanzamiento de Claude, workers paralelos, worktrees
+automáticos, cola automática, n8n ejecutando tareas, Redis como cola,
+PostgreSQL como estado.
+
+T-0001 y T-0002 siguen sin ejecutar. wip/columnas-pre-supervisor intacta.
+
+Estado:
+A2 = IMPLEMENTADO_PENDIENTE_DE_REVISION

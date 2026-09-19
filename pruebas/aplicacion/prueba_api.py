@@ -8,7 +8,8 @@ Cubren:
 - las páginas visibles;
 - la hoja de estilo local;
 - el cálculo rápido de viga, con un caso válido y varios inválidos;
-- el tablero del Supervisor y su origen de datos.
+- el tablero del Supervisor y su origen de datos: desde A2, la base SQLite
+  global del repositorio (las definiciones siguen en las fichas JSON).
 """
 
 import sys
@@ -191,12 +192,20 @@ def prueba_pagina_desarrollo():
     assert "Supervisor de Desarrollo" in texto
     assert "Agentes activos" in texto
     assert "Tareas totales" in texto
+    assert "Nuevas" in texto
     assert "Requieren revisión" in texto
     assert "Bloqueadas" in texto
     assert "ACTIVIDAD RECIENTE" in texto
 
+    # A2: el tablero declara y muestra la base global SQLite.
+    assert "Base global SQLite" in texto
+    assert 'id="dato-base"' in texto
+    assert "Última actividad global" in texto
+    assert "Última verificación" in texto
+    assert "Requiere decisión humana" in texto
+
     # El tablero se alimenta de su propia API local, sin recursos externos.
-    assert "/api/desarrollo/tareas" in texto
+    assert "/api/desarrollo/estado" in texto
 
     minuscula = texto.lower()
 
@@ -224,8 +233,8 @@ def prueba_pagina_desarrollo():
         )
 
 
-def prueba_api_desarrollo():
-    respuesta = cliente.get("/api/desarrollo/tareas")
+def _comprobar_estado_desarrollo(ruta: str) -> dict:
+    respuesta = cliente.get(ruta)
 
     assert respuesta.status_code == 200
 
@@ -233,12 +242,24 @@ def prueba_api_desarrollo():
 
     for clave in (
         "generado_en",
+        "base_global",
         "resumen",
         "tareas",
         "actividad",
         "fichas_ilegibles",
     ):
         assert clave in datos
+
+    # A2: el estado operativo proviene de la base SQLite global.
+    base = datos["base_global"]
+
+    assert base["estado"] == "ACTIVA", base
+    assert base["ruta"].endswith("ingenieria-supervisor.sqlite3")
+    assert base["version_esquema"] == 1
+    assert base["journal_mode"] == "wal"
+
+    # La base vive en el directorio común de Git, nunca en el árbol.
+    assert ".git" in Path(base["ruta"]).parts
 
     resumen = datos["resumen"]
 
@@ -257,7 +278,13 @@ def prueba_api_desarrollo():
         assert clave in resumen
         assert isinstance(resumen[clave], int)
 
+    assert "ultima_actividad" in resumen
+
     assert resumen["totales"] == len(datos["tareas"])
+
+    # Sin trabajadores activos el tablero debe decir 0, no inventar.
+    assert resumen["agentes_activos"] == 0
+    assert resumen["en_ejecucion"] == 0
 
     # Cada tarea publicada debe traer los campos que el tablero muestra.
     for tarea in datos["tareas"]:
@@ -274,11 +301,57 @@ def prueba_api_desarrollo():
             "actualizado_en",
             "ultima_falla",
             "decisiones_pendientes",
+            "requiere_decision_humana",
+            "ultima_verificacion",
+            "definicion_ruta",
+            "definicion_legible",
             "trabajador_id",
             "pid",
             "ultimo_latido",
         ):
             assert clave in tarea, "Falta '" + clave + "' en " + tarea["id"]
+
+    # Las dos fichas reales aparecen con el estado que tenían antes de A2.
+    por_id = {tarea["id"]: tarea for tarea in datos["tareas"]}
+
+    assert "T-0001" in por_id and "T-0002" in por_id
+
+    primera = por_id["T-0001"]
+    segunda = por_id["T-0002"]
+
+    assert primera["estado"] == "nuevo"
+    assert primera["intentos"] == 0
+    assert primera["trabajador_id"] is None
+    assert primera["requiere_decision_humana"] is True
+    assert len(primera["decisiones_pendientes"]) == 3
+    assert [una["clave"] for una in primera["decisiones_pendientes"]] == [
+        "D-1", "D-2", "D-3"
+    ]
+    assert primera["definicion_legible"] is True
+
+    assert segunda["estado"] == "nuevo"
+    assert segunda["intentos"] == 0
+    assert segunda["requiere_decision_humana"] is False
+    assert segunda["decisiones_pendientes"] == []
+
+    # Cada evento de actividad trae su tipo (proviene de la tabla eventos).
+    for evento in datos["actividad"]:
+        assert "tipo" in evento and evento["tipo"]
+
+    return datos
+
+
+def prueba_api_desarrollo():
+    _comprobar_estado_desarrollo("/api/desarrollo/estado")
+
+
+def prueba_api_desarrollo_ruta_v1():
+    """La ruta de V1 se conserva y responde exactamente lo mismo."""
+    nueva = _comprobar_estado_desarrollo("/api/desarrollo/estado")
+    antigua = _comprobar_estado_desarrollo("/api/desarrollo/tareas")
+
+    assert antigua["resumen"] == nueva["resumen"]
+    assert [t["id"] for t in antigua["tareas"]] == [t["id"] for t in nueva["tareas"]]
 
 
 # ----------------------------------------------------------------------
@@ -300,7 +373,9 @@ COMPROBACIONES = [
     ("POST viga, luz no numérica = 422",
      prueba_calculo_viga_luz_no_numerica),
     ("GET /desarrollo", prueba_pagina_desarrollo),
-    ("GET /api/desarrollo/tareas", prueba_api_desarrollo),
+    ("GET /api/desarrollo/estado (SQLite global)", prueba_api_desarrollo),
+    ("GET /api/desarrollo/tareas (ruta V1 conservada)",
+     prueba_api_desarrollo_ruta_v1),
 ]
 
 

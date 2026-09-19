@@ -108,13 +108,24 @@ async def pagina_desarrollo(request: Request):
     )
 
 
-@app.get("/api/desarrollo/tareas")
-async def api_desarrollo_tareas():
+@app.get("/api/desarrollo/estado")
+def api_desarrollo_estado():
     """
-    Estado del Supervisor leído directamente de las fichas JSON.
+    Estado operativo del Supervisor leído de la base SQLite global.
 
-    No consulta PostgreSQL ni Redis: el estado vive en Git.
+    Las definiciones de tarea siguen viniendo de las fichas JSON versionadas
+    en Git. No consulta PostgreSQL ni Redis, y no mantiene ninguna caché:
+    cada petición lee la base.
+
+    Es una función síncrona a propósito: FastAPI la ejecuta en su grupo de
+    hilos y la lectura de disco no bloquea el bucle de eventos.
     """
+    return supervisor_desarrollo.tablero(RAIZ)
+
+
+@app.get("/api/desarrollo/tareas")
+def api_desarrollo_tareas():
+    """Ruta conservada de V1: misma respuesta que /api/desarrollo/estado."""
     return supervisor_desarrollo.tablero(RAIZ)
 
 

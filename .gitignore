@@ -18,3 +18,9 @@ logs/
 # Sistema
 Thumbs.db
 .DS_Store
+
+# Estado operativo global del Supervisor (vive en .git/, nunca se versiona)
+ingenieria-supervisor.sqlite3
+ingenieria-supervisor.sqlite3-wal
+ingenieria-supervisor.sqlite3-shm
+ingenieria-supervisor.sqlite3-journal

@@ -71,14 +71,25 @@
             </h1>
 
             <p>
-                Estado real de las tareas, leído de las fichas versionadas
-                en Git. Este tablero es de sólo lectura.
+                Estado operativo leído de la base SQLite global del
+                repositorio; definiciones de tarea desde las fichas
+                versionadas en Git. Este tablero es de sólo lectura.
             </p>
 
         </section>
 
 
         <section class="panel-resumen" id="resumen">
+
+            <div class="dato">
+                <span class="dato-etiqueta">Base global SQLite</span>
+                <strong id="dato-base">—</strong>
+            </div>
+
+            <div class="dato">
+                <span class="dato-etiqueta">Última actividad global</span>
+                <strong id="dato-actividad">—</strong>
+            </div>
 
             <div class="dato">
                 <span class="dato-etiqueta">Agentes activos</span>
@@ -88,6 +99,11 @@
             <div class="dato">
                 <span class="dato-etiqueta">Tareas totales</span>
                 <strong id="dato-totales">—</strong>
+            </div>
+
+            <div class="dato">
+                <span class="dato-etiqueta">Nuevas</span>
+                <strong id="dato-nuevas">—</strong>
             </div>
 
             <div class="dato">
@@ -129,6 +145,8 @@
                 <span class="marca-actualizacion" id="actualizado">—</span>
             </div>
 
+            <div id="aviso-base"></div>
+
             <div class="lista-tareas" id="tareas"></div>
 
         </section>
@@ -153,7 +171,11 @@
 
     <span>•</span>
 
-    <span>Estado en Git</span>
+    <span>Estado global en SQLite</span>
+
+    <span>•</span>
+
+    <span>Definiciones en Git</span>
 
     <span>•</span>
 
@@ -242,14 +264,31 @@ function dibujarTarea(tarea) {
     bloque += fila("PID", escapar(tarea.pid));
     bloque += fila("Último latido", fecha(tarea.ultimo_latido));
 
+    const verificacion = tarea.ultima_verificacion;
+
+    bloque += fila(
+        "Última verificación",
+        verificacion
+            ? escapar(verificacion.resultado) + " · " + escapar(verificacion.ok)
+              + " de " + escapar(verificacion.total) + " · " + fecha(verificacion.fecha)
+            : "—"
+    );
+
     const pendientes = tarea.decisiones_pendientes || [];
 
     bloque += fila(
-        "Decisión humana",
-        pendientes.length > 0
-            ? '<span class="pendiente">PENDIENTE (' + pendientes.length + ')</span>'
-            : (tarea.decisiones_totales > 0 ? "resueltas" : "—")
+        "Requiere decisión humana",
+        tarea.requiere_decision_humana
+            ? '<span class="pendiente">SÍ · PENDIENTE (' + pendientes.length + ')</span>'
+            : (tarea.decisiones_totales > 0 ? "no · resueltas" : "no")
     );
+
+    if (tarea.definicion_legible === false) {
+        bloque += fila(
+            "Definición JSON",
+            '<span class="pendiente">NO LEGIBLE · ' + escapar(tarea.definicion_ruta) + '</span>'
+        );
+    }
 
     bloque += '</div>';
 
@@ -283,9 +322,25 @@ function dibujarTarea(tarea) {
 
 function dibujar(datos) {
     const resumen = datos.resumen;
+    const base = datos.base_global || { estado: "ERROR", detalle: "sin datos" };
+
+    const indicador = document.getElementById("dato-base");
+    indicador.textContent = base.estado;
+    indicador.className = base.estado === "ACTIVA" ? "" : "pendiente";
+
+    document.getElementById("dato-actividad").textContent =
+        fecha(resumen.ultima_actividad);
+
+    const aviso = document.getElementById("aviso-base");
+
+    aviso.innerHTML = base.estado === "ACTIVA"
+        ? ""
+        : '<div class="mensaje-tecnico aviso">Base global SQLite no disponible: '
+          + escapar(base.detalle) + '</div>';
 
     document.getElementById("dato-agentes").textContent = resumen.agentes_activos;
     document.getElementById("dato-totales").textContent = resumen.totales;
+    document.getElementById("dato-nuevas").textContent = resumen.nuevas;
     document.getElementById("dato-ejecucion").textContent = resumen.en_ejecucion;
     document.getElementById("dato-propuestas").textContent = resumen.propuestas;
     document.getElementById("dato-revision").textContent = resumen.requieren_revision;
@@ -299,14 +354,18 @@ function dibujar(datos) {
         : resumen.totales + (resumen.totales === 1 ? " tarea registrada" : " tareas registradas");
 
     document.getElementById("actualizado").textContent =
-        "Actualizado: " + fecha(datos.generado_en);
+        "Actualizado: " + fecha(datos.generado_en)
+        + (base.ubicacion_resumida ? " · Base: " + base.ubicacion_resumida : "");
 
     const contenedor = document.getElementById("tareas");
 
     if (datos.tareas.length === 0) {
         contenedor.innerHTML = '<div class="vacio">'
-            + 'Las fichas de tarea viven en orquestacion/tareas y se '
-            + 'versionan en Git.</div>';
+            + (base.estado === "ACTIVA"
+                ? 'La base global no registra ninguna tarea. Las definiciones '
+                  + 'viven en orquestacion/tareas y se versionan en Git.'
+                : 'Sin estado operativo: la base global no está disponible.')
+            + '</div>';
     } else {
         contenedor.innerHTML = datos.tareas.map(dibujarTarea).join("");
     }
@@ -324,8 +383,9 @@ function dibujar(datos) {
                 + escapar(evento.estado_anterior) + ' → '
                 + escapar(evento.estado_nuevo) + '</span>'
                 + '<span class="evento-motivo">'
-                + '<span class="evento-origen">[' + escapar(evento.origen)
-                + ']</span> ' + escapar(evento.motivo) + '</span>'
+                + '<span class="evento-origen">[' + escapar(evento.tipo) + ' · '
+                + escapar(evento.origen) + ']</span> '
+                + escapar(evento.motivo) + '</span>'
                 + '</div>';
         }).join("");
     }
@@ -342,7 +402,7 @@ function dibujar(datos) {
 }
 
 function consultar() {
-    fetch("/api/desarrollo/tareas", { cache: "no-store" })
+    fetch("/api/desarrollo/estado", { cache: "no-store" })
         .then(function (respuesta) {
             if (!respuesta.ok) {
                 throw new Error("Respuesta " + respuesta.status);

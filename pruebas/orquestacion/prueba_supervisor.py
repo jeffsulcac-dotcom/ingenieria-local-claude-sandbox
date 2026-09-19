@@ -27,6 +27,7 @@ sys.path.insert(0, str(RAIZ / "nucleo"))
 
 from ingenieria_nucleo.estados import Estado
 
+from ingenieria_supervisor import estado_global
 from ingenieria_supervisor import pruebas as corredor
 from ingenieria_supervisor import supervisor as nucleo
 from ingenieria_supervisor import tarea as fichas
@@ -52,8 +53,25 @@ PRUEBA_MUDA = (
 
 
 def crear_repositorio(con_roja=False, con_muda=False) -> Path:
-    """Crea una raíz temporal con pruebas sintéticas controladas."""
+    """
+    Crea una raíz temporal con pruebas sintéticas controladas.
+
+    Desde A2 la raíz es un repositorio Git mínimo: el estado operativo vive
+    en la base SQLite global ubicada en el directorio común de Git, así que
+    sin repositorio no hay Supervisor. Cada raíz temporal tiene su propio
+    `.git`, por lo que cada comprobación usa una base aislada.
+    """
     raiz = Path(tempfile.mkdtemp(prefix="supervisor_"))
+
+    inicio = subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(raiz)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert inicio.returncode == 0, (
+        "No se pudo crear el repositorio temporal: " + inicio.stderr
+    )
 
     carpeta = raiz / "pruebas" / "demostracion"
     carpeta.mkdir(parents=True)
@@ -71,8 +89,14 @@ def crear_repositorio(con_roja=False, con_muda=False) -> Path:
     return raiz
 
 
+def _quitar_solo_lectura(funcion, ruta, _excepcion):
+    """Git marca sus objetos como sólo lectura; se limpian igual."""
+    os.chmod(ruta, 0o700)
+    funcion(ruta)
+
+
 def borrar(raiz: Path) -> None:
-    shutil.rmtree(raiz, ignore_errors=True)
+    shutil.rmtree(raiz, onexc=_quitar_solo_lectura, ignore_errors=False)
 
 
 def ficha_minima(raiz: Path, identificador="T-0001", **extras):
@@ -807,14 +831,31 @@ def prueba_reanudar_detecta_ficha_inconsistente():
 
         # Ficha en ejecución sin identidad de trabajador: estado imposible,
         # propio de una escritura interrumpida a medias.
+        #
+        # Desde A2 el estado operativo vive en SQLite: el JSON operativo
+        # no es entrada, así que la inconsistencia se inyecta en la base.
+        # De paso se comprueba que un JSON alterado a mano NO manda.
         ficha.estado = Estado.EN_EJECUCION
         fichas.guardar(raiz, ficha)
+
+        assert nucleo.cargar(raiz, "T-0001").estado == Estado.NUEVO, (
+            "Un JSON editado a mano cambió el estado operativo."
+        )
+
+        with estado_global.conexion(raiz) as con:
+            with estado_global.transaccion(con):
+                estado_global.actualizar_tarea(
+                    con, "T-0001", {"estado": str(Estado.EN_EJECUCION)}
+                )
 
         informe = nucleo.reanudar(raiz)
 
         assert len(informe["inconsistentes"]) == 1
         assert "sin identidad completa" in informe["inconsistentes"][0]["motivo"]
 
+        assert nucleo.cargar(raiz, "T-0001").estado == Estado.REABIERTO
+
+        # El espejo JSON quedó regenerado desde SQLite.
         assert fichas.leer(raiz, "T-0001").estado == Estado.REABIERTO
 
     finally:
@@ -969,20 +1010,35 @@ def prueba_ambito_invalido_se_rechaza():
             assert "ámbito" in str(error)
 
         # Rutas absolutas o con '..' no son comparables de forma fiable.
-        for patron in [
+        #
+        # Desde A2 el estado global recuerda cada identificador aunque su
+        # JSON se borre, así que cada patrón usa una tarea distinta.
+        patrones = [
             "C:/INGENIERIA_LOCAL/motor/modulos/vigas.py",
             "/modulos/vigas.py",
             "../fuera/archivo.py",
-        ]:
-            ficha_minima(raiz, "T-0002", ambito_archivos=[patron])
+        ]
+
+        for numero, patron in enumerate(patrones, start=2):
+            identificador = "T-" + str(numero).zfill(4)
+
+            ficha_minima(raiz, identificador, ambito_archivos=[patron])
 
             try:
-                nucleo.tomar(raiz, "T-0002")
+                nucleo.tomar(raiz, identificador)
                 raise AssertionError("Se aceptó el patrón: " + patron)
             except nucleo.ErrorSupervisor as error:
                 assert "relativas" in str(error)
 
-            fichas.ruta_ficha(raiz, "T-0002").unlink()
+        # Borrar el JSON no borra la tarea del estado global: el
+        # identificador queda reservado y no puede volver a crearse.
+        fichas.ruta_ficha(raiz, "T-0002").unlink()
+
+        try:
+            ficha_minima(raiz, "T-0002", ambito_archivos=["modulos/x.py"])
+            raise AssertionError("Se recreó una tarea que el estado global ya conocía.")
+        except nucleo.ErrorSupervisor as error:
+            assert "estado global" in str(error)
 
         # Un patrón que abarca todo el repositorio choca con cualquiera.
         assert nucleo.patrones_solapan(".", "modulos/vigas.py")

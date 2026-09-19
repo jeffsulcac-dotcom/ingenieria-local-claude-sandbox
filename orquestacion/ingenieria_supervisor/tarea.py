@@ -10,6 +10,20 @@ tarea. No depende del historial de ninguna conversación.
 
 La escritura es atómica: temporal -> validación -> reemplazo.
 Un corte de energía no puede dejar una ficha JSON corrupta.
+
+Autoridad desde A2
+------------------
+El JSON es la DEFINICIÓN versionada de la tarea: id, título, objetivo,
+criterios, ámbito, pruebas requeridas y decisiones humanas declaradas
+(clave y descripción).
+
+El ESTADO OPERATIVO (estado, rama, worktree, intentos, trabajador, latido,
+fallas, resolución de decisiones, ejecuciones e historial) lo gobierna la
+base SQLite global (ver `estado_global.py`). Los campos operativos que siguen
+presentes en el JSON son un ESPEJO derivado: se regeneran a partir de SQLite
+después de cada operación, por compatibilidad con el Supervisor V1 y para
+que el commit automático de la ficha siga dejando rastro en Git. Nunca son
+entrada: al cargar una tarea, SQLite se superpone a lo que diga el JSON.
 """
 
 from __future__ import annotations
@@ -149,6 +163,10 @@ class Ficha:
     ejecuciones: list[dict] = field(default_factory=list)
     historial: list[dict] = field(default_factory=list)
 
+    # Eventos registrados en memoria y todavía no confirmados en SQLite.
+    # No forman parte del JSON: `persistir()` los inserta y los vacía.
+    eventos_pendientes: list[dict] = field(default_factory=list, repr=False)
+
     # ------------------------------------------------------------------
     # Decisiones humanas
     # ------------------------------------------------------------------
@@ -175,6 +193,7 @@ class Ficha:
     def registrar_evento(self, evento: dict) -> None:
         self.historial.append(evento)
         del self.historial[:-MAXIMO_HISTORIAL]
+        self.eventos_pendientes.append(evento)
 
     # ------------------------------------------------------------------
     # Serialización

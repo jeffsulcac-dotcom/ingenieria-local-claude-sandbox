@@ -15,6 +15,15 @@ Reglas duras que este módulo hace cumplir:
 4. Los commits automáticos se limitan a la ficha de la propia tarea,
    dentro de la rama de la tarea, y jamás en la rama principal.
 
+5. Desde A2, el estado operativo se lee y se escribe en la base SQLite
+   global (`estado_global.py`). Toda operación que cambia estado persiste
+   primero en SQLite y sólo después regenera la ficha JSON como espejo.
+
+Lo que NO hace este módulo (reservado para A3/B): toma atómica concurrente
+de tareas, locks, latidos automáticos, detección avanzada de trabajadores
+huérfanos, verificación dentro del worktree de la tarea, lanzamiento de
+trabajadores.
+
 Este módulo no realiza cálculos de ingeniería.
 """
 
@@ -22,6 +31,7 @@ from __future__ import annotations
 
 import os
 import socket
+import sqlite3
 import subprocess
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
@@ -30,14 +40,16 @@ from uuid import uuid4
 
 from ingenieria_nucleo.estados import Estado
 
+from . import estado_global as global_
 from . import pruebas as corredor
 from .tarea import (
+    FORMATO_ID,
+    ErrorFicha,
     Ficha,
     ahora_utc,
     existe,
     guardar,
     leer,
-    listar,
     listar_con_errores,
     ruta_relativa_ficha,
     temporales_huerfanos,
@@ -327,24 +339,58 @@ def conflictos_de_ambito(
     ficha: Ficha,
     estados_activos: frozenset = ESTADOS_QUE_RETIENEN_AMBITO,
 ) -> list[dict]:
-    """Conflictos de esta ficha contra todas las tareas que retienen ámbito."""
+    """
+    Conflictos de esta ficha contra todas las tareas que retienen ámbito.
+
+    Se enumera desde SQLite (estado y ámbito registrados), no desde los JSON
+    del árbol actual: así una tarea cuya ficha sólo existe en la rama de
+    otro worktree sigue contando para la regla de un solo escritor.
+
+    Una ficha ilegible que la base todavía no conoce interrumpe, igual que
+    en V1: sin conocer su ámbito no se puede garantizar nada.
+
+    La comprobación NO es atómica respecto de otros procesos: la toma
+    concurrente con locks pertenece a A3/B.
+    """
     conflictos = []
 
-    for otra in listar(raiz):
-        if otra.id == ficha.id:
+    fichas, errores = listar_con_errores(raiz)
+
+    with global_.conexion(raiz) as con:
+        global_.sincronizar_lista(con, fichas)
+        filas = global_.listar_tareas(con)
+
+    registradas = {fila["id"] for fila in filas}
+
+    desconocidas = [
+        error for error in errores
+        if FORMATO_ID.match(Path(error["archivo"]).stem)
+        and Path(error["archivo"]).stem not in registradas
+    ]
+
+    if desconocidas:
+        raise ErrorSupervisor(
+            "Hay fichas ilegibles que el estado global no conoce; sin su "
+            "ámbito no se puede garantizar un solo escritor: "
+            + ", ".join(error["archivo"] for error in desconocidas)
+            + "."
+        )
+
+    for fila in filas:
+        if fila["id"] == ficha.id:
             continue
 
-        if otra.estado not in estados_activos:
+        if fila["estado"] not in {str(estado) for estado in estados_activos}:
             continue
 
-        pares = solapamientos(ficha.ambito_archivos, otra.ambito_archivos)
+        pares = solapamientos(ficha.ambito_archivos, fila["ambito_archivos"])
 
         if pares:
             conflictos.append(
                 {
-                    "tarea": otra.id,
-                    "titulo": otra.titulo,
-                    "estado": str(otra.estado),
+                    "tarea": fila["id"],
+                    "titulo": fila["titulo"],
+                    "estado": fila["estado"],
                     "pares": [
                         {"propio": uno, "ajeno": dos} for uno, dos in pares
                     ],
@@ -398,12 +444,105 @@ def transicionar(
     ficha.registrar_evento(
         {
             "fecha": ahora_utc(),
+            "tipo": global_.EVENTO_TRANSICION,
             "estado_anterior": str(anterior),
             "estado_nuevo": str(destino),
             "motivo": motivo,
             "origen": origen,
         }
     )
+
+    return ficha
+
+
+# ----------------------------------------------------------------------
+# Carga y persistencia: SQLite manda, el JSON refleja
+# ----------------------------------------------------------------------
+
+# Columnas de `tareas` que una operación del ciclo puede modificar.
+# Las de definición (titulo, definicion_*) sólo las toca la sincronización.
+COLUMNAS_OPERATIVAS = (
+    "estado",
+    "rama",
+    "worktree",
+    "intentos",
+    "max_intentos",
+    "trabajador_id",
+    "pid",
+    "iniciado_en",
+    "ultimo_latido",
+    "actualizado_en",
+    "ultima_falla",
+    "requiere_decision_humana",
+    "decisiones",
+    "ejecuciones",
+    "ultima_verificacion",
+    "commit_inicial",
+)
+
+
+def cargar(raiz: Path, identificador: str) -> Ficha:
+    """
+    Tarea completa: definición desde el JSON, estado operativo desde SQLite.
+
+    Si la tarea todavía no está en la base global se incorpora en ese
+    momento (misma sincronización idempotente del bootstrap). Después,
+    el estado de SQLite se superpone a cualquier valor operativo del JSON.
+    """
+    ficha = leer(raiz, identificador)
+
+    with global_.conexion(raiz) as con:
+        global_.asegurar_ficha(con, ficha)
+        fila = global_.obtener_tarea(con, ficha.id)
+
+    global_.aplicar_fila(ficha, fila)
+    ficha.eventos_pendientes.clear()
+
+    return ficha
+
+
+def persistir(raiz: Path, ficha: Ficha) -> Ficha:
+    """
+    Confirma el estado operativo de la ficha.
+
+    1. Se valida el contrato de la ficha antes de tocar nada.
+    2. Transacción SQLite: columnas operativas + eventos pendientes. COMMIT.
+    3. Sólo entonces se regenera el JSON como espejo, con la misma marca de
+       actualización, mediante la escritura atómica ya existente.
+
+    Si el espejo no se pudiera escribir, el estado global ya quedó
+    confirmado y la siguiente persistencia lo regenera: nunca hay dos
+    escrituras contradictorias, porque el JSON siempre sale de SQLite.
+    """
+    Ficha.desde_dict(ficha.a_dict())
+
+    ficha.actualizado_en = ahora_utc()
+
+    if not ficha.creado_en:
+        ficha.creado_en = ficha.actualizado_en
+
+    fila = global_.fila_desde_ficha(ficha, ficha.actualizado_en)
+    campos = {columna: fila[columna] for columna in COLUMNAS_OPERATIVAS}
+    eventos = list(ficha.eventos_pendientes)
+
+    with global_.conexion(raiz) as con:
+        with global_.transaccion(con):
+            global_.actualizar_tarea(con, ficha.id, campos)
+
+            for evento in eventos:
+                global_.insertar_evento(con, ficha.id, evento)
+
+    ficha.eventos_pendientes.clear()
+
+    try:
+        guardar(raiz, ficha, marcar_actualizacion=False)
+    except (ErrorFicha, OSError) as error:
+        raise ErrorSupervisor(
+            "El estado global de '" + ficha.id + "' quedó confirmado en "
+            "SQLite (" + str(ficha.estado) + "), pero no se pudo regenerar "
+            "el espejo JSON: " + str(error) + ". La siguiente operación lo "
+            "regenerará; no se registró ningún commit."
+        ) from error
 
     return ficha
 
@@ -592,6 +731,7 @@ def crear(
     ficha.registrar_evento(
         {
             "fecha": ahora_utc(),
+            "tipo": global_.EVENTO_CREACION,
             "estado_anterior": None,
             "estado_nuevo": str(Estado.NUEVO),
             "motivo": "Ficha creada.",
@@ -599,7 +739,22 @@ def crear(
         }
     )
 
-    guardar(raiz, ficha)
+    # La definición es el contrato: primero el JSON versionable, después su
+    # incorporación al estado global (misma vía que el bootstrap).
+    with global_.conexion(raiz) as con:
+        if global_.obtener_tarea(con, identificador) is not None:
+            raise ErrorSupervisor(
+                "La tarea '" + identificador + "' ya existe en el estado "
+                "global aunque su ficha JSON no esté: no se puede volver a "
+                "crear con el mismo identificador."
+            )
+
+        guardar(raiz, ficha)
+
+        with global_.transaccion(con):
+            global_.importar_ficha(con, ficha, evento_importacion=False)
+
+    ficha.eventos_pendientes.clear()
 
     return ficha
 
@@ -637,8 +792,11 @@ def tomar(
 
     Aquí se aplica la regla de un solo escritor: si otra tarea activa declara
     un ámbito que se solapa, la toma se rechaza.
+
+    A2: la comprobación y la escritura no son atómicas entre procesos.
+    La toma atómica concurrente con locks pertenece a A3/B.
     """
-    ficha = leer(raiz, identificador)
+    ficha = cargar(raiz, identificador)
 
     if ficha.estado not in ESTADOS_TOMABLES:
         raise ErrorSupervisor(
@@ -705,7 +863,7 @@ def tomar(
         ORIGEN_AUTOMATICO,
     )
 
-    guardar(raiz, ficha)
+    persistir(raiz, ficha)
 
     _registrar_en_git(git, ficha, "Tarea tomada.")
 
@@ -717,8 +875,12 @@ def latido(
     identificador: str,
     ahora: datetime | None = None,
 ) -> Ficha:
-    """Señal de vida del trabajador que sostiene la tarea."""
-    ficha = leer(raiz, identificador)
+    """
+    Señal de vida del trabajador que sostiene la tarea.
+
+    Es una orden manual. Los latidos automáticos pertenecen a A3/B.
+    """
+    ficha = cargar(raiz, identificador)
 
     if ficha.estado != Estado.EN_EJECUCION:
         raise ErrorSupervisor(
@@ -729,7 +891,7 @@ def latido(
         ahora or ahora_datetime()
     ).isoformat(timespec="seconds")
 
-    guardar(raiz, ficha)
+    persistir(raiz, ficha)
 
     return ficha
 
@@ -741,7 +903,7 @@ def devolver(
     git=None,
 ) -> Ficha:
     """El trabajador suelta la tarea sin haberla terminado."""
-    ficha = leer(raiz, identificador)
+    ficha = cargar(raiz, identificador)
 
     if ficha.estado != Estado.EN_EJECUCION:
         raise ErrorSupervisor(
@@ -752,7 +914,7 @@ def devolver(
 
     transicionar(ficha, Estado.REABIERTO, motivo, ORIGEN_AUTOMATICO)
 
-    guardar(raiz, ficha)
+    persistir(raiz, ficha)
 
     _registrar_en_git(git, ficha, motivo)
 
@@ -783,8 +945,11 @@ def verificar(
             ->  REQUIERE_REVISION, o BLOQUEADO al agotar los intentos
     Ámbar:  pruebas verdes pero con decisión humana pendiente
             ->  REQUIERE_REVISION, sin consumir un intento
+
+    A2: las pruebas se ejecutan sobre `raiz`, no sobre el worktree de la
+    tarea. La verificación consciente del worktree pertenece a A3/B.
     """
-    ficha = leer(raiz, identificador)
+    ficha = cargar(raiz, identificador)
 
     if ficha.estado != Estado.EN_EJECUCION:
         raise ErrorSupervisor(
@@ -818,6 +983,24 @@ def verificar(
 
     corrida["problemas"] = list(problemas)
     ficha.registrar_ejecucion(corrida)
+
+    ficha.registrar_evento(
+        {
+            "fecha": corrida["fecha"],
+            "tipo": global_.EVENTO_VERIFICACION,
+            "estado_anterior": str(ficha.estado),
+            "estado_nuevo": str(ficha.estado),
+            "motivo": "Verificación: "
+            + str(corrida["resultado"])
+            + " ("
+            + str(corrida["ok"])
+            + " de "
+            + str(corrida["total"])
+            + " pruebas en OK).",
+            "origen": ORIGEN_AUTOMATICO,
+            "datos": global_.resumen_de_corrida(corrida),
+        }
+    )
 
     if problemas:
         ficha.intentos = ficha.intentos + 1
@@ -881,7 +1064,7 @@ def verificar(
 
     transicionar(ficha, destino, motivo, ORIGEN_AUTOMATICO)
 
-    guardar(raiz, ficha)
+    persistir(raiz, ficha)
 
     registro = _registrar_en_git(git, ficha, motivo)
 
@@ -905,9 +1088,12 @@ def decidir(
     """
     Resuelve explícitamente una decisión humana pendiente.
 
+    La definición de la decisión (clave, descripción) vive en el JSON; su
+    resolución (resuelta, resolución, fecha, origen) queda en SQLite.
+
     No genera commit automático: no es una transición de estado.
     """
-    ficha = leer(raiz, identificador)
+    ficha = cargar(raiz, identificador)
 
     encontrada = None
 
@@ -931,22 +1117,26 @@ def decidir(
     encontrada["resuelta"] = True
     encontrada["resolucion"] = resolucion
     encontrada["resuelta_en"] = ahora_utc()
+    encontrada["origen"] = ORIGEN_HUMANO
 
     # Resolver una decisión no es una transición de estado, y el commit
-    # automático está reservado a las transiciones. La ficha queda escrita
-    # en disco y su versionado corresponde al humano que decidió.
+    # automático está reservado a las transiciones. La resolución queda en
+    # SQLite; el espejo JSON queda escrito en disco y su versionado
+    # corresponde al humano que decidió.
 
     ficha.registrar_evento(
         {
             "fecha": ahora_utc(),
+            "tipo": global_.EVENTO_DECISION,
             "estado_anterior": str(ficha.estado),
             "estado_nuevo": str(ficha.estado),
             "motivo": "Decisión humana '" + str(clave) + "' resuelta.",
             "origen": ORIGEN_HUMANO,
+            "datos": {"clave": str(clave), "resolucion": resolucion},
         }
     )
 
-    guardar(raiz, ficha)
+    persistir(raiz, ficha)
 
     return ficha
 
@@ -958,7 +1148,7 @@ def aprobar(
     git=None,
 ) -> Ficha:
     """Aprobación humana. El Supervisor nunca puede ejecutar esto solo."""
-    ficha = leer(raiz, identificador)
+    ficha = cargar(raiz, identificador)
 
     if ficha.estado != Estado.PROPUESTO:
         raise ErrorSupervisor(
@@ -984,7 +1174,7 @@ def aprobar(
         ORIGEN_HUMANO,
     )
 
-    guardar(raiz, ficha)
+    persistir(raiz, ficha)
 
     _registrar_en_git(git, ficha, "Aprobación humana.")
 
@@ -1001,13 +1191,13 @@ def rechazar(
     if not (motivo or "").strip():
         raise ErrorSupervisor("El rechazo exige un motivo.")
 
-    ficha = leer(raiz, identificador)
+    ficha = cargar(raiz, identificador)
 
     _liberar_trabajador(ficha)
 
     transicionar(ficha, Estado.RECHAZADO, motivo, ORIGEN_HUMANO)
 
-    guardar(raiz, ficha)
+    persistir(raiz, ficha)
 
     _registrar_en_git(git, ficha, motivo)
 
@@ -1027,7 +1217,7 @@ def reabrir(
     no se reiniciara, una tarea desbloqueada a mano volvería a bloquearse
     en la siguiente verificación.
     """
-    ficha = leer(raiz, identificador)
+    ficha = cargar(raiz, identificador)
 
     _liberar_trabajador(ficha)
 
@@ -1035,7 +1225,7 @@ def reabrir(
 
     transicionar(ficha, Estado.REABIERTO, motivo, ORIGEN_HUMANO)
 
-    guardar(raiz, ficha)
+    persistir(raiz, ficha)
 
     _registrar_en_git(git, ficha, motivo)
 
@@ -1053,13 +1243,13 @@ def bloquear(
     if not (motivo or "").strip():
         raise ErrorSupervisor("El bloqueo exige un motivo.")
 
-    ficha = leer(raiz, identificador)
+    ficha = cargar(raiz, identificador)
 
     _liberar_trabajador(ficha)
 
     transicionar(ficha, Estado.BLOQUEADO, motivo, origen)
 
-    guardar(raiz, ficha)
+    persistir(raiz, ficha)
 
     _registrar_en_git(git, ficha, motivo)
 
@@ -1173,6 +1363,10 @@ def reanudar(
 
     Ninguna tarea se pierde: las ejecuciones interrumpidas se registran como
     tales, conservando el historial, y la tarea vuelve a REABIERTO.
+
+    A2: es una orden manual que juzga por PID y por el latido registrado.
+    La detección avanzada de trabajadores huérfanos y los latidos
+    automáticos pertenecen a A3/B.
     """
     ahora = ahora or ahora_datetime()
 
@@ -1182,6 +1376,7 @@ def reanudar(
         "activas": [],
         "huerfanas": [],
         "inconsistentes": [],
+        "sin_definicion": [],
         "temporales_eliminados": [],
         "fichas_ilegibles": [],
     }
@@ -1193,15 +1388,43 @@ def reanudar(
         except OSError:
             pass
 
+    # Las tareas en ejecución se enumeran desde SQLite (autoridad). Para
+    # recuperar una hace falta además su definición JSON en este árbol:
+    # sin ella no se puede regenerar el espejo ni conocer su contrato, así
+    # que se informa sin tocarla.
     fichas, errores = listar_con_errores(raiz)
+    definiciones = {ficha.id: ficha for ficha in fichas}
 
     informe["fichas_ilegibles"] = errores
 
-    for ficha in fichas:
-        if ficha.estado != Estado.EN_EJECUCION:
+    with global_.conexion(raiz) as con:
+        global_.sincronizar_lista(con, fichas)
+        filas = global_.listar_tareas(con)
+
+    for fila in filas:
+        if fila["estado"] != str(Estado.EN_EJECUCION):
             continue
 
         informe["revisadas"] = informe["revisadas"] + 1
+
+        ficha = definiciones.get(fila["id"])
+
+        if ficha is None:
+            informe["sin_definicion"].append(
+                {
+                    "id": fila["id"],
+                    "titulo": fila["titulo"],
+                    "trabajador_id": fila["trabajador_id"],
+                    "pid": fila["pid"],
+                    "motivo": "En ejecución según el estado global, pero su "
+                    "ficha JSON no está en este árbol de trabajo ("
+                    + str(fila["definicion_ruta"]) + "). No se modifica.",
+                }
+            )
+            continue
+
+        global_.aplicar_fila(ficha, fila)
+        ficha.eventos_pendientes.clear()
 
         clase, motivo = clasificar_ejecucion(
             ficha, ahora, comprobar_proceso, latido_maximo_s, latido_gracia_s
@@ -1240,6 +1463,24 @@ def reanudar(
             "problemas": ["Ejecución interrumpida: " + motivo],
         }
 
+        ficha.registrar_evento(
+            {
+                "fecha": informe["fecha"],
+                "tipo": global_.EVENTO_RECUPERACION,
+                "estado_anterior": str(ficha.estado),
+                "estado_nuevo": str(ficha.estado),
+                "motivo": "Ejecución " + clase.lower() + ": " + motivo,
+                "origen": ORIGEN_AUTOMATICO,
+                "datos": {
+                    "clase": clase,
+                    "trabajador_id": ficha.trabajador_id,
+                    "pid": ficha.pid,
+                    "iniciado_en": ficha.iniciado_en,
+                    "ultimo_latido": ficha.ultimo_latido,
+                },
+            }
+        )
+
         _liberar_trabajador(ficha)
 
         transicionar(
@@ -1249,7 +1490,7 @@ def reanudar(
             ORIGEN_AUTOMATICO,
         )
 
-        guardar(raiz, ficha)
+        persistir(raiz, ficha)
 
         _registrar_en_git(git, ficha, "Recuperación tras interrupción.")
 
@@ -1272,43 +1513,78 @@ def reanudar(
 
 
 # ----------------------------------------------------------------------
-# Lectura para la interfaz
+# Lectura para la interfaz: SQLite global como única fuente operativa
 # ----------------------------------------------------------------------
 
-def _ultima_corrida(ficha: Ficha) -> dict | None:
-    for ejecucion in reversed(ficha.ejecuciones):
-        if ejecucion.get("tipo") == "corrida":
-            return ejecucion
+def resumen_de_tarea(fila: dict, definicion: Ficha | None) -> dict:
+    """
+    Vista compacta de una tarea para el tablero.
 
-    return None
+    `fila` es la autoridad (SQLite). `definicion` es la ficha JSON legible,
+    o None si el archivo falta o está corrupto: la tarea se muestra igual,
+    con su estado real, y se indica que la definición no es legible.
+    """
+    declaradas = definicion.requiere_decision_humana if definicion else []
 
+    if definicion is not None:
+        decisiones = global_.fusionar_decisiones(
+            declaradas, fila.get("decisiones") or []
+        )
+    else:
+        decisiones = [
+            dict(operativa, descripcion="(definición JSON no legible)")
+            for operativa in fila.get("decisiones") or []
+        ]
 
-def resumen_de_ficha(ficha: Ficha) -> dict:
-    """Vista compacta de una ficha, pensada para el tablero."""
-    corrida = _ultima_corrida(ficha)
+    pendientes = [una for una in decisiones if not una.get("resuelta")]
+
+    verificacion = fila.get("ultima_verificacion")
 
     return {
-        "id": ficha.id,
-        "titulo": ficha.titulo,
-        "objetivo": ficha.objetivo,
-        "estado": str(ficha.estado),
-        "rama": ficha.rama,
-        "worktree": ficha.worktree,
-        "intentos": ficha.intentos,
-        "max_intentos": ficha.max_intentos,
-        "pruebas_ok": corrida.get("ok", 0) if corrida else 0,
-        "pruebas_total": corrida.get("total", 0) if corrida else 0,
-        "pruebas_requeridas": list(ficha.pruebas_requeridas),
-        "ambito_archivos": list(ficha.ambito_archivos),
-        "actualizado_en": ficha.actualizado_en,
-        "creado_en": ficha.creado_en,
-        "ultima_falla": ficha.ultima_falla,
-        "decisiones_pendientes": ficha.decisiones_pendientes(),
-        "decisiones_totales": len(ficha.requiere_decision_humana),
-        "trabajador_id": ficha.trabajador_id,
-        "pid": ficha.pid,
-        "iniciado_en": ficha.iniciado_en,
-        "ultimo_latido": ficha.ultimo_latido,
+        "id": fila["id"],
+        "titulo": fila["titulo"],
+        "objetivo": definicion.objetivo if definicion else "",
+        "estado": fila["estado"],
+        "rama": fila.get("rama"),
+        "worktree": fila.get("worktree"),
+        "intentos": fila.get("intentos", 0),
+        "max_intentos": fila.get("max_intentos", 0),
+        "pruebas_ok": verificacion.get("ok", 0) if verificacion else 0,
+        "pruebas_total": verificacion.get("total", 0) if verificacion else 0,
+        "pruebas_requeridas": (
+            list(definicion.pruebas_requeridas) if definicion else []
+        ),
+        "ambito_archivos": list(fila.get("ambito_archivos") or []),
+        "actualizado_en": fila.get("actualizado_en"),
+        "creado_en": fila.get("creado_en"),
+        "ultima_falla": fila.get("ultima_falla"),
+        "decisiones_pendientes": pendientes,
+        "decisiones_totales": len(decisiones),
+        "requiere_decision_humana": bool(pendientes),
+        "trabajador_id": fila.get("trabajador_id"),
+        "pid": fila.get("pid"),
+        "iniciado_en": fila.get("iniciado_en"),
+        "ultimo_latido": fila.get("ultimo_latido"),
+        "ultima_verificacion": verificacion,
+        "commit_inicial": fila.get("commit_inicial"),
+        "definicion_ruta": fila.get("definicion_ruta"),
+        "definicion_legible": definicion is not None,
+    }
+
+
+def _resumen_vacio() -> dict:
+    return {
+        "agentes_activos": 0,
+        "totales": 0,
+        "nuevas": 0,
+        "en_ejecucion": 0,
+        "propuestas": 0,
+        "requieren_revision": 0,
+        "bloqueadas": 0,
+        "reabiertas": 0,
+        "aprobadas": 0,
+        "rechazadas": 0,
+        "ultima_actividad": None,
     }
 
 
@@ -1316,11 +1592,73 @@ def tablero(raiz: Path, maximo_actividad: int = 20) -> dict:
     """
     Estado completo del Supervisor para la interfaz de sólo lectura.
 
-    Nunca lanza excepción por una ficha corrupta: la reporta.
-    """
-    fichas, errores = listar_con_errores(raiz)
+    Todo el estado operativo proviene de la base SQLite global. Antes de
+    leer se sincronizan las definiciones JSON legibles (idempotente), de
+    modo que una ficha recién añadida aparece sin pasos manuales.
 
-    tareas = [resumen_de_ficha(ficha) for ficha in fichas]
+    Nunca lanza excepción: una ficha corrupta se reporta, y si la base
+    global no está disponible el tablero lo dice (estado ERROR) en lugar de
+    inventar datos a partir de los JSON.
+    """
+    raiz = Path(raiz)
+
+    fichas, errores = listar_con_errores(raiz)
+    definiciones = {ficha.id: ficha for ficha in fichas}
+
+    base = {
+        "estado": "ERROR",
+        "ruta": None,
+        "ubicacion_resumida": None,
+        "git_common_dir": None,
+        "version_esquema": None,
+        "journal_mode": None,
+        "detalle": None,
+    }
+
+    filas: list[dict] = []
+    eventos: list[dict] = []
+    ultima_actividad = None
+
+    try:
+        ruta = global_.ruta_base(raiz)
+
+        base["ruta"] = str(ruta)
+        base["ubicacion_resumida"] = global_.ubicacion_resumida(ruta)
+        base["git_common_dir"] = str(ruta.parent)
+
+        with global_.conexion(raiz) as con:
+            # Camino de sólo lectura: incorpora tareas ausentes, no
+            # refresca definiciones (ver sincronizar_lista).
+            global_.sincronizar_lista(con, fichas, solo_importar=True)
+
+            base["version_esquema"] = global_.version_esquema(con)
+            base["journal_mode"] = con.execute(
+                "PRAGMA journal_mode"
+            ).fetchone()[0]
+
+            filas = global_.listar_tareas(con)
+            eventos = global_.listar_eventos(con, maximo=maximo_actividad)
+
+            ultima_actualizacion = global_.ultima_actualizacion(con)
+            ultimo_evento = eventos[0]["fecha"] if eventos else None
+
+            candidatos = [
+                valor for valor in (ultima_actualizacion, ultimo_evento)
+                if valor
+            ]
+            ultima_actividad = max(candidatos) if candidatos else None
+
+        base["estado"] = "ACTIVA"
+        base["detalle"] = "Base global operativa."
+
+    except (global_.ErrorEstadoGlobal, sqlite3.Error, OSError) as error:
+        base["estado"] = "ERROR"
+        base["detalle"] = str(error)
+
+    tareas = [
+        resumen_de_tarea(fila, definiciones.get(fila["id"]))
+        for fila in filas
+    ]
 
     def contar(estado: Estado) -> int:
         return sum(1 for una in tareas if una["estado"] == str(estado))
@@ -1331,47 +1669,45 @@ def tablero(raiz: Path, maximo_actividad: int = 20) -> dict:
         if una["estado"] == str(Estado.EN_EJECUCION) and una["trabajador_id"]
     }
 
-    # Varios eventos pueden compartir el mismo segundo. El orden dentro de
-    # la ficha desempata, para que lo más reciente aparezca siempre arriba.
-    ordenados = []
+    actividad = [
+        {
+            "fecha": evento.get("fecha"),
+            "tarea": evento.get("tarea_id"),
+            "titulo": evento.get("titulo"),
+            "tipo": evento.get("tipo"),
+            "estado_anterior": evento.get("estado_anterior"),
+            "estado_nuevo": evento.get("estado_nuevo"),
+            "motivo": evento.get("motivo"),
+            "origen": evento.get("origen"),
+            "datos": evento.get("datos"),
+        }
+        for evento in eventos
+    ]
 
-    for ficha in fichas:
-        for posicion, evento in enumerate(ficha.historial):
-            ordenados.append(
-                (
-                    evento.get("fecha") or "",
-                    posicion,
-                    {
-                        "fecha": evento.get("fecha"),
-                        "tarea": ficha.id,
-                        "titulo": ficha.titulo,
-                        "estado_anterior": evento.get("estado_anterior"),
-                        "estado_nuevo": evento.get("estado_nuevo"),
-                        "motivo": evento.get("motivo"),
-                        "origen": evento.get("origen"),
-                    },
-                )
-            )
+    resumen = _resumen_vacio()
 
-    ordenados.sort(key=lambda uno: (uno[0], uno[1]), reverse=True)
-
-    actividad = [uno[2] for uno in ordenados]
+    if base["estado"] == "ACTIVA":
+        resumen.update(
+            {
+                "agentes_activos": len(agentes),
+                "totales": len(tareas),
+                "nuevas": contar(Estado.NUEVO),
+                "en_ejecucion": contar(Estado.EN_EJECUCION),
+                "propuestas": contar(Estado.PROPUESTO),
+                "requieren_revision": contar(Estado.REQUIERE_REVISION),
+                "bloqueadas": contar(Estado.BLOQUEADO),
+                "reabiertas": contar(Estado.REABIERTO),
+                "aprobadas": contar(Estado.APROBADO),
+                "rechazadas": contar(Estado.RECHAZADO),
+                "ultima_actividad": ultima_actividad,
+            }
+        )
 
     return {
         "generado_en": ahora_utc(),
-        "resumen": {
-            "agentes_activos": len(agentes),
-            "totales": len(tareas),
-            "nuevas": contar(Estado.NUEVO),
-            "en_ejecucion": contar(Estado.EN_EJECUCION),
-            "propuestas": contar(Estado.PROPUESTO),
-            "requieren_revision": contar(Estado.REQUIERE_REVISION),
-            "bloqueadas": contar(Estado.BLOQUEADO),
-            "reabiertas": contar(Estado.REABIERTO),
-            "aprobadas": contar(Estado.APROBADO),
-            "rechazadas": contar(Estado.RECHAZADO),
-        },
+        "base_global": base,
+        "resumen": resumen,
         "tareas": tareas,
-        "actividad": actividad[:maximo_actividad],
+        "actividad": actividad,
         "fichas_ilegibles": errores,
     }

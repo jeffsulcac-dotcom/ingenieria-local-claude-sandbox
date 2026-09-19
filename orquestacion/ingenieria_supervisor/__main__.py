@@ -6,10 +6,16 @@ Toda la experiencia visible está en español.
 Uso desde la raíz del repositorio:
 
     python -m orquestacion.ingenieria_supervisor estado
+    python -m orquestacion.ingenieria_supervisor diagnostico
+    python -m orquestacion.ingenieria_supervisor inicializar-estado
+    python -m orquestacion.ingenieria_supervisor sincronizar-definiciones
     python -m orquestacion.ingenieria_supervisor verificar T-0001
     python -m orquestacion.ingenieria_supervisor reanudar
     python -m orquestacion.ingenieria_supervisor aprobar T-0001
     python -m orquestacion.ingenieria_supervisor rechazar T-0001 --motivo "..."
+
+Desde A2 las órdenes de consulta leen la base SQLite global del
+repositorio; las órdenes que cambian estado escriben en ella.
 
 Esta misma CLI es la que podrá invocar n8n más adelante. La lógica vive en
 Python local: si n8n desaparece, el Supervisor sigue funcionando.
@@ -25,9 +31,10 @@ from pathlib import Path
 from ingenieria_nucleo.estados import Estado
 
 from . import RAIZ
+from . import estado_global as global_
 from . import pruebas as corredor
 from . import supervisor as nucleo
-from .tarea import ErrorFicha, leer
+from .tarea import ErrorFicha
 
 
 ANCHO = 74
@@ -64,9 +71,21 @@ def _linea(etiqueta: str, valor) -> None:
 def mostrar_tablero(raiz: Path) -> int:
     datos = nucleo.tablero(raiz)
     resumen = datos["resumen"]
+    base = datos["base_global"]
 
     _titulo("DESARROLLO — INGENIERÍA LOCAL")
 
+    _linea("Base global SQLite", base["estado"])
+    _linea("Ubicación", base["ubicacion_resumida"])
+    _linea("Versión de esquema", base["version_esquema"])
+    _linea("Última actividad global", resumen["ultima_actividad"])
+
+    if base["estado"] != "ACTIVA":
+        print("")
+        print("  La base global no está disponible: " + str(base["detalle"]))
+        print("")
+
+    print("")
     _linea("Agentes activos", resumen["agentes_activos"])
     _linea("Tareas totales", resumen["totales"])
     _linea("Nuevas", resumen["nuevas"])
@@ -103,6 +122,27 @@ def mostrar_tablero(raiz: Path) -> int:
         _linea("Trabajador", tarea["trabajador_id"])
         _linea("PID", tarea["pid"])
         _linea("Último latido", tarea["ultimo_latido"])
+
+        verificacion = tarea.get("ultima_verificacion")
+
+        _linea(
+            "Última verificación",
+            (
+                str(verificacion.get("fecha"))
+                + "  "
+                + str(verificacion.get("resultado"))
+                + "  ("
+                + str(verificacion.get("ok"))
+                + " de "
+                + str(verificacion.get("total"))
+                + ")"
+            )
+            if verificacion
+            else None,
+        )
+
+        if not tarea.get("definicion_legible", True):
+            _linea("Definición JSON", "NO LEGIBLE (" + str(tarea["definicion_ruta"]) + ")")
 
         pendientes = tarea["decisiones_pendientes"]
 
@@ -147,7 +187,9 @@ def mostrar_tablero(raiz: Path) -> int:
                 + str(evento.get("fecha"))
                 + "  "
                 + str(evento.get("tarea"))
-                + "  "
+                + "  ["
+                + str(evento.get("tipo"))
+                + "]  "
                 + anterior
                 + " -> "
                 + str(evento.get("estado_nuevo"))
@@ -159,8 +201,80 @@ def mostrar_tablero(raiz: Path) -> int:
     return 0
 
 
+def mostrar_diagnostico(raiz: Path) -> int:
+    informe = global_.diagnostico(raiz)
+
+    _titulo("DIAGNÓSTICO DE LA BASE GLOBAL SQLITE")
+
+    _linea("Raíz consultada", informe["raiz"])
+    _linea("Git common dir", informe["git_common_dir"])
+    _linea("Ruta real de SQLite", informe["ruta"])
+    _linea("Existe", "sí" if informe["existe"] else "no")
+    _linea("Tamaño (bytes)", informe["tamano_bytes"])
+    _linea("Estado de la base", informe["estado"])
+    _linea("Detalle", informe["detalle"])
+    _linea(
+        "Versión de esquema",
+        str(informe["version_esquema"])
+        + " (esperada "
+        + str(informe["version_esperada"])
+        + ")",
+    )
+    _linea("journal_mode", informe["journal_mode"])
+    _linea("synchronous", informe["synchronous"])
+    _linea("busy_timeout (ms)", informe["busy_timeout_ms"])
+    _linea(
+        "foreign_keys",
+        None if informe["foreign_keys"] is None
+        else ("activas" if informe["foreign_keys"] else "inactivas"),
+    )
+    _linea("integrity_check", informe["integridad"])
+    _linea("Tareas registradas", informe["tareas"])
+    _linea("Eventos registrados", informe["eventos"])
+    _linea("Última actualización", informe["ultima_actualizacion"])
+
+    ultimo = informe["ultimo_evento"]
+
+    _linea(
+        "Último evento",
+        (
+            str(ultimo["fecha"])
+            + "  "
+            + str(ultimo["tarea"])
+            + "  ["
+            + str(ultimo["tipo"])
+            + "]  "
+            + str(ultimo["motivo"])
+        )
+        if ultimo
+        else None,
+    )
+
+    _linea("Definiciones JSON", informe["definiciones_json"])
+    _linea(
+        "Sin importar",
+        ", ".join(informe["sin_importar"]) if informe["sin_importar"] else "ninguna",
+    )
+    _linea(
+        "Definición desactualizada",
+        ", ".join(informe["desactualizadas"])
+        if informe["desactualizadas"]
+        else "ninguna",
+    )
+
+    if informe["fichas_ilegibles"]:
+        print("")
+        print("  FICHAS ILEGIBLES:")
+        for error in informe["fichas_ilegibles"]:
+            print("      · " + error["archivo"] + ": " + error["motivo"])
+
+    print("")
+
+    return 0 if informe["estado"] == "ACTIVA" else 1
+
+
 def mostrar_ficha(raiz: Path, identificador: str) -> int:
-    ficha = leer(raiz, identificador)
+    ficha = nucleo.cargar(raiz, identificador)
 
     _titulo(ficha.id + " — " + ficha.titulo)
 
@@ -260,6 +374,72 @@ def orden_estado(raiz: Path, argumentos) -> int:
 
 def orden_ver(raiz: Path, argumentos) -> int:
     return mostrar_ficha(raiz, argumentos.tarea)
+
+
+def orden_diagnostico(raiz: Path, argumentos) -> int:
+    if argumentos.json:
+        informe = global_.diagnostico(raiz)
+        print(json.dumps(informe, ensure_ascii=False, indent=2))
+        return 0 if informe["estado"] == "ACTIVA" else 1
+
+    return mostrar_diagnostico(raiz)
+
+
+def orden_inicializar_estado(raiz: Path, argumentos) -> int:
+    informe = global_.inicializar_base(raiz)
+
+    esquema = informe["esquema"]
+    sincronizacion = informe["sincronizacion"]
+
+    _titulo("INICIALIZACIÓN DEL ESTADO GLOBAL")
+
+    _linea("Ruta de SQLite", informe["ruta"])
+    _linea(
+        "Esquema",
+        "creado en versión " + str(esquema["version_actual"])
+        if esquema["version_anterior"] == 0
+        else (
+            "migrado de "
+            + str(esquema["version_anterior"])
+            + " a "
+            + str(esquema["version_actual"])
+            if esquema["aplicadas"]
+            else "ya estaba en versión " + str(esquema["version_actual"])
+        ),
+    )
+    _linea("Definiciones importadas", ", ".join(sincronizacion["importadas"]) or "ninguna")
+    _linea("Definiciones actualizadas", ", ".join(sincronizacion["actualizadas"]) or "ninguna")
+    _linea("Sin cambios", ", ".join(sincronizacion["sin_cambios"]) or "ninguna")
+
+    if sincronizacion["fichas_ilegibles"]:
+        print("")
+        print("  FICHAS ILEGIBLES:")
+        for error in sincronizacion["fichas_ilegibles"]:
+            print("      · " + error["archivo"] + ": " + error["motivo"])
+
+    print("")
+
+    return 0
+
+
+def orden_sincronizar_definiciones(raiz: Path, argumentos) -> int:
+    informe = global_.sincronizar_definiciones(raiz)
+
+    _titulo("SINCRONIZACIÓN DE DEFINICIONES")
+
+    _linea("Importadas", ", ".join(informe["importadas"]) or "ninguna")
+    _linea("Actualizadas", ", ".join(informe["actualizadas"]) or "ninguna")
+    _linea("Sin cambios", ", ".join(informe["sin_cambios"]) or "ninguna")
+
+    if informe["fichas_ilegibles"]:
+        print("")
+        print("  FICHAS ILEGIBLES:")
+        for error in informe["fichas_ilegibles"]:
+            print("      · " + error["archivo"] + ": " + error["motivo"])
+
+    print("")
+
+    return 0
 
 
 def orden_crear(raiz: Path, argumentos) -> int:
@@ -439,12 +619,14 @@ def orden_reanudar(raiz: Path, argumentos) -> int:
     _linea("Siguen activas", len(informe["activas"]))
     _linea("Huérfanas recuperadas", len(informe["huerfanas"]))
     _linea("Inconsistentes recuperadas", len(informe["inconsistentes"]))
+    _linea("Sin definición en este árbol", len(informe["sin_definicion"]))
     _linea("Temporales eliminados", len(informe["temporales_eliminados"]))
 
     for grupo, etiqueta in (
         ("activas", "ACTIVAS"),
         ("huerfanas", "HUÉRFANAS RECUPERADAS"),
         ("inconsistentes", "INCONSISTENTES RECUPERADAS"),
+        ("sin_definicion", "SIN DEFINICIÓN EN ESTE ÁRBOL (no modificadas)"),
     ):
         if informe[grupo]:
             print("")
@@ -525,6 +707,26 @@ def construir_analizador() -> argparse.ArgumentParser:
     ver = ordenes.add_parser("ver", help="Detalle de una tarea.")
     ver.add_argument("tarea")
     ver.set_defaults(funcion=orden_ver)
+
+    diagnostico = ordenes.add_parser(
+        "diagnostico", help="Diagnóstico de la base SQLite global."
+    )
+    diagnostico.add_argument(
+        "--json", action="store_true", help="Salida en formato JSON."
+    )
+    diagnostico.set_defaults(funcion=orden_diagnostico)
+
+    inicializar = ordenes.add_parser(
+        "inicializar-estado",
+        help="Crear la base SQLite global e importar las definiciones.",
+    )
+    inicializar.set_defaults(funcion=orden_inicializar_estado)
+
+    sincronizar = ordenes.add_parser(
+        "sincronizar-definiciones",
+        help="Importar o refrescar las fichas JSON en la base global.",
+    )
+    sincronizar.set_defaults(funcion=orden_sincronizar_definiciones)
 
     crear = ordenes.add_parser("crear", help="Crear una ficha de tarea.")
     crear.add_argument("tarea")
@@ -620,7 +822,11 @@ def principal(argumentos_crudos: list[str] | None = None) -> int:
 
     try:
         return argumentos.funcion(raiz, argumentos)
-    except (nucleo.ErrorSupervisor, ErrorFicha) as error:
+    except (
+        nucleo.ErrorSupervisor,
+        ErrorFicha,
+        global_.ErrorEstadoGlobal,
+    ) as error:
         print("")
         print("  ERROR: " + str(error))
         print("")
