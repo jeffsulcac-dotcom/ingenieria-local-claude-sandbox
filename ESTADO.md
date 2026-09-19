@@ -106,3 +106,24 @@ Prueba:
 
 Estado:
 INTERFAZ_BASE = APROBADA
+
+## Control principal del sistema
+
+Se implementó y verificó el comando central:
+
+- .\ingenieria.ps1 iniciar
+- .\ingenieria.ps1 estado
+- .\ingenieria.ps1 detener
+
+Pruebas realizadas:
+
+- inicio de PostgreSQL: OK
+- inicio de Redis: OK
+- inicio de n8n: OK
+- inicio de Ingeniería Local: OK
+- detección de estado: OK
+- apagado controlado: OK
+- reinicio completo: OK
+
+Estado:
+CONTROL_LOCAL = APROBADO
