@@ -528,6 +528,11 @@ CODIGO_TOMA_RECHAZADA = 3
 # veces: también lo usa argparse ante un error de uso.
 CODIGO_PROPIEDAD_INVALIDA = 4
 
+# Código propio de una creación que llega segunda (A3.3). Perder una carrera
+# de creación es un resultado NORMAL, igual que perder una toma: un guion
+# que crea tareas en lote necesita distinguir "ya existía" de una avería.
+CODIGO_YA_EXISTE = 5
+
 
 def orden_tomar(raiz: Path, argumentos) -> int:
     try:
@@ -920,6 +925,15 @@ def principal(argumentos_crudos: list[str] | None = None) -> int:
 
     try:
         return argumentos.funcion(raiz, argumentos)
+    except nucleo.ErrorCreacion as choque:
+        # Antes que el genérico, por el mismo motivo que ErrorPropiedad:
+        # hereda de ErrorSupervisor y si no se capturase aquí colapsaría en
+        # el código 2, indistinguible de una avería.
+        print("")
+        print("  NO CREADA: " + str(choque))
+        print("")
+
+        return CODIGO_YA_EXISTE
     except nucleo.ErrorPropiedad as rechazo:
         # Antes que el genérico: ErrorPropiedad hereda de ErrorSupervisor y
         # si no se capturase aquí colapsaría en el código 2, indistinguible

@@ -870,6 +870,16 @@ def _regenerar_espejo(raiz: Path, ficha: Ficha) -> None:
 # Git: commits automáticos estrictamente limitados
 # ----------------------------------------------------------------------
 
+class ErrorCreacion(ErrorSupervisor):
+    """
+    No se pudo crear la tarea porque ya existía.
+
+    Es un error propio y no genérico porque perder una carrera de creación
+    es un resultado NORMAL —igual que perder una toma—, no una avería: el
+    que llega segundo tiene que poder distinguirlo de un fallo del sistema.
+    """
+
+
 class ErrorWorktree(ErrorSupervisor):
     """
     La ruta registrada como worktree de una tarea no se puede usar.
@@ -1121,8 +1131,11 @@ def crear(
     """Crea una ficha nueva en estado NUEVO."""
     validar_id(identificador)
 
+    # Atajo amable, no la garantía: evita construir la ficha entera para
+    # nada en el caso normal. Quien decide de verdad es la comprobación de
+    # abajo, hecha con el bloqueo de escritura tomado.
     if existe(raiz, identificador):
-        raise ErrorSupervisor(
+        raise ErrorCreacion(
             "Ya existe la ficha '" + identificador + "'."
         )
 
@@ -1152,19 +1165,40 @@ def crear(
         }
     )
 
-    # La definición es el contrato: primero el JSON versionable, después su
-    # incorporación al estado global (misma vía que el bootstrap).
+    # Crear es un acto único: o lo hace uno o no lo hace nadie (A3.3).
+    #
+    # La comprobación de existencia, la escritura del JSON y el INSERT
+    # ocurren DENTRO de la misma transacción, y en ese orden. Antes la
+    # comprobación se hacía en autocommit y el JSON se escribía ANTES del
+    # INSERT, con lo que dos procesos que crearan la misma tarea a la vez
+    # pasaban los dos la comprobación, los dos escribían su JSON —el
+    # segundo pisando al primero— y sólo entonces la clave primaria
+    # rechazaba a uno. El perdedor se iba con un error, pero dejaba su
+    # definición escrita encima de la del ganador.
+    #
+    # Con BEGIN IMMEDIATE el segundo espera a que el primero confirme, y
+    # entonces ve la fila y se rechaza SIN escribir nada. Y si la escritura
+    # del JSON fallara, el ROLLBACK deja la base sin fila: no queda una
+    # tarea registrada cuya definición no existe.
     with global_.conexion(raiz) as con:
-        if global_.obtener_tarea(con, identificador) is not None:
-            raise ErrorSupervisor(
-                "La tarea '" + identificador + "' ya existe en el estado "
-                "global aunque su ficha JSON no esté: no se puede volver a "
-                "crear con el mismo identificador."
-            )
-
-        guardar(raiz, ficha)
-
         with global_.transaccion(con):
+            if global_.obtener_tarea(con, identificador) is not None:
+                raise ErrorCreacion(
+                    "La tarea '" + identificador + "' ya existe en el "
+                    "estado global: no se puede volver a crear con el "
+                    "mismo identificador."
+                )
+
+            # Se relee el árbol con el bloqueo tomado: entre la
+            # comprobación de arriba y este punto, otro proceso pudo haber
+            # creado la ficha y confirmado.
+            if existe(raiz, identificador):
+                raise ErrorCreacion(
+                    "Ya existe la ficha '" + identificador + "'."
+                )
+
+            guardar(raiz, ficha)
+
             global_.importar_ficha(con, ficha, evento_importacion=False)
 
     ficha.eventos_pendientes.clear()

@@ -725,6 +725,187 @@ def prueba_f_el_worktree_se_valida_al_tomar():
 
 
 # ----------------------------------------------------------------------
+# GRUPO 3 — Crear es un acto único
+# ----------------------------------------------------------------------
+
+def _creador(ruta_raiz: str, identificador: str, marca: str, barrera) -> dict:
+    """
+    Un proceso que intenta crear la tarea a la vez que los demás.
+
+    Cada uno escribe un TÍTULO distinto, para que al final se pueda saber
+    de quién es la definición que quedó. Si dos escribieran lo mismo, una
+    sobrescritura pasaría inadvertida.
+    """
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    for sufijo in ("orquestacion", "nucleo"):
+        destino = str(_Path(__file__).resolve().parents[2] / sufijo)
+        if destino not in _sys.path:
+            _sys.path.insert(0, destino)
+
+    from ingenieria_supervisor import supervisor as _nucleo
+
+    raiz = _Path(ruta_raiz)
+
+    try:
+        barrera.wait(timeout=ESPERA_BARRERA_S)
+    except Exception as error:
+        return {"clase": "barrera", "marca": marca, "detalle": str(error)}
+
+    try:
+        _nucleo.crear(
+            raiz,
+            identificador,
+            titulo="Creada por " + marca,
+            ambito_archivos=["modulos/" + marca + ".py"],
+            pruebas_requeridas=["pruebas/demostracion/prueba_verde.py"],
+        )
+
+        return {"clase": "creada", "marca": marca, "detalle": None}
+    except _nucleo.ErrorCreacion as choque:
+        return {"clase": "rechazada", "marca": marca, "detalle": str(choque)}
+    except sqlite3.Error as error:
+        return {"clase": "sqlite", "marca": marca, "detalle": str(error)}
+    except Exception as error:
+        return {
+            "clase": "inesperada",
+            "marca": marca,
+            "detalle": type(error).__name__ + ": " + str(error),
+        }
+
+
+def prueba_g_crear_concurrente_tiene_un_solo_ganador(creadores: int):
+    """
+    Varios procesos creando la misma tarea a la vez: crea exactamente uno.
+
+    La carrera era real y de las feas. La comprobación de existencia se
+    hacía en autocommit y el JSON se escribía ANTES del INSERT, así que dos
+    procesos pasaban los dos la comprobación, los dos escribían su
+    definición —el segundo pisando la del primero— y sólo entonces la clave
+    primaria rechazaba a uno. El perdedor se iba con un error habiendo
+    dejado su ficha encima de la del ganador.
+
+    Por eso cada proceso escribe un título distinto: al final se comprueba
+    que la definición que quedó, en SQLite Y en el JSON, es la del que
+    ganó. Contar ganadores no bastaría.
+    """
+    print(
+        "  7. crear concurrente (" + str(creadores) + " procesos): ",
+        end="",
+    )
+
+    contexto = multiprocessing.get_context("spawn")
+    raiz = crear_repositorio("crear_")
+
+    try:
+        # La base se prepara antes: lo que se prueba aquí es la carrera de
+        # creación, no la de arranque, que ya cubre A3.2.
+        estado_global.inicializar_base(raiz)
+
+        with contexto.Manager() as gestor:
+            barrera = gestor.Barrier(creadores)
+            reserva = gestor.Pool(processes=creadores)
+
+            try:
+                pendientes = [
+                    reserva.apply_async(
+                        _creador,
+                        (str(raiz), "T-0901", "worker" + str(numero), barrera),
+                    )
+                    for numero in range(creadores)
+                ]
+
+                resultados = [
+                    uno.get(timeout=ESPERA_PROCESO_S) for uno in pendientes
+                ]
+            finally:
+                reserva.close()
+                reserva.join()
+
+        METRICAS["OPERACIONES"] += creadores
+
+        creadas = [uno for uno in resultados if uno["clase"] == "creada"]
+        rechazadas = [uno for uno in resultados if uno["clase"] == "rechazada"]
+        errores = [uno for uno in resultados if uno["clase"] == "sqlite"]
+        raras = [
+            uno for uno in resultados
+            if uno["clase"] in ("inesperada", "barrera")
+        ]
+
+        METRICAS["ACEPTADAS"] += len(creadas)
+        METRICAS["RECHAZADAS"] += len(rechazadas)
+        METRICAS["ERRORES_SQLITE"] += len(errores)
+        METRICAS["EXCEPCIONES"] += len(raras)
+
+        assert not errores, "Errores de SQLite: " + repr(errores)
+        assert not raras, "Excepciones inesperadas: " + repr(raras)
+        assert len(creadas) == 1, (
+            "Crearon " + str(len(creadas)) + " procesos en vez de uno: "
+            + repr([uno["marca"] for uno in creadas])
+        )
+        assert len(rechazadas) == creadores - 1, (
+            "No todos los perdedores recibieron un rechazo controlado: "
+            + repr(resultados)
+        )
+
+        ganador = creadas[0]["marca"]
+        titulo_esperado = "Creada por " + ganador
+
+        # La definición que quedó es la del ganador, en los dos sitios.
+        fila = fila_de(raiz, "T-0901")
+
+        assert fila["titulo"] == titulo_esperado, (
+            "La fila quedó con la definición de otro: " + repr(fila["titulo"])
+            + " en vez de " + repr(titulo_esperado)
+        )
+
+        import json
+
+        espejo = json.loads(
+            fichas.ruta_ficha(raiz, "T-0901").read_text(encoding="utf-8")
+        )
+
+        assert espejo["titulo"] == titulo_esperado, (
+            "El JSON quedó con la definición de un perdedor: "
+            + repr(espejo["titulo"])
+        )
+        assert espejo["ambito_archivos"] == ["modulos/" + ganador + ".py"]
+
+        # Una sola tarea, un solo evento de creación.
+        con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+        try:
+            assert estado_global.contar_tareas(con) == 1
+            eventos = estado_global.listar_eventos(con, "T-0901")
+        finally:
+            con.close()
+
+        creaciones = [
+            uno for uno in eventos
+            if uno["tipo"] == estado_global.EVENTO_CREACION
+        ]
+
+        assert len(creaciones) == 1, (
+            "Se registraron " + str(len(creaciones)) + " creaciones."
+        )
+
+        # Sin temporales huérfanos de la escritura atómica.
+        sobrantes = list(fichas.carpeta_tareas(raiz).glob("*.tmp*"))
+
+        assert not sobrantes, "Quedaron temporales: " + repr(sobrantes)
+
+        comprobar_integridad(raiz)
+
+        print(
+            "OK (1 creada, " + str(len(rechazadas)) + " rechazadas, "
+            "ganador " + ganador + ")"
+        )
+    finally:
+        borrar(raiz)
+
+
+# ----------------------------------------------------------------------
 # Corredor de este archivo
 # ----------------------------------------------------------------------
 
@@ -770,6 +951,8 @@ def prueba_ejecucion_segura(rondas: int = RONDAS_POR_OMISION) -> None:
 
     for comprobacion in COMPROBACIONES:
         comprobacion()
+
+    prueba_g_crear_concurrente_tiene_un_solo_ganador(CREADORES_POR_OMISION)
 
     duracion = time.monotonic() - inicio
 
