@@ -68,3 +68,21 @@ Una sesión nueva debe poder leer:
 3. ESTADO.md
 
 y comprender inmediatamente dónde continuar.
+
+## Hito actual
+
+Núcleo mínimo implementado y probado.
+
+Componentes:
+- Proyecto
+- Módulo
+- Tarea
+- Observación
+- Aprobación
+- Estados comunes
+
+Prueba:
+PRUEBA_NUCLEO=OK
+
+Estado:
+NÚCLEO_BASE = APROBADO
