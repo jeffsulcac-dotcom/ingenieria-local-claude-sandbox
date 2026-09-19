@@ -12,12 +12,17 @@ Cubren:
   global del repositorio (las definiciones siguen en las fichas JSON).
 """
 
+import json
 import sys
 import warnings
 from pathlib import Path
 
 
 RAIZ = Path(__file__).resolve().parents[2]
+
+# Definiciones versionadas: lo único del repositorio real cuyo contenido
+# el tablero debe reflejar. El estado operativo vive en SQLite y cambia.
+CARPETA_TAREAS = RAIZ / "orquestacion" / "tareas"
 
 sys.path.insert(0, str(RAIZ))
 sys.path.insert(0, str(RAIZ / "nucleo"))
@@ -233,8 +238,8 @@ def prueba_pagina_desarrollo():
         )
 
 
-def _comprobar_estado_desarrollo(ruta: str) -> dict:
-    respuesta = cliente.get(ruta)
+def _comprobar_estado_desarrollo() -> dict:
+    respuesta = cliente.get("/api/desarrollo/tareas")
 
     assert respuesta.status_code == 200
 
@@ -282,9 +287,16 @@ def _comprobar_estado_desarrollo(ruta: str) -> dict:
 
     assert resumen["totales"] == len(datos["tareas"])
 
-    # Sin trabajadores activos el tablero debe decir 0, no inventar.
-    assert resumen["agentes_activos"] == 0
-    assert resumen["en_ejecucion"] == 0
+    # El resumen debe cuadrar con las tareas publicadas, no inventar.
+    assert resumen["en_ejecucion"] == len(
+        [una for una in datos["tareas"] if una["estado"] == "en_ejecucion"]
+    )
+    assert resumen["agentes_activos"] == len(
+        {
+            una["trabajador_id"] for una in datos["tareas"]
+            if una["estado"] == "en_ejecucion" and una["trabajador_id"]
+        }
+    )
 
     # Cada tarea publicada debe traer los campos que el tablero muestra.
     for tarea in datos["tareas"]:
@@ -311,28 +323,42 @@ def _comprobar_estado_desarrollo(ruta: str) -> dict:
         ):
             assert clave in tarea, "Falta '" + clave + "' en " + tarea["id"]
 
-    # Las dos fichas reales aparecen con el estado que tenían antes de A2.
+    # Las fichas versionadas del repositorio aparecen en el tablero, con su
+    # definición legible. No se fija su estado operativo: lo gobierna
+    # SQLite y cambia legítimamente en cuanto se trabaja una tarea.
     por_id = {tarea["id"]: tarea for tarea in datos["tareas"]}
 
-    assert "T-0001" in por_id and "T-0002" in por_id
+    for ruta_ficha in sorted(CARPETA_TAREAS.glob("T-*.json")):
+        identificador = ruta_ficha.stem
+        declarada = json.loads(ruta_ficha.read_text(encoding="utf-8"))
 
-    primera = por_id["T-0001"]
-    segunda = por_id["T-0002"]
+        assert identificador in por_id, (
+            "La ficha " + identificador + " no aparece en el tablero."
+        )
 
-    assert primera["estado"] == "nuevo"
-    assert primera["intentos"] == 0
-    assert primera["trabajador_id"] is None
-    assert primera["requiere_decision_humana"] is True
-    assert len(primera["decisiones_pendientes"]) == 3
-    assert [una["clave"] for una in primera["decisiones_pendientes"]] == [
-        "D-1", "D-2", "D-3"
-    ]
-    assert primera["definicion_legible"] is True
+        publicada = por_id[identificador]
 
-    assert segunda["estado"] == "nuevo"
-    assert segunda["intentos"] == 0
-    assert segunda["requiere_decision_humana"] is False
-    assert segunda["decisiones_pendientes"] == []
+        assert publicada["definicion_legible"] is True
+        assert publicada["titulo"] == declarada["titulo"]
+        assert publicada["definicion_ruta"] == (
+            "orquestacion/tareas/" + identificador + ".json"
+        )
+
+        # Las decisiones pendientes son las declaradas y aún sin resolver.
+        assert publicada["decisiones_totales"] == len(
+            declarada["requiere_decision_humana"]
+        )
+        assert publicada["requiere_decision_humana"] is (
+            len(publicada["decisiones_pendientes"]) > 0
+        )
+
+        declaradas = {
+            una["clave"] for una in declarada["requiere_decision_humana"]
+        }
+
+        for pendiente in publicada["decisiones_pendientes"]:
+            assert pendiente["clave"] in declaradas
+            assert pendiente["resuelta"] is False
 
     # Cada evento de actividad trae su tipo (proviene de la tabla eventos).
     for evento in datos["actividad"]:
@@ -342,7 +368,7 @@ def _comprobar_estado_desarrollo(ruta: str) -> dict:
 
 
 def prueba_api_desarrollo():
-    _comprobar_estado_desarrollo("/api/desarrollo/tareas")
+    _comprobar_estado_desarrollo()
 
 
 # ----------------------------------------------------------------------

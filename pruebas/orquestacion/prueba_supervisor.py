@@ -4,9 +4,10 @@ Pruebas del Supervisor de Desarrollo V1.
 Todas las comprobaciones son herméticas: trabajan sobre repositorios
 temporales creados al vuelo, nunca sobre el repositorio real.
 
-La única excepción controlada es el repositorio Git de juguete que se crea
-también en una carpeta temporal para comprobar los límites del commit
-automático.
+Desde A2 cada raíz temporal es además un repositorio Git propio, porque el
+estado operativo vive en la base SQLite ubicada en el directorio común de
+Git: cada comprobación usa así su propia base, aislada de las demás y de
+la del repositorio real.
 """
 
 import json
