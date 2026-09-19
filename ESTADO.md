@@ -388,7 +388,7 @@ Pruebas ejecutadas (Python 3.11.15, Linux):
 - PRUEBA_SUPERVISOR=OK        31 comprobaciones
 - PRUEBA_ESTADO_GLOBAL=OK     16 comprobaciones
 - PRUEBA_API=OK               12 comprobaciones
-- PRUEBA_TOMA_ATOMICA=OK      18 comprobaciones (matriz A..N)
+- PRUEBA_TOMA_ATOMICA=OK      21 comprobaciones (matriz A..N)
 
 6 de 6 archivos de prueba en OK.
 
@@ -398,12 +398,54 @@ automática de tareas abandonadas, cola o planificador, lanzamiento
 automático de trabajadores, paralelismo de agentes escritores, verificar()
 en el worktree de la tarea.
 
+Hasta dónde llega la garantía (importante, medido, no supuesto):
+- La toma es atómica: varios trabajadores que reclaman la misma tarea
+  producen exactamente un ganador.
+- El resto del ciclo de vida NO lo es. `latido`, `devolver`, `verificar` y
+  las órdenes humanas siguen escribiendo con `persistir`, cuyo UPDATE es
+  incondicional. Reproducido: A emite un latido; antes de que su escritura
+  llegue, un humano devuelve la tarea y C la toma legítimamente; la
+  escritura de A pisa a C y la fila vuelve a decir A. Corregirlo exige
+  UPDATE condicional también en `persistir`, es decir, rehacer las nueve
+  órdenes del ciclo: eso es A3.2, no A3.1.
+
+Correcciones aplicadas durante la auditoría adversarial (todas
+reproducidas antes de corregir y validadas por mutación después):
+- `tomar` refrescaba TODAS las definiciones antes de comprobar los
+  ámbitos, con lo que reescribía el `ambito_archivos` registrado de una
+  tarea que otro trabajador tenía en ejecución en otra rama; acto seguido
+  no veía el solapamiento y concedía la toma. Reproducido: dos tareas
+  EN_EJECUCION sobre `modulos/comun/**`. Ahora sólo incorpora las tareas
+  ausentes (`solo_importar=True`); la definición de la tarea que se toma ya
+  la pone al día `cargar`.
+- El ROLLBACK y el COMMIT del gestor `transaccion` se ejecutaban sin
+  protección. Sin espacio en la base, SQLite deshace la transacción por su
+  cuenta y el ROLLBACK explícito lanzaba "cannot rollback - no transaction
+  is active", que sustituía a la causa real ("database or disk is full") y,
+  al no ser `ErrorEstadoGlobal`, la línea de órdenes no sabía traducirla.
+  Ahora la causa real llega en español con su código de salida.
+- `tomar` leía la fila DESPUÉS del COMMIT: otra orden podía colarse en
+  medio y devolver al trabajador una ficha que ya no era suya. Ahora se lee
+  dentro de la transacción.
+- Tres afirmaciones de la documentación que la auditoría demostró falsas
+  ("nunca hay dos propietarios a la vez", "una toma rechazada no escribe
+  absolutamente nada", y el alcance de la garantía en la cabecera del
+  módulo) quedaron corregidas, no suavizadas.
+
 Deuda conocida de A3.1, no corregida por quedar fuera de su alcance:
+- La unicidad de propietario fuera de la toma (ver arriba). Es la deuda
+  principal que hereda A3.2.
 - `latido()` y `verificar()` no comprueban que quien llama sea el
   propietario de la tarea: cualquiera puede latir o verificar una tarea
   ajena. Pertenece a A3.2 (propiedad efectiva del claim).
 - `reanudar()` puede arrebatar una tarea a un trabajador vivo si su latido
   vence; la política de expiración es A3.2.
+- Crear la base desde cero con varios procesos a la vez sigue fallando en
+  los perdedores con "table tareas already exists" (deuda ya declarada de
+  A2, en `inicializar()`). Reproducido con 6 procesos: falla de forma
+  explícita, sin corromper nada, y NUNCA produjo doble propietario (un solo
+  ganador en 8 de 8 rondas). Basta con crear la base una vez antes de
+  lanzar trabajadores.
 - La deuda de A2 sigue vigente salvo la atomicidad de `tomar`, ya resuelta.
 
 Pendiente de ejecución en Windows: es el entorno final real y esta corrida

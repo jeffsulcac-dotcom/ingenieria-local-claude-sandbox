@@ -518,6 +518,20 @@ def prueba_a_toma_normal():
         assert fila["trabajador_id"] == "equipo/solo/1", fila
         assert fila["pid"] == os.getpid(), fila["pid"]
 
+        # Lo que `tomar` devuelve es exactamente lo que la transacción
+        # confirmó, no una relectura posterior que otro pudiera haber
+        # cambiado: la ficha y la fila dicen lo mismo, campo por campo.
+        for columna in ("estado", "trabajador_id", "pid", "iniciado_en",
+                        "ultimo_latido", "rama", "commit_inicial"):
+            devuelto = getattr(ficha, columna)
+            devuelto = str(devuelto) if columna == "estado" else devuelto
+
+            assert devuelto == fila[columna], (
+                "La ficha devuelta y la fila confirmada difieren en '"
+                + columna + "': " + repr(devuelto) + " vs "
+                + repr(fila[columna])
+            )
+
         transiciones = [
             evento for evento in eventos_de(raiz, "T-0901")
             if evento["tipo"] == estado_global.EVENTO_TRANSICION
@@ -890,6 +904,62 @@ def prueba_ambito_se_decide_en_la_misma_transaccion():
         borrar(raiz)
 
 
+def prueba_la_toma_no_pisa_el_ambito_de_una_tarea_viva():
+    """
+    Refrescar definiciones no puede borrar el ámbito de una tarea en marcha.
+
+    La base global es única, pero cada worktree puede estar en una rama
+    distinta y traer su propia versión de la MISMA ficha. Si `tomar`
+    refrescara todas las definiciones antes de comprobar los ámbitos,
+    reescribiría el `ambito_archivos` registrado de una tarea que otro
+    trabajador tiene en ejecución, y acto seguido no vería el solapamiento:
+    dos trabajadores escribiendo los mismos archivos.
+
+    Por eso `tomar` incorpora las tareas que faltan pero no refresca las
+    que ya están. La suya propia sí está al día: la sincronizó `cargar`.
+    """
+    raiz = crear_repositorio()
+
+    try:
+        compartido = "modulos/comun/*.py"
+
+        ficha_minima(raiz, "T-0901", ambito_archivos=[compartido])
+        nucleo.tomar(raiz, "T-0901", trabajador_id="equipo/vivo/1")
+
+        # Otra rama declara la MISMA tarea con otro ámbito. Llega al árbol
+        # sin pasar por el Supervisor, igual que un `git checkout`.
+        otra_rama = fichas.leer(raiz, "T-0901")
+        otra_rama.ambito_archivos = ["modulos/otro/*.py"]
+        fichas.guardar(raiz, otra_rama)
+
+        ficha_minima(raiz, "T-0902", ambito_archivos=[compartido])
+
+        try:
+            nucleo.tomar(raiz, "T-0902", trabajador_id="equipo/intruso/1")
+        except nucleo.ErrorSolapamiento as choque:
+            assert "T-0901" in str(choque), str(choque)
+        else:
+            raise AssertionError(
+                "Dos tareas quedaron en ejecución sobre el mismo ámbito: el "
+                "refresco de definiciones borró el ámbito de la tarea viva."
+            )
+
+        viva = fila_de(raiz, "T-0901")
+
+        assert viva["ambito_archivos"] == [compartido], (
+            "El ámbito registrado de la tarea viva se reescribió: "
+            + repr(viva["ambito_archivos"])
+        )
+        assert viva["trabajador_id"] == "equipo/vivo/1", viva
+
+        intrusa = fila_de(raiz, "T-0902")
+
+        assert intrusa["estado"] == str(Estado.NUEVO), intrusa
+        assert intrusa["trabajador_id"] is None, intrusa
+    finally:
+        borrar(raiz)
+
+
 # ----------------------------------------------------------------------
 # D, E, F. Segundas tomas sobre una tarea ya reclamada
 # ----------------------------------------------------------------------
@@ -1060,6 +1130,78 @@ def prueba_g_rollback_ante_excepcion():
         borrar(raiz)
 
 
+def prueba_g_rollback_con_la_base_sin_espacio():
+    """
+    Sin espacio en la base, el fallo llega en español y nada queda colgado.
+
+    Es el caso que más fácilmente rompe una limpieza mal hecha: cuando la
+    escritura falla por falta de espacio, SQLite deshace la transacción
+    por su cuenta, de modo que el ROLLBACK explícito llega a una
+    transacción que ya no existe. Si ese segundo error escapara, taparía
+    al primero y quien llama recibiría un fallo desnudo en inglés en lugar
+    de `ErrorEstadoGlobal` (que es lo único que la línea de órdenes sabe
+    traducir a un código de salida).
+
+    `PRAGMA max_page_count` produce exactamente el mismo error que un
+    disco lleno, sin necesidad de llenar ningún disco.
+    """
+    raiz = crear_repositorio()
+
+    try:
+        ficha_minima(raiz, "T-0901")
+
+        con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+        try:
+            paginas = con.execute("PRAGMA page_count").fetchone()[0]
+            con.execute("PRAGMA max_page_count = " + str(paginas))
+
+            try:
+                with estado_global.transaccion(con):
+                    for numero in range(20000):
+                        con.execute(
+                            "INSERT INTO esquema (version, aplicado_en) "
+                            "VALUES (?, ?)",
+                            (1000 + numero, "relleno"),
+                        )
+            except estado_global.ErrorEstadoGlobal as error:
+                assert "full" in str(error.__cause__ or ""), (
+                    "Se perdió la causa real del fallo: "
+                    + repr(error.__cause__)
+                )
+            except sqlite3.Error as error:
+                raise AssertionError(
+                    "Escapó un error crudo de SQLite en lugar de "
+                    "ErrorEstadoGlobal: " + repr(error)
+                )
+            else:
+                raise AssertionError(
+                    "La transacción no debió confirmarse sin espacio."
+                )
+
+            # Y no quedó ninguna transacción abierta bloqueando la base.
+            con.execute("PRAGMA max_page_count = 0")
+
+            with estado_global.transaccion(con):
+                estado_global.actualizar_tarea(
+                    con, "T-0901", {"max_intentos": 7}
+                )
+        finally:
+            con.close()
+
+        assert fila_de(raiz, "T-0901")["max_intentos"] == 7, (
+            "La base quedó inutilizable tras el fallo de espacio."
+        )
+
+        # Y la toma normal sigue funcionando.
+        ficha = nucleo.tomar(raiz, "T-0901", trabajador_id="equipo/tras/1")
+
+        assert ficha.estado == Estado.EN_EJECUCION, ficha.estado
+        assert comprobar_integridad(raiz).lower() == "ok"
+    finally:
+        borrar(raiz)
+
+
 # ----------------------------------------------------------------------
 # H e I. La toma sobrevive al proceso que la hizo
 # ----------------------------------------------------------------------
@@ -1156,6 +1298,100 @@ def prueba_i_persistencia_del_claim():
         borrar(raiz)
 
 
+TOMA_QUE_MUERE = """
+import os
+import sys
+from pathlib import Path
+
+from ingenieria_supervisor import supervisor as nucleo
+
+
+def morir(raiz, ficha):
+    # Muerte súbita justo después del COMMIT, al ir a escribir el espejo:
+    # el peor instante posible para un corte de energía.
+    os._exit(9)
+
+
+nucleo._regenerar_espejo = morir
+
+nucleo.tomar(Path(sys.argv[1]), "T-0901", trabajador_id="equipo/apagon/1",
+             pid=777)
+
+print("no debería llegar aquí")
+"""
+
+
+def prueba_i_la_toma_sobrevive_al_apagon():
+    """
+    Un corte entre el COMMIT y el espejo no pierde la toma ni bloquea la base.
+
+    Es el requisito de recuperación llevado al peor instante: la
+    transacción ya confirmó, pero el proceso muere antes de escribir el
+    JSON. SQLite manda, así que la toma sigue ahí; el espejo queda
+    atrasado y lo regenera la operación siguiente.
+    """
+    import json
+
+    raiz = crear_repositorio()
+
+    try:
+        ficha_minima(raiz, "T-0901")
+
+        espejo_antes = json.loads(
+            fichas.ruta_ficha(raiz, "T-0901").read_text(encoding="utf-8")
+        )
+
+        muerte = subprocess.run(
+            [sys.executable, "-c", TOMA_QUE_MUERE, str(raiz)],
+            cwd=str(RAIZ),
+            env=corredor.entorno_controlado(RAIZ),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+
+        assert muerte.returncode == 9, (
+            "El proceso debía morir de golpe: " + repr(muerte.returncode)
+            + " " + muerte.stderr[-400:]
+        )
+
+        fila = fila_de(raiz, "T-0901")
+
+        assert fila["estado"] == str(Estado.EN_EJECUCION), fila
+        assert fila["trabajador_id"] == "equipo/apagon/1", fila
+        assert fila["pid"] == 777, fila
+
+        espejo = json.loads(
+            fichas.ruta_ficha(raiz, "T-0901").read_text(encoding="utf-8")
+        )
+
+        assert espejo["estado"] == espejo_antes["estado"], (
+            "el espejo no debía haberse escrito"
+        )
+
+        # La base no quedó bloqueada por el proceso muerto.
+        recargada = nucleo.cargar(raiz, "T-0901")
+
+        assert recargada.estado == Estado.EN_EJECUCION, recargada.estado
+        assert recargada.trabajador_id == "equipo/apagon/1"
+
+        # Y la operación siguiente regenera el espejo desde SQLite.
+        nucleo.devolver(raiz, "T-0901", "Recuperada tras el corte.")
+
+        espejo = json.loads(
+            fichas.ruta_ficha(raiz, "T-0901").read_text(encoding="utf-8")
+        )
+
+        assert espejo["estado"] == str(Estado.REABIERTO), espejo["estado"]
+        assert espejo["trabajador_id"] is None, espejo
+
+        assert comprobar_integridad(raiz).lower() == "ok"
+    finally:
+        borrar(raiz)
+
+
 # ----------------------------------------------------------------------
 # J. Integridad de la base tras las carreras
 # ----------------------------------------------------------------------
@@ -1164,15 +1400,11 @@ def prueba_j_integridad_sqlite():
     """
     Ninguna carrera de esta ejecución dejó la base dañada.
 
-    Se apoya en los `PRAGMA integrity_check` que cada bloque de carreras
-    ejecutó sobre SU propia base antes de borrarla, y añade uno más sobre
-    una base recién sometida a una carrera.
+    Primero somete una base propia a una carrera y la revisa a fondo; sólo
+    después repasa los `PRAGMA integrity_check` que los demás bloques
+    ejecutaron sobre SUS bases antes de borrarlas. En ese orden la
+    comprobación vale igual ejecutada sola que dentro de la tanda completa.
     """
-    assert METRICAS["INTEGRITY_CHECKS"] > 0, (
-        "No se comprobó la integridad de ninguna base."
-    )
-    assert METRICAS["INTEGRITY_FAILURES"] == 0, METRICAS
-
     raiz = crear_repositorio()
 
     try:
@@ -1211,6 +1443,14 @@ def prueba_j_integridad_sqlite():
         assert duplicadas == 0, "quedaron identificadores repetidos"
     finally:
         borrar(raiz)
+
+    # Y ninguna de las bases que esta ejecución sometió a carreras quedó
+    # dañada. La de aquí arriba ya cuenta, así que el mínimo se cumple
+    # aunque esta comprobación se ejecute sola.
+    assert METRICAS["INTEGRITY_CHECKS"] > 0, (
+        "No se comprobó la integridad de ninguna base."
+    )
+    assert METRICAS["INTEGRITY_FAILURES"] == 0, METRICAS
 
 
 # ----------------------------------------------------------------------
@@ -1574,6 +1814,8 @@ COMPROBACIONES = [
      prueba_carrera_entre_conexiones),
     ("ámbitos solapados decididos en la misma transacción",
      prueba_ambito_se_decide_en_la_misma_transaccion),
+    ("la toma no pisa el ámbito de una tarea viva",
+     prueba_la_toma_no_pisa_el_ambito_de_una_tarea_viva),
     ("D. toma sobre tarea ya reclamada",
      prueba_d_toma_sobre_tarea_ya_reclamada),
     ("E. mismo trabajador reclamando otra vez",
@@ -1581,9 +1823,12 @@ COMPROBACIONES = [
     ("F. trabajador distinto, segunda toma",
      prueba_f_trabajador_distinto_segunda_toma),
     ("G. rollback ante excepción", prueba_g_rollback_ante_excepcion),
+    ("G. rollback con la base sin espacio",
+     prueba_g_rollback_con_la_base_sin_espacio),
     ("H. proceso nuevo lee al propietario",
      prueba_h_proceso_nuevo_lee_al_propietario),
     ("I. persistencia de la toma", prueba_i_persistencia_del_claim),
+    ("I. la toma sobrevive al apagón", prueba_i_la_toma_sobrevive_al_apagon),
     ("J. integridad de SQLite", prueba_j_integridad_sqlite),
     ("K. toma de tarea inexistente", prueba_k_toma_de_tarea_inexistente),
     ("L. toma en estado no reclamable",

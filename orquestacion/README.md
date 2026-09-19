@@ -175,8 +175,31 @@ invariante real es que los estados reclamables (`nuevo`, `reabierto`,
 `requiere_revision`) siempre tienen `trabajador_id` nulo, porque
 `verificar`, `devolver` y `reanudar` liberan al trabajador.
 
+**Hasta dónde llega la garantía.** A3.1 hace atómica LA TOMA. No hace
+atómico el resto del ciclo de vida, y conviene tenerlo claro porque la
+diferencia importa:
+
+| Situación | ¿Garantizado? |
+|---|---|
+| Varios trabajadores reclaman la misma tarea a la vez | Sí: gana exactamente uno |
+| Dos tareas con ámbitos solapados reclamadas a la vez | Sí: se concede una sola |
+| El propietario que ganó sobrevive a las demás órdenes | **No**: ver abajo |
+
+`latido`, `devolver`, `verificar` y las órdenes humanas siguen escribiendo
+con `persistir`, cuyo UPDATE es incondicional. Una de esas órdenes que
+llegue con una lectura vieja puede sobrescribir al trabajador que acababa
+de ganar la toma. Ejemplo medido: A emite un latido; antes de que su
+escritura llegue, un humano devuelve la tarea y C la toma legítimamente; la
+escritura de A pisa entonces a C y la fila vuelve a decir A. Resolverlo
+exige que cada orden exija ser el propietario (UPDATE condicional también
+en `persistir`), que es A3.2. No se adelantó aquí para no rehacer las nueve
+órdenes del ciclo dentro de una etapa cuyo alcance es la toma.
+
 **Limitaciones conocidas de A3.1 (por diseño).**
 
+- La unicidad de propietario está garantizada para la toma, no para el
+  resto del ciclo de vida (ver la tabla anterior). Es la deuda principal
+  que hereda A3.2.
 - `latido` y `verificar` no comprueban que quien llama sea el propietario
   de la tarea: cualquiera puede latir o verificar una tarea ajena. La
   propiedad efectiva del claim pertenece a A3.2.
@@ -184,6 +207,18 @@ invariante real es que los estados reclamables (`nuevo`, `reabierto`,
   vence; la política de expiración pertenece a A3.2.
 - No hay latidos automáticos, expiración de trabajadores, detección de
   trabajadores muertos ni recuperación automática de tareas abandonadas.
+- El espejo JSON se escribe DESPUÉS del COMMIT, así que puede quedar
+  momentáneamente atrasado respecto de SQLite si otra orden se cruza en
+  medio. No es nuevo de A3.1: le pasa a toda operación desde A2. SQLite
+  manda siempre, y la siguiente operación regenera el espejo. Si el
+  proceso muere justo en esa ventana, el estado operativo está a salvo:
+  está comprobado que la toma sobrevive y que la orden siguiente pone el
+  JSON al día.
+- Crear la base desde cero con varios procesos a la vez sigue fallando en
+  los perdedores con "table tareas already exists" (deuda declarada de A2,
+  en `inicializar()`). Está comprobado que no produce dos propietarios:
+  falla de forma explícita, sin corromper nada. Basta con crear la base
+  una vez (`inicializar-estado`) antes de lanzar trabajadores.
 
 Prueba correspondiente:
 

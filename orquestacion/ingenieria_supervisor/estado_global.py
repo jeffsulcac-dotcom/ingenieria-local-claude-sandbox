@@ -301,6 +301,27 @@ def conexion(raiz: Path, inicializar_esquema: bool = True):
         con.close()
 
 
+def _deshacer(con: sqlite3.Connection) -> None:
+    """
+    ROLLBACK que nunca tapa la causa real del fallo.
+
+    Ante un disco lleno o un error de E/S, SQLite deshace la transacción
+    por su cuenta. El ROLLBACK explícito llega entonces a una transacción
+    que ya no existe y lanza 'cannot rollback - no transaction is active'.
+    Si se dejara escapar, esa excepción sustituiría al error que de verdad
+    importa ("database or disk is full") y, al no ser `ErrorEstadoGlobal`,
+    la línea de órdenes la mostraría como un fallo desnudo en inglés en
+    lugar del mensaje en español con su código de salida.
+
+    Aquí no hay nada que rescatar: la transacción está deshecha de un modo
+    u otro, que es lo único que se pedía.
+    """
+    try:
+        con.execute("ROLLBACK")
+    except sqlite3.Error:
+        pass
+
+
 @contextmanager
 def transaccion(con: sqlite3.Connection):
     """
@@ -308,6 +329,10 @@ def transaccion(con: sqlite3.Connection):
 
     BEGIN IMMEDIATE toma el bloqueo de escritura al empezar, de modo que
     una transacción no descubre a mitad de camino que otra conexión escribió.
+
+    Salga por donde salga, la transacción queda cerrada y el error que
+    llega a quien llamó es siempre `ErrorEstadoGlobal` (o la excepción
+    original, si no vino de SQLite), nunca un fallo de la propia limpieza.
     """
     try:
         con.execute("BEGIN IMMEDIATE")
@@ -319,15 +344,23 @@ def transaccion(con: sqlite3.Connection):
     try:
         yield con
     except sqlite3.Error as error:
-        con.execute("ROLLBACK")
+        _deshacer(con)
         raise ErrorEstadoGlobal(
             "Transacción anulada por error de SQLite: " + str(error)
         ) from error
     except BaseException:
-        con.execute("ROLLBACK")
+        _deshacer(con)
         raise
 
-    con.execute("COMMIT")
+    try:
+        con.execute("COMMIT")
+    except sqlite3.Error as error:
+        # Un COMMIT que falla puede dejar la transacción todavía abierta:
+        # se deshace antes de informar, para no bloquear a los demás.
+        _deshacer(con)
+        raise ErrorEstadoGlobal(
+            "No se pudo confirmar la transacción: " + str(error)
+        ) from error
 
 
 # ----------------------------------------------------------------------

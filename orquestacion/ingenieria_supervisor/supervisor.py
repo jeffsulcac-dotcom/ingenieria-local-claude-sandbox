@@ -22,9 +22,17 @@ Reglas duras que este módulo hace cumplir:
 6. Desde A3.1, `tomar` es ATÓMICA: comprobación de ámbitos y toma ocurren
    en una sola transacción BEGIN IMMEDIATE y la concede un UPDATE
    condicional resuelto por rowcount. Compitan los trabajadores que
-   compitan por la misma tarea, gana exactamente uno.
+   compitan por la misma tarea, la gana exactamente uno.
 
-Lo que NO hace este módulo (reservado para A3.2/B): latidos automáticos,
+   El alcance de esa garantía es la TOMA, no el ciclo de vida entero. Las
+   demás órdenes (`latido`, `devolver`, `verificar` y las humanas) siguen
+   escribiendo con `persistir`, cuyo UPDATE es incondicional: una de ellas
+   que llegue con una lectura vieja puede pisar al ganador de una toma
+   posterior. Corregirlo exige propiedad efectiva del claim, que es A3.2
+   (ver "Limitaciones conocidas de A3.1" en orquestacion/README.md).
+
+Lo que NO hace este módulo (reservado para A3.2/B): propiedad efectiva del
+claim (que cada orden exija ser el propietario), latidos automáticos,
 expiración de trabajadores, detección automática de trabajadores muertos,
 recuperación automática de tareas abandonadas, cola o planificador de
 tareas, verificación dentro del worktree de la tarea, lanzamiento de
@@ -835,7 +843,13 @@ def tomar(
 
     Cuando varios trabajadores compiten por la MISMA tarea, exactamente uno
     obtiene la toma; los demás reciben `ErrorToma`, que describe quién la
-    tiene y en qué estado quedó. Nunca hay dos propietarios a la vez.
+    tiene y en qué estado quedó. Dos tomas nunca se conceden a la vez.
+
+    Lo que esto NO promete: que el propietario resultante sobreviva a lo
+    que hagan después las demás órdenes. `latido`, `devolver` y `verificar`
+    escriben con `persistir`, cuyo UPDATE es incondicional, así que una de
+    ellas con una lectura vieja puede sobrescribir a quien acaba de ganar.
+    Eso lo resuelve la propiedad efectiva del claim, que es A3.2.
 
     Aquí se aplica además la regla de un solo escritor: si otra tarea activa
     declara un ámbito que se solapa, la toma se rechaza.
@@ -856,8 +870,15 @@ def tomar(
     escritura mientras tanto castigaría a todos los demás trabajadores. Nada
     de eso decide la toma; sólo aporta datos que el UPDATE vuelve a validar.
 
-    El espejo JSON se regenera DESPUÉS del COMMIT, a partir de la fila real.
-    Una toma rechazada no escribe absolutamente nada.
+    El espejo JSON se regenera DESPUÉS del COMMIT, a partir de la fila que
+    la propia transacción confirmó.
+
+    Un rechazo no cambia el estado operativo de ninguna tarea: ni el
+    estado, ni el propietario, ni los intentos. Sí puede haber quedado
+    antes el trabajo de incorporación que hacen `cargar` y
+    `sincronizar_lista`, que registran en la base las fichas JSON que
+    todavía no conocía. Eso es bootstrap de definiciones, no la toma, y
+    ocurre igual aunque nadie reclame nada.
     """
     ficha = cargar(raiz, identificador)
 
@@ -896,7 +917,20 @@ def tomar(
     definiciones, ilegibles = listar_con_errores(raiz)
 
     with global_.conexion(raiz) as con:
-        global_.sincronizar_lista(con, definiciones)
+        # `solo_importar`: se incorporan las tareas que la base todavía no
+        # conoce (sin ellas, la comprobación de ámbitos se interrumpiría),
+        # pero NO se refresca la definición de las que ya están.
+        #
+        # Refrescarlas reescribiría `ambito_archivos`, que es justo el dato
+        # del que depende la regla de un solo escritor, y lo haría con la
+        # definición de ESTA rama aunque la tarea esté en ejecución en otro
+        # worktree con otro ámbito. La toma siguiente ya no vería el
+        # solapamiento y dos trabajadores acabarían escribiendo los mismos
+        # archivos. El refresco por huella es de `sincronizar-definiciones`.
+        #
+        # La definición de la tarea que se toma sí está al día: `cargar`
+        # la sincronizó al principio.
+        global_.sincronizar_lista(con, definiciones, solo_importar=True)
 
         with global_.transaccion(con):
             filas = global_.listar_tareas(con)
@@ -966,7 +1000,11 @@ def tomar(
 
             global_.insertar_evento(con, ficha.id, evento)
 
-        fila = global_.obtener_tarea(con, ficha.id)
+            # La fila se lee DENTRO de la transacción, no después: así lo
+            # que se devuelve es exactamente lo que el COMMIT confirmó. Si
+            # se leyera fuera, otra operación podría colarse en medio y
+            # `tomar` devolvería una ficha que ya no es de quien la pidió.
+            fila = global_.obtener_tarea(con, ficha.id)
 
     global_.aplicar_fila(ficha, fila)
 
