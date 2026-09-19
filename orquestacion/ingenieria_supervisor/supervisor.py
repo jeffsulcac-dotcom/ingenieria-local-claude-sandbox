@@ -935,6 +935,31 @@ def tomar(
         with global_.transaccion(con):
             filas = global_.listar_tareas(con)
 
+            # Estado previo tal como lo ve ESTA transacción. Sólo sirve
+            # para explicar el rechazo y documentar el evento: quien
+            # concede la toma es el WHERE del UPDATE, no esta lectura.
+            previa = next(
+                (fila for fila in filas if fila["id"] == ficha.id), None
+            )
+
+            # Si el estado ya no admite toma, se dice ESO y no otra cosa.
+            # Sin esta comprobación, una tarea aprobada o rechazada cuyo
+            # ámbito además se solape se rechazaría por "ámbito en
+            # conflicto", mandando a quien la pidió a esperar a que se
+            # libere un ámbito que no la desbloquearía nunca.
+            #
+            # No reintroduce ninguna ventana: se decide sobre la fila leída
+            # DENTRO de la transacción, y la toma la sigue concediendo el
+            # UPDATE condicional, no esta lectura.
+            if previa is not None and previa["estado"] not in {
+                str(estado) for estado in ESTADOS_TOMABLES
+            }:
+                raise ErrorToma(
+                    global_.rechazo(
+                        previa, ficha.id, aspirante, momento, ESTADOS_TOMABLES
+                    )
+                )
+
             conflictos = conflictos_de_ambito(ficha, filas, ilegibles)
 
             if conflictos:
@@ -954,13 +979,6 @@ def tomar(
                     + detalle
                     + ". Un solo escritor por archivo."
                 )
-
-            # Estado previo tal como lo ve ESTA transacción. Sólo sirve para
-            # documentar el evento: quien decide la toma es el WHERE del
-            # UPDATE, no esta lectura.
-            previa = next(
-                (fila for fila in filas if fila["id"] == ficha.id), None
-            )
 
             informe = global_.reclamar(
                 con,

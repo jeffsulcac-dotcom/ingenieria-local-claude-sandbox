@@ -1644,6 +1644,71 @@ def prueba_l_toma_en_estado_no_reclamable():
         borrar(raiz)
 
 
+def prueba_l_el_estado_manda_sobre_el_ambito_en_el_rechazo():
+    """
+    Un estado que no admite toma se dice como tal, aunque el ámbito choque.
+
+    Si el ámbito se juzgara primero, una tarea aprobada o rechazada cuyo
+    ámbito además se solape con otra activa se rechazaría por "ámbito en
+    conflicto": quien la pidiera quedaría esperando a que se libere un
+    ámbito que no la desbloquearía nunca, porque el problema es otro.
+    """
+    raiz = crear_repositorio()
+
+    try:
+        compartido = "modulos/demostracion/compartido.py"
+
+        ficha_minima(raiz, "T-0901", ambito_archivos=[compartido])
+        ficha_minima(raiz, "T-0902", ambito_archivos=[compartido])
+
+        # T-0901 activa y reteniendo el ámbito.
+        nucleo.tomar(raiz, "T-0901", trabajador_id="equipo/activa/1")
+
+        # T-0902, con el MISMO ámbito, en un estado terminal.
+        con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+        try:
+            with estado_global.transaccion(con):
+                estado_global.actualizar_tarea(
+                    con, "T-0902", {"estado": str(Estado.APROBADO)}
+                )
+        finally:
+            con.close()
+
+        try:
+            nucleo.tomar(raiz, "T-0902", trabajador_id="equipo/aspirante/1")
+        except nucleo.ErrorToma as rechazo:
+            assert rechazo.motivo == (
+                estado_global.MOTIVO_ESTADO_NO_RECLAMABLE
+            ), rechazo.motivo
+            assert rechazo.estado == str(Estado.APROBADO), rechazo.estado
+            assert "aprobado" in str(rechazo), str(rechazo)
+        except nucleo.ErrorSolapamiento as choque:
+            raise AssertionError(
+                "El rechazo culpa al ámbito cuando el problema es el "
+                "estado: " + str(choque)
+            )
+        else:
+            raise AssertionError("No debió tomarse una tarea aprobada.")
+
+        # Y la tarea activa sigue intacta.
+        assert fila_de(raiz, "T-0901")["trabajador_id"] == "equipo/activa/1"
+        assert fila_de(raiz, "T-0902")["estado"] == str(Estado.APROBADO)
+        assert fila_de(raiz, "T-0902")["trabajador_id"] is None
+
+        # El ámbito sigue mandando cuando el estado sí admite toma.
+        ficha_minima(raiz, "T-0903", ambito_archivos=[compartido])
+
+        try:
+            nucleo.tomar(raiz, "T-0903", trabajador_id="equipo/aspirante/2")
+        except nucleo.ErrorSolapamiento as choque:
+            assert "T-0901" in str(choque), str(choque)
+        else:
+            raise AssertionError("El ámbito en conflicto debía rechazarse.")
+    finally:
+        borrar(raiz)
+
+
 # ----------------------------------------------------------------------
 # M. Datos mal formados y propietario residual
 # ----------------------------------------------------------------------
@@ -1912,6 +1977,8 @@ COMPROBACIONES = [
     ("K. toma de tarea inexistente", prueba_k_toma_de_tarea_inexistente),
     ("L. toma en estado no reclamable",
      prueba_l_toma_en_estado_no_reclamable),
+    ("L. el estado manda sobre el ámbito al rechazar",
+     prueba_l_el_estado_manda_sobre_el_ambito_en_el_rechazo),
     ("M. datos mal formados", prueba_m_datos_mal_formados),
     ("M. propietario residual no bloquea",
      prueba_m_propietario_residual_no_bloquea),
@@ -1931,6 +1998,33 @@ def prueba_toma_atomica() -> None:
         )
 
     imprimir_metricas()
+
+    # Antes de celebrar los ceros: que las carreras hayan ocurrido de
+    # verdad. "0 dobles tomas de 0 carreras" sería un verde en vacío, y es
+    # exactamente el resultado que produciría un arnés averiado.
+    bloques = {informe["ETIQUETA"].split(" x")[0] for informe in INFORMES}
+
+    esperados = {
+        "control ingenuo", "procesos", "conexiones", "ámbitos cruzados",
+    }
+
+    assert esperados <= bloques, (
+        "Faltan bloques de carrera: no se ejecutaron " + repr(esperados - bloques)
+    )
+
+    # Tres bloques de procesos (K=2, K=10 y ámbitos cruzados) corren
+    # `--carreras` rondas cada uno; el de conexiones corre las suyas. El
+    # control ingenuo no cuenta aquí: mide el arnés, no la implementación.
+    minimo = 3 * ARGUMENTOS.carreras + RONDAS_HILOS
+
+    assert METRICAS["TOTAL_RACES"] >= minimo, (
+        "Se esperaban al menos " + str(minimo) + " carreras y hubo "
+        + str(METRICAS["TOTAL_RACES"]) + ": " + repr(METRICAS)
+    )
+
+    assert METRICAS["TOTAL_REJECTED_CLAIMS"] > 0, (
+        "Ninguna toma fue rechazada: nadie llegó a competir."
+    )
 
     assert METRICAS["DOUBLE_CLAIM_EVENTS"] == 0, METRICAS
     assert METRICAS["TOTAL_SUCCESSFUL_CLAIMS"] == METRICAS["TOTAL_RACES"], (

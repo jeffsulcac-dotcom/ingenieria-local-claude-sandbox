@@ -868,7 +868,31 @@ def reclamar(
     # rowcount = 0: la fila no existe o ya no estaba en un estado reclamable.
     # El motivo se lee DENTRO de la misma transacción, así que describe
     # exactamente el estado que rechazó esta toma, no uno posterior.
-    fila = obtener_tarea(con, identificador)
+    return rechazo(
+        obtener_tarea(con, identificador),
+        identificador,
+        trabajador_id,
+        momento,
+        estados,
+    )
+
+
+def rechazo(
+    fila: dict | None,
+    identificador: str,
+    trabajador_id: str,
+    momento: str,
+    estados_reclamables,
+) -> dict:
+    """
+    Describe por qué NO se concede una toma, con el mismo formato siempre.
+
+    La usan `reclamar`, cuando su UPDATE condicional no modifica ninguna
+    fila, y quien necesite rechazar antes de llegar al UPDATE por un
+    motivo que ya conoce. Que el informe salga de un solo sitio es lo que
+    garantiza que quien reciba el rechazo lo lea igual venga de donde venga.
+    """
+    estados = tuple(sorted({str(estado) for estado in estados_reclamables}))
 
     if fila is None:
         return {
