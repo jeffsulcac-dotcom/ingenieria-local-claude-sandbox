@@ -673,3 +673,231 @@ T-0001 y T-0002 siguen sin ejecutar, en estado NUEVA.
 
 Estado:
 A3.2 = IMPLEMENTADO_PENDIENTE_DE_VERIFICACION_EN_WINDOWS
+     (cerrada: ver la sección A3.3, que la integra y la amplía)
+
+## Supervisor — A3.3: ejecución segura, recuperación y worktrees
+
+Base: 419d15e (A3.2 integrada).
+
+Qué cierra A3.3, que es lo último que faltaba antes de poder poner a
+trabajar a varios escritores a la vez:
+
+1. **Cada orden escribe sólo sus campos.** A3.2 impedía que entrara una
+   orden AJENA, pero dos órdenes legítimas del mismo propietario seguían
+   pisándose: `persistir` reescribía las dieciséis columnas operativas con la
+   foto que tenía en memoria. Ahora declarar las columnas es obligatorio.
+   Los contadores los incrementa el motor en SQL, no Python.
+
+2. **Latido automático** durante las operaciones largas del Supervisor.
+   Escribe sólo `ultimo_latido`, con identidad, generación, estado y una
+   guarda de no regresión; se para solo al terminar; aguanta un
+   `database is locked` sin apagarse; no resucita nada.
+
+3. **Vitalidad en seis estados** (ACTIVA, LATIDO_VENCIDO, HUÉRFANA,
+   REANUDABLE, ESPERA_HUMANA, FINALIZADA) que NUNCA declara abandono con una sola señal.
+   Un proceso vivo y comprobable lo impide, dure lo que dure el silencio.
+   Un trabajador de otra máquina no se libera solo: lo decide una persona.
+
+4. **Recuperación idempotente** que no le quita la tarea a quien sigue
+   vivo, ni siquiera si da señal justo entre la clasificación y la
+   escritura.
+
+5. **`verificar()` ejecuta en el worktree REGISTRADO de la tarea** —el que
+   `git worktree list` conoce— y graba dónde corrió: árbol, rama, commit,
+   generación y trabajador. Si el árbol se movió a mitad, la corrida no se
+   graba: no se sabe qué se ejecutó.
+
+6. **`crear` atómico**, con el archivo escrito después del COMMIT.
+
+7. **El tablero y la consola dicen la verdad**: vitalidad, edad del
+   latido, dónde se verificó, y si ese verde es de otra ejecución. El
+   tablero ya no escribe nada.
+
+Cómo se comprobó, porque «PASS» no es evidencia:
+
+- 37 comprobaciones en `pruebas/orquestacion/prueba_ejecucion_segura.py`
+  (34 en la corrida de Windows del 19/09, rotuladas hasta la 36; la
+  revisión final cerró la numeración y añadió tres), con carreras reales
+  entre procesos (`spawn` + barrera compartida) y
+  métricas medidas: 0 actualizaciones perdidas, 0 robos indebidos, 0
+  verificaciones en árbol incorrecto, 0 errores SQLite, 0 excepciones, 0
+  fallos de integridad en 32 `PRAGMA integrity_check`. Las métricas
+  positivas llevan cota mínima: sin ella, una corrida que no hiciera nada
+  habría salido igual de verde.
+- 22 mutaciones del código reintroducidas sobre copias temporales, 22
+  detectadas por la batería.
+- Dos rondas de auditoría adversarial con seis y tres revisores de sólo
+  lectura, sobre un montaje inmutable del repositorio. Sesenta hallazgos
+  confirmados en la primera ronda; todos los críticos y altos, cerrados.
+
+Lo más grave que encontró la auditoría, y que ya está cerrado:
+
+- Se podía ejecutar y grabar un VERDE FALSO: bastaba copiar un worktree a
+  otro sitio, o declarar un subdirectorio cualquiera, o tener `GIT_DIR` en
+  el entorno (lo está siempre dentro de un hook de Git).
+- La rama y el commit se leían DESPUÉS de correr: quedaba grabado «commit
+  X, todo en verde» cuando X nunca se ejecutó y estaba rojo.
+- El umbral de abandono declaraba huérfana una ejecución sin mirar
+  siquiera si el proceso seguía vivo.
+- Un latido del dueño llegado a mitad de la recuperación no la frenaba.
+- Dos `decidir` a la vez se pisaban: 24 de 25 carreras perdían una
+  resolución humana, sin error y sin rastro.
+- El espejo JSON borraba lo que una persona escribía durante la corrida,
+  incluida una decisión que quería frenar la propuesta.
+- El tablero «de sólo lectura» creaba tareas desde un GET de la API web.
+
+Deuda conocida, marcada para revisión humana y anotada en
+`orquestacion/README.md`: la reutilización de PID no se descarta
+comparando la hora de arranque del proceso (es específico de cada sistema
+y no se escribe a ciegas); el efecto está acotado en la dirección segura
+—la tarea espera a una persona en vez de quitársele a nadie— y la salida
+manual es `reabrir`.
+
+Verificado en Windows (PowerShell 7.6.5 y Python 3.12.4) el 19/09/2026:
+
+- `prueba_ejecucion_segura.py`: OK en 18.54 s; 0 actualizaciones perdidas,
+  robos indebidos, errores SQLite, excepciones y fallos de integridad.
+- Estrés de 40 rondas: 240 órdenes concurrentes aceptadas, 0 pérdidas y 0
+  errores SQLite, en 18.55 s.
+- La misma batería con `-X dev -W error::ResourceWarning`: OK, sin avisos.
+- Corredor completo confirmado desde `verificar` sobre T-9003 temporal: 8 de
+  8 pruebas OK, ejecutadas en un worktree Git real y registradas como
+  verificadas allí.
+- Rutas Windows `C:pruebas` y `\pruebas`: rechazadas con código 6; junction
+  y ruta con espacios: aceptadas por la comprobación de worktree.
+- La desaparición de un worktree no libera una ejecución fresca; la
+  comprobación 17 fuerza el caso huérfano y exige el aviso correspondiente.
+
+El guion del gate se corrigió para no devolver T-9004 antes de comprobar la
+retoma: devolver libera el worktree por diseño y, por tanto, no podía probar
+su desaparición. Las tareas de gate vivieron sólo en un clon temporal, sin
+afectar T-0001 ni T-0002, que no se ejecutaron.
+
+## Supervisor — A3.3: revisión final adversarial (20/09/2026)
+
+Sobre la punta 17530d0, en Linux (Python 3.11, git 2.43), con siete
+revisores de sólo lectura por dimensión (rutas y worktrees, concurrencia,
+recuperación y vitalidad, pruebas, evidencia Windows, consola y tablero,
+documentación frente a código) más tres de ojos frescos, y verificación
+propia de cada hallazgo por reproducción antes de tocar nada. Todo lo
+corregido lleva su comprobación y su mutante.
+
+Defectos reales encontrados y cerrados en esta rama:
+
+1. **Verde falso por worktree.** `resolver_worktree` sólo miraba que la
+   ruta apareciera en `git worktree list`. Git sigue listando una entrada
+   `prunable` (directorio borrado y recreado como carpeta corriente), y
+   lista como válida una ruta que este repositorio registró y borró y que
+   OTRO repositorio reutilizó para un worktree suyo: `verificar` corría
+   allí y grababa rama y commit vacíos o ajenos. Ahora se descartan
+   `prunable` y `bare`, y se exige que `git`, desde dentro de la ruta,
+   responda con esa raíz y con el directorio común de este repositorio.
+2. **El instante del latido se leía antes de pedir el candado**, al revés
+   de lo que decían el README y el comentario del código; lo mismo en la
+   toma. Corregido; la comprobación 33 lee el orden real.
+3. **Un fallo del espejo JSON abortaba `reanudar` entero**: el `except`
+   estaba alrededor de `_registrar_en_git`, que no lanza; el fallo real
+   subía desde `persistir`. La primera tarea quedaba recuperada en la base
+   con el JSON viejo y sin figurar en el informe, y las siguientes sin
+   revisar. Reproducido y corregido (34).
+4. **La consola de `reanudar` callaba** `inconsistentes_sin_tocar` y
+   `espejo_no_regenerado` —la orden humana `reabrir` que el README manda
+   no podía darse porque nadie sabía que hacía falta— y «Inconsistentes
+   recuperadas» era un contador muerto. Ahora imprime todos los grupos y
+   devuelve 1 cuando deja algo que una persona debe mirar (35).
+5. `verificar`: un árbol que desaparece a mitad salía como traceback con
+   código 1 (ahora `ErrorWorktree`, código 6); un árbol sucio se grababa
+   como «commit X en verde» sin marca (ahora `sin_confirmar` en la
+   evidencia, el tablero, `estado`, `ver` y la salida de `verificar`); y
+   una edición a mitad en un árbol ya sucio pasaba por quieto (ahora se
+   compara una huella del contenido, no un booleano). Comprobaciones 19 y
+   20.
+6. `reanudar` sólo avisaba del worktree ausente en las tareas que
+   liberaba; una ejecución ACTIVA con el árbol borrado no se avisaba (17).
+7. Un error transitorio al releer la fila tras un rechazo del latido se
+   convertía en «propiedad perdida» y `verificar` descartaba la batería
+   entera (30); el motivo de un rechazo por `exigir_iguales` se
+   contradecía a sí mismo («en_ejecucion no admite esta orden; la
+   admiten: en_ejecucion») y era lo que la consola enseñaba (28);
+   `~usuario_inexistente` como worktree producía un traceback (5).
+8. Consola y tablero: `ver` sobre una fila rota reventaba con traceback y
+   código 1 (ahora avería, código 2, en español); la tarjeta de una fila
+   ilegible culpaba al JSON sano e inventaba «0 / 0»; `estado --json`
+   devolvía 0 con la base en ERROR; `verificar` no decía dónde corrió;
+   `ver` no mostraba la última falla ni dónde se verificó; la web no
+   avisaba de fichas sin importar ni de ejecuciones sin señal.
+9. Pruebas: la batería tenía 34 comprobaciones rotuladas hasta la 36 y la
+   documentación decía 36; 14 de 17 mutantes nuevos sobrevivían (entre
+   ellos «acepta un worktree prunable» y «el latido lee el reloj fuera del
+   candado»); la 37 contaba como aceptados latidos que la guarda había
+   rechazado; las 23 y 24 sumaban «rechazadas» sin ninguna operación; y
+   `prueba_api.py` exigía que las fichas aparecieran en el tablero, lo que
+   sólo ocurre si la base ya las conoce: en un clon limpio el corredor daba
+   7 de 8. Todo cerrado: 37 comprobaciones, 19 mutantes nuevos detectados
+   (tabla en el README), corredor 8 de 8 en un clon limpio.
+10. Documentación: «PENDIENTE DE EJECUTAR» con el gate ya ejecutado, un
+    `devolver T-9003` imposible en el paso 10 del gate, un paso 8 cuyo
+    resultado dependía de cuánto se tardara desde la toma, cifras de
+    invocaciones rancias.
+11. Segunda tanda (misma revisión, tras la ronda de ojos frescos y la
+    verificación cruzada). Una regresión de la propia revisión: la huella
+    del contenido contaba el espejo JSON del Supervisor, y una decisión
+    resuelta a mitad de la batería abortaba la corrida; corregida antes de
+    cerrar. Y defectos de la punta original que salieron con ella: la
+    relectura de decisiones tras la corrida no releía nada (la lista en
+    memoria mandaba sobre la base); sin `--worktree` el árbol era «la raíz
+    de quien invoque la siguiente orden» (un trabajador tomando desde su
+    worktree y un operador verificando desde `main` proponían una tarea
+    cuyo trabajo nunca se ejecutó); un `database is locked` llega como
+    `ErrorEstadoGlobal` y apagaba el latido al primer choque (la prueba
+    lo simulaba con un tipo que en producción nunca llega); el `latido`
+    manual podía retroceder la marca; `verificar` decidía BLOQUEADO con un
+    `max_intentos` que ya no era el vigente; `aprobar` no exigía al motor
+    lo que comprobaba en Python; la falla ámbar quedaba rancia; PROPUESTO
+    y BLOQUEADO se rotulaban FINALIZADA; `reanudar` devolvía 0 con fichas
+    ilegibles; `os.replace` del espejo sin reintento ante un lector en
+    Windows; `prueba_api.py` ahora corre sobre un repositorio temporal.
+12. Corrección de gate: en Windows la comprobación 5 falló por una
+    comparación textual (introducida en esta revisión) entre una ruta de
+    Python y la que imprime `git worktree list --porcelain`. Reproducido
+    en Linux con `TMPDIR` a través de un enlace simbólico; corregido
+    comparando rutas resueltas. Los cinco casos de seguridad de
+    worktrees siguen detectándose al reintroducir cada defecto.
+
+Marcado para decisión humana, sin cambiar el comportamiento (detalle en
+la deuda conocida del README): la ventana de 120 s de una toma desde la
+consola; que `verificar` no exija la rama de la tarea; que `ver` y el
+tablero creen la base o importen fichas; identificadores con `/`;
+`proceso_vivo` en Windows ante «acceso denegado»; marcas de latido sin
+zona horaria; los errores de `argparse` en inglés; si una prueba
+requerida sin versionar debe valer; `diagnostico` en rutas UNC.
+
+Comprobado en esta rama (Linux):
+
+- `prueba_ejecucion_segura.py`: 37 de 37, `PRUEBA_EJECUCION_SEGURA=OK`,
+  ~17 s; las seis métricas de fallo en 0; con `-X dev -W
+  error::ResourceWarning`: OK sin avisos; 446 invocaciones de `git` en el
+  proceso padre y 483 conexiones SQLite, 0 vivas al terminar.
+- Las otras cuatro baterías de orquestación y `prueba_api.py`: OK.
+  Corredor único (`pruebas --detalle`): 8 de 8 APROBADO en un clon limpio.
+- Mutación: las 29 reintroducciones de la tabla R1–R29 del README, una a
+  una sobre copias limpias: 29 fallos de la batería, en la comprobación
+  esperada cada una.
+
+Pendiente en Windows: los cambios de esta revisión (`resolver_worktree`,
+`verificar`, `reanudar`, la consola, la batería) sólo se han ejecutado en
+Linux. Repetir el gate del README sobre la nueva punta y anotar los ocho
+criterios; de la corrida del 19/09 no consta explícitamente el criterio 5
+(corredor completo desde la raíz) ni la salida vacía del paso 9.
+
+T-0001 y T-0002 no se ejecutaron ni se tocaron.
+
+NO implementado en A3.3, reservado a C: lanzamiento de trabajadores,
+trabajadores paralelos, worktrees automáticos, cola y priorización,
+expiración automática de trabajadores y acciones desde el tablero.
+
+T-0001 y T-0002 siguen sin ejecutar, en estado NUEVA.
+
+Estado:
+A3.2 = CERRADA
+A3.3 = LISTO_PARA_REVISION

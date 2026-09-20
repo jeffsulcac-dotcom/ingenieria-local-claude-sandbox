@@ -406,6 +406,7 @@ def latido_rezagado(raiz: Path, vieja):
         exigir_propietario=vieja.trabajador_id,
         estados_admitidos={Estado.EN_EJECUCION},
         exigir_generacion=vieja.generacion,
+        campos_propios=nucleo.CAMPOS_LATIDO,
     )
 
 
@@ -423,6 +424,7 @@ def devolucion_rezagada(raiz: Path, vieja):
         exigir_propietario=vieja.trabajador_id,
         estados_admitidos={Estado.EN_EJECUCION},
         exigir_generacion=vieja.generacion,
+        campos_propios=nucleo.CAMPOS_DEVOLVER,
     )
 
 
@@ -449,6 +451,7 @@ def verificacion_rezagada(raiz: Path, vieja):
         exigir_propietario=vieja.trabajador_id,
         estados_admitidos={Estado.EN_EJECUCION},
         exigir_generacion=vieja.generacion,
+        campos_propios=nucleo.CAMPOS_VERIFICAR,
     )
 
 
@@ -463,7 +466,9 @@ def persistencia_rezagada(raiz: Path, vieja):
     ficha = copy.deepcopy(vieja)
     ficha.ultima_falla = {"motivo": "Escritura rezagada sin propietario."}
 
-    nucleo.persistir(raiz, ficha)
+    nucleo.persistir(
+        raiz, ficha, campos_propios=("ultima_falla",)
+    )
 
 
 REZAGADAS = (
@@ -610,6 +615,7 @@ def prueba_c_el_espejo_json_no_se_regenera_en_un_rechazo():
                 exigir_propietario=vieja.trabajador_id,
                 estados_admitidos={Estado.EN_EJECUCION},
                 exigir_generacion=vieja.generacion,
+                campos_propios=nucleo.CAMPOS_LATIDO,
             ),
             "latido rezagado",
             estado_global.MOTIVO_GENERACION_VENCIDA,
@@ -691,6 +697,7 @@ def prueba_d_mismo_trabajador_nueva_ejecucion():
             exigir_propietario=segunda.trabajador_id,
             estados_admitidos={Estado.EN_EJECUCION},
             exigir_generacion=segunda.generacion,
+            campos_propios=nucleo.CAMPOS_LATIDO,
         )
         METRICAS["ORDENES_TOTALES"] += 1
         METRICAS["ORDENES_ACEPTADAS"] += 1
@@ -2595,6 +2602,7 @@ def prueba_s2_la_misma_ficha_se_puede_persistir_dos_veces():
                 ficha,
                 exigir_propietario="worker-A",
                 exigir_generacion=ficha.generacion,
+                campos_propios=nucleo.CAMPOS_LATIDO,
             )
             METRICAS["ORDENES_TOTALES"] += 1
             METRICAS["ORDENES_ACEPTADAS"] += 1
@@ -2606,7 +2614,9 @@ def prueba_s2_la_misma_ficha_se_puede_persistir_dos_veces():
         nucleo.transicionar(
             ficha, Estado.REABIERTO, "Devuelta.", nucleo.ORIGEN_AUTOMATICO
         )
-        nucleo.persistir(raiz, ficha)
+        nucleo.persistir(
+            raiz, ficha, campos_propios=nucleo.CAMPOS_DEVOLVER
+        )
         METRICAS["ORDENES_TOTALES"] += 1
         METRICAS["ORDENES_ACEPTADAS"] += 1
 
@@ -2665,7 +2675,9 @@ def prueba_s_orden_humana_rezagada_no_revierte_una_transicion():
         )
 
         informe = exigir_rechazo(
-            lambda: nucleo.persistir(raiz, vieja),
+            lambda: nucleo.persistir(
+                raiz, vieja, campos_propios=("ultima_falla",)
+            ),
             "orden humana rezagada",
             estado_global.MOTIVO_ESTADO_INCOMPATIBLE,
         )

@@ -50,10 +50,12 @@ Este módulo no realiza cálculos de ingeniería.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import socket
 import sqlite3
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
@@ -93,8 +95,35 @@ LATIDO_MAXIMO_S = 900
 # latido tampoco es reciente.
 LATIDO_GRACIA_S = 120
 
+# Antigüedad de latido a partir de la cual se da la ejecución por perdida
+# aunque no se pueda comprobar el proceso (por ejemplo, otra máquina).
+#
+# Es el único umbral que decide SOLO, y por eso es holgado: una hora sin
+# una señal que se emite automáticamente mientras dura el trabajo ya no
+# admite otra lectura.
+LATIDO_ABANDONO_S = 3600
+
+# Cada cuánto late el acompañante automático de una operación larga.
+#
+# Un minuto es holgado frente a los 900 s que tarda un latido en caducar:
+# harían falta quince fallos seguidos para que una operación viva pareciera
+# caducada, y cada latido cuesta una escritura de una columna.
+INTERVALO_LATIDO_S = 60
+
+# Lo que se espera a que el hilo del latido termine al cerrar.
+ESPERA_CIERRE_LATIDO_S = 10
+
+# Fallos transitorios de SQLite seguidos que se toleran antes de darse por
+# vencido. Uno solo no puede apagar el latido: `database is locked` ocurre
+# de verdad bajo concurrencia y dura milisegundos.
+FALLOS_LATIDO_SEGUIDOS = 5
+
 ORIGEN_AUTOMATICO = "automático"
 ORIGEN_HUMANO = "humano"
+
+# Tipo de `ultima_falla` cuando lo único que frena la propuesta son
+# decisiones humanas pendientes. `decidir` la retira al resolver la última.
+FALLA_DECISIONES_PENDIENTES = "decisiones_pendientes"
 
 # Estados a los que el Supervisor NUNCA puede llegar por su cuenta.
 ESTADOS_SOLO_HUMANOS = frozenset({Estado.APROBADO, Estado.RECHAZADO})
@@ -149,6 +178,31 @@ TRANSICIONES = {
 CLASE_ACTIVA = "ACTIVA"
 CLASE_HUERFANA = "HUERFANA"
 CLASE_INCONSISTENTE = "INCONSISTENTE"
+
+# A3.3 — una ejecución cuyo latido caducó pero que NO está demostrada muerta.
+#
+# Es el estado que faltaba, y su ausencia hacía que un latido viejo bastara
+# por sí solo para declarar abandono. Un latido es una señal débil: puede
+# faltar porque el trabajador murió, pero también porque estuvo una hora
+# compilando, porque el reloj de la otra máquina va adelantado o porque
+# nadie emitió latidos manualmente. Declarar huérfana una tarea por eso es
+# arrebatársela a alguien que sigue trabajando.
+CLASE_LATIDO_VENCIDO = "LATIDO_VENCIDO"
+
+# Estados de vitalidad que se informan (no son estados de la tarea).
+VITALIDAD_ACTIVA = "ACTIVA"
+VITALIDAD_LATIDO_VENCIDO = "LATIDO_VENCIDO"
+VITALIDAD_HUERFANA = "HUERFANA"
+VITALIDAD_FINALIZADA = "FINALIZADA"
+VITALIDAD_REANUDABLE = "REANUDABLE"
+# PROPUESTO y BLOQUEADO no están cerradas: esperan a alguien. Rotularlas
+# FINALIZADA contradecía al motivo que se imprimía al lado.
+VITALIDAD_ESPERA_HUMANA = "ESPERA_HUMANA"
+
+# Estados sin ejecución en curso que NO están cerrados: esperan a alguien.
+ESTADOS_QUE_ESPERAN_A_UNA_PERSONA = frozenset(
+    {str(Estado.PROPUESTO), str(Estado.BLOQUEADO)}
+)
 
 
 class ErrorSupervisor(Exception):
@@ -558,6 +612,60 @@ COLUMNAS_OPERATIVAS = (
 )
 
 
+# Campos que cada orden POSEE, es decir los únicos que puede escribir.
+#
+# A3.2 protegió QUIÉN escribe y DESDE QUÉ momento; no QUÉ. `persistir`
+# reescribía las dieciséis columnas operativas en bloque a partir de la foto
+# que `cargar` había leído, así que dos órdenes perfectamente válidas de la
+# misma generación, propietario y estado —un latido y una decisión humana,
+# por ejemplo— se pisaban campo a campo: la segunda devolvía a la columna
+# de la primera el valor que tenía cuando ella leyó. Un lost update de
+# manual, y silencioso.
+#
+# Desde A3.3 cada orden declara lo suyo y no toca nada más.
+# `actualizado_en` se añade siempre: es la marca de "algo cambió aquí", la
+# escribe con derecho cualquier orden que confirme, y que dos la pisen no
+# pierde información de estado.
+CAMPOS_LATIDO = ("ultimo_latido",)
+
+# Soltar al trabajador: lo hacen todas las órdenes que cierran un turno.
+# Al soltar el turno se suelta también el árbol. El worktree pertenece a la
+# EJECUCIÓN, no a la tarea: si se quedaba pegado, el trabajador siguiente
+# —que no puede saberlo— acababa verificando en el árbol del anterior. Sus
+# pruebas corrían sobre trabajo ajeno y el resultado se grababa como suyo.
+CAMPOS_LIBERACION = (
+    "trabajador_id",
+    "pid",
+    "iniciado_en",
+    "ultimo_latido",
+    "worktree",
+)
+
+CAMPOS_TRANSICION = ("estado",)
+
+CAMPOS_DEVOLVER = CAMPOS_TRANSICION + CAMPOS_LIBERACION
+
+CAMPOS_VERIFICAR = (
+    CAMPOS_TRANSICION
+    + CAMPOS_LIBERACION
+    + ("ultima_falla", "ultima_verificacion", "ejecuciones")
+)
+
+CAMPOS_DECIDIR = ("decisiones", "requiere_decision_humana")
+
+# `reabrir` devuelve además el presupuesto de intentos, que es un valor
+# fijo (cero) y no un incremento.
+CAMPOS_REABRIR = CAMPOS_TRANSICION + CAMPOS_LIBERACION + ("intentos",)
+
+# `reanudar` cierra la ejecución interrumpida: la anota en `ejecuciones`,
+# deja constancia en `ultima_falla` y devuelve la tarea al circuito.
+CAMPOS_RECUPERAR = (
+    CAMPOS_TRANSICION
+    + CAMPOS_LIBERACION
+    + ("ejecuciones", "ultima_falla")
+)
+
+
 def cargar(raiz: Path, identificador: str) -> Ficha:
     """
     Tarea completa: definición desde el JSON, estado operativo desde SQLite.
@@ -584,7 +692,16 @@ def persistir(
     exigir_propietario: str | None = None,
     estados_admitidos=None,
     exigir_generacion: int | None = None,
+    campos_propios=None,
+    incrementos=None,
+    exigir_iguales=None,
+    exigir_no_retroceso=None,
 ) -> Ficha:
+    # `campos_propios` es OBLIGATORIO. Su valor por omisión era escribir
+    # las dieciséis columnas operativas, es decir, exactamente el defecto
+    # que A3.3 vino a eliminar: la siguiente orden que alguien añadiera lo
+    # haría mal por descuido y ninguna prueba lo notaría. Quien de verdad
+    # necesite escribirlo todo, que pase `COLUMNAS_OPERATIVAS` a mano.
     """
     Confirma el estado operativo de la ficha, si la propiedad sigue vigente.
 
@@ -643,7 +760,37 @@ def persistir(
         ficha.creado_en = ficha.actualizado_en
 
     fila = global_.fila_desde_ficha(ficha, ficha.actualizado_en)
-    campos = {columna: fila[columna] for columna in COLUMNAS_OPERATIVAS}
+
+    # Sólo lo que esta orden posee (A3.3). Sin `campos_propios` se escriben
+    # las dieciséis, que es lo que hacía A3.2 y lo que abre la puerta al
+    # lost update: queda disponible para quien deba escribir de verdad todo
+    # el estado operativo, pero ninguna orden del ciclo lo usa ya.
+    if campos_propios is None:
+        raise ErrorSupervisor(
+            "persistir() exige declarar qué columnas escribe esta orden "
+            "(campos_propios). Escribirlas todas es lo que provocaba que "
+            "dos órdenes válidas se pisaran."
+        )
+
+    propios = tuple(campos_propios)
+
+    incrementos = tuple(incrementos or ())
+
+    for columna in propios + incrementos:
+        if columna not in COLUMNAS_OPERATIVAS:
+            raise ErrorSupervisor(
+                "'" + str(columna) + "' no es una columna operativa: una "
+                "orden no puede declararla como suya."
+            )
+
+    campos = {columna: fila[columna] for columna in propios}
+
+    # La marca de actualización la escribe cualquier orden que confirme.
+    campos["actualizado_en"] = fila["actualizado_en"]
+
+    for columna in incrementos:
+        campos.pop(columna, None)
+
     eventos = list(ficha.eventos_pendientes)
 
     if estados_admitidos is None and ficha.estado_leido is not None:
@@ -664,6 +811,9 @@ def persistir(
                     momento=ficha.actualizado_en,
                     trabajador_id=exigir_propietario,
                     estados_admitidos=estados_admitidos,
+                    incrementos=incrementos,
+                    exigir_iguales=exigir_iguales,
+                    exigir_no_retroceso=exigir_no_retroceso,
                 )
 
                 if informe["resultado"] != global_.ESCRITURA_ACEPTADA:
@@ -671,6 +821,12 @@ def persistir(
 
                 for evento in eventos:
                     global_.insertar_evento(con, ficha.id, evento)
+
+                # La fila se relee DENTRO de la transacción para que la
+                # ficha refleje lo que el COMMIT confirma, incluidos los
+                # incrementos que resolvió el motor y los campos que esta
+                # orden NO escribió y que otra pudo haber cambiado.
+                confirmada = global_.obtener_tarea(con, ficha.id)
     except ErrorPropiedad:
         # La ficha en memoria vuelve a ser el reflejo de lo que hay grabado:
         # nada cambió, y sus marcas de tiempo no deben sugerir lo contrario.
@@ -679,6 +835,15 @@ def persistir(
         raise
 
     ficha.eventos_pendientes.clear()
+
+    # La ficha vuelve a ser el reflejo de la fila, no de lo que esta orden
+    # creía. Sin esto, escribir sólo lo propio dejaría en memoria los
+    # valores viejos de las columnas ajenas, y el espejo JSON los volcaría
+    # a disco: se habría cambiado un lost update en SQLite por otro en el
+    # archivo.
+    historial = list(ficha.historial)
+    global_.aplicar_fila(ficha, confirmada)
+    ficha.historial = historial
 
     # Lo que se acaba de confirmar es, a partir de ahora, lo leído: si la
     # misma ficha se persiste otra vez, la precondición tiene que ser el
@@ -760,6 +925,51 @@ def credencial_de(
     return (ficha.trabajador_id, int(ficha.generacion or 0))
 
 
+CAMPOS_DECLARATIVOS = (
+    "objetivo",
+    "criterios_aceptacion",
+    "pruebas_requeridas",
+    "ambito_archivos",
+    "max_intentos",
+)
+
+
+def _refrescar_declarativo(raiz: Path, ficha: Ficha) -> None:
+    """
+    Relee del disco lo que la ficha declara, justo antes de escribirla.
+
+    El espejo sólo debe reescribir los campos OPERATIVOS, que salen de
+    SQLite. Lo declarativo —objetivo, criterios, pruebas requeridas,
+    ámbito, presupuesto de intentos, decisiones declaradas— lo escribe una
+    persona en el archivo, y se quedaba en memoria tal como se leyó AL
+    EMPEZAR la orden. Con `verificar` esa ventana no son milisegundos: es
+    toda la batería de pruebas, minutos enteros. Lo que el ingeniero
+    escribiera mientras tanto desaparecía al terminar, sin aviso; incluida
+    una decisión humana recién declarada, con lo que la tarea se iba a
+    PROPUESTO saltándose justo la decisión que esa persona quería forzar.
+
+    Si el archivo no se puede leer, se escribe lo que hay en memoria: es lo
+    que se hacía siempre y no empeora nada.
+    """
+    try:
+        en_disco = leer(raiz, ficha.id)
+    except (ErrorFicha, OSError):
+        return
+
+    for campo in CAMPOS_DECLARATIVOS:
+        valor = getattr(en_disco, campo)
+        setattr(
+            ficha, campo, list(valor) if isinstance(valor, list) else valor
+        )
+
+    # Las decisiones son mixtas: la clave y la descripción son del archivo,
+    # la resolución es de la base. Se fusionan en vez de elegir una.
+    ficha.requiere_decision_humana = global_.fusionar_decisiones(
+        en_disco.requiere_decision_humana,
+        global_.decisiones_operativas(ficha.requiere_decision_humana),
+    )
+
+
 def _regenerar_espejo(raiz: Path, ficha: Ficha) -> None:
     """
     Reescribe el JSON como espejo de lo que SQLite ya confirmó.
@@ -768,6 +978,8 @@ def _regenerar_espejo(raiz: Path, ficha: Ficha) -> None:
     confirmado y la siguiente persistencia lo regenera: nunca hay dos
     escrituras contradictorias, porque el JSON siempre sale de SQLite.
     """
+    _refrescar_declarativo(raiz, ficha)
+
     try:
         guardar(raiz, ficha, marcar_actualizacion=False)
     except (ErrorFicha, OSError) as error:
@@ -783,6 +995,405 @@ def _regenerar_espejo(raiz: Path, ficha: Ficha) -> None:
 # Git: commits automáticos estrictamente limitados
 # ----------------------------------------------------------------------
 
+class ErrorCreacion(ErrorSupervisor):
+    """
+    No se pudo crear la tarea porque ya existía.
+
+    Es un error propio y no genérico porque perder una carrera de creación
+    es un resultado NORMAL —igual que perder una toma—, no una avería: el
+    que llega segundo tiene que poder distinguirlo de un fallo del sistema.
+    """
+
+
+class ErrorWorktree(ErrorSupervisor):
+    """
+    La ruta registrada como worktree de una tarea no se puede usar.
+
+    No existe, no es un directorio, o pertenece a otro repositorio. Es un
+    error propio y no genérico porque la respuesta del operador es distinta
+    en cada caso y porque una ruta ajena NUNCA debe ejecutarse por el
+    hecho de existir.
+    """
+
+
+# Variables que hacen que `git` deje de mirar el directorio en el que se le
+# invoca. Están puestas SIEMPRE dentro de un hook, y también en
+# `git rebase --exec`, `git bisect run` y en muchos envoltorios de CI. Con
+# `GIT_DIR` heredado, dos `rev-parse` desde directorios distintos devuelven
+# lo mismo y la comprobación de pertenencia deja de comprobar nada: se llegó
+# a aceptar `/tmp` como worktree de la tarea. Se quitan antes de preguntar.
+VARIABLES_GIT_HEREDADAS = (
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+)
+
+
+def entorno_git_limpio() -> dict:
+    """Copia del entorno sin las variables que redirigen a `git`."""
+    entorno = dict(os.environ)
+
+    for nombre in VARIABLES_GIT_HEREDADAS:
+        entorno.pop(nombre, None)
+
+    return entorno
+
+
+def _identidad_de_arbol(ruta: Path) -> tuple:
+    """
+    (raíz del checkout, directorio común) que `git` ve desde DENTRO de
+    `ruta`; (None, None) si no puede contestar desde ahí (una carpeta
+    corriente, un `.git` roto, un repositorio bare, un volumen que no
+    responde).
+
+    Con el entorno saneado y sin memorizar, por lo mismo que
+    `arboles_registrados`: es una decisión de seguridad. No reutiliza
+    `estado_global.git_common_dir` a propósito: aquélla memoriza por
+    proceso y lanza sus propios errores; aquí una respuesta dudosa tiene
+    que valer «no», no «lo que se recordaba».
+    """
+    try:
+        resultado = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel", "--git-common-dir"],
+            cwd=str(ruta),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=entorno_git_limpio(),
+        )
+    except OSError:
+        return (None, None)
+
+    if resultado.returncode != 0:
+        return (None, None)
+
+    lineas = [linea for linea in resultado.stdout.splitlines() if linea.strip()]
+
+    if len(lineas) < 2:
+        return (None, None)
+
+    def resolver(texto: str) -> Path | None:
+        camino = Path(texto.strip())
+
+        if not camino.is_absolute():
+            camino = Path(ruta) / camino
+
+        try:
+            return camino.resolve()
+        except OSError:
+            return None
+
+    return (resolver(lineas[0]), resolver(lineas[1]))
+
+
+def _inventario_de_arboles(raiz: Path) -> tuple:
+    """
+    Lo que `git worktree list --porcelain` conoce, ya resuelto y en dos
+    montones: los árboles UTILIZABLES y los que Git lista pero no sirven,
+    con el motivo.
+
+    Es la lista canónica: la que `git worktree list` imprime, la misma que
+    ve una persona. Incluye el árbol principal.
+
+    Git sigue listando una entrada cuyo directorio o cuyo `.git` ya no
+    están, y la marca `prunable` con el motivo; y un repositorio `bare`
+    figura sin árbol de trabajo. Ninguna de las dos vale como destino de
+    una ejecución. La línea `prunable` se ignoraba: un worktree borrado con
+    `rm -rf` y vuelto a crear como carpeta corriente —sin `.git`, con una
+    prueba verde dentro— se aceptaba, `git` no podía leer ahí ni rama ni
+    commit, y `verificar` corría igual grabando los dos vacíos.
+
+    Se pregunta a Git cada vez, sin memorizar. Es una invocación por
+    validación —no cientos—, y una decisión de seguridad no debe depender
+    de si este proceso ya había mirado antes ese directorio: eso haría que
+    el mismo estado del disco diera veredictos distintos.
+    """
+    try:
+        resultado = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=str(raiz),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=entorno_git_limpio(),
+        )
+    except OSError as error:
+        raise ErrorWorktree(
+            "No se pudo consultar la lista de worktrees de Git: "
+            + str(error)
+        ) from None
+
+    if resultado.returncode != 0:
+        raise ErrorWorktree(
+            "Git no pudo listar los worktrees desde '" + str(raiz) + "': "
+            + (resultado.stderr or "").strip()
+        )
+
+    utilizables = set()
+    descartados = {}
+
+    # El formato porcelain va por bloques separados por una línea en
+    # blanco: `worktree <ruta>` primero y después sus atributos (`HEAD`,
+    # `branch`, `detached`, `bare`, `locked`, `prunable [motivo]`).
+    bloque = []
+
+    for linea in resultado.stdout.splitlines() + [""]:
+        if linea:
+            bloque.append(linea)
+            continue
+
+        if not bloque:
+            continue
+
+        ruta_declarada = None
+        motivo = None
+
+        for atributo in bloque:
+            if atributo.startswith("worktree "):
+                # Sin recortar: un nombre que termina en espacio es legal.
+                ruta_declarada = atributo[len("worktree "):]
+            elif atributo == "bare":
+                motivo = "es un repositorio bare, sin árbol de trabajo"
+            elif atributo.startswith("prunable"):
+                detalle = atributo[len("prunable"):].strip()
+                motivo = "Git la marca como prunable" + (
+                    " (" + detalle + ")" if detalle else ""
+                )
+
+        bloque = []
+
+        if ruta_declarada is None:
+            continue
+
+        try:
+            resuelta = Path(ruta_declarada).resolve()
+        except OSError:
+            # Un worktree listado pero irresoluble no sirve como destino;
+            # tampoco es motivo para tumbar la validación de los demás.
+            continue
+
+        if motivo is None:
+            utilizables.add(resuelta)
+        else:
+            descartados[resuelta] = motivo
+
+    return utilizables, descartados
+
+
+def arboles_registrados(raiz: Path) -> set:
+    """Los worktrees UTILIZABLES que Git reconoce para este repositorio."""
+    return _inventario_de_arboles(raiz)[0]
+
+
+def resolver_worktree(raiz: Path, declarado: str | None) -> Path:
+    """
+    Convierte la ruta registrada de un worktree en una raíz utilizable.
+
+    Devuelve la raíz resuelta cuando no se declara nada. Desde la revisión
+    final toda toma graba su árbol —la raíz desde la que se tomó si no se
+    declaró otro—, así que este camino queda para las órdenes que no vienen
+    de una toma.
+
+    Qué se comprueba, y por qué cada cosa
+    -------------------------------------
+    - Que exista y sea un DIRECTORIO. Un archivo con ese nombre, o una ruta
+      borrada, no es un árbol de trabajo.
+
+    - Que Git lo reconozca como worktree de ESTE repositorio, preguntándole
+      a `git worktree list`. Es la comprobación que impide ejecutar una ruta
+      ajena, y es más estricta que comparar el directorio común: ese valor
+      no lo decide el repositorio, lo decide un archivo `.git` de una línea
+      que vive en el directorio candidato. Copiar un worktree con `cp -a`,
+      moverlo sin `git worktree repair`, o escribir a mano
+      `gitdir: <principal>/.git/worktrees/A` en cualquier carpeta, producía
+      un directorio que se aceptaba y que `git worktree list` no ha listado
+      nunca. Peor: la rama y el commit se leían de ese `.git` prestado, así
+      que la evidencia grabada era la del worktree legítimo y el historial
+      afirmaba haber verificado un commit que nadie ejecutó.
+
+      Un subdirectorio cualquiera tampoco vale, por lo mismo: el corredor
+      descubre `<arbol>/pruebas/**/prueba_*.py`, así que un subdirectorio
+      con una sola prueba verde dentro bastaba para llegar a PROPUESTO
+      saltándose la batería entera.
+
+      Dos cosas más que la lista sola no cubre (revisión final de A3.3):
+      una entrada `prunable` —el directorio o su `.git` desaparecieron— o
+      `bare` no vale aunque Git la liste; y el árbol que hay en la ruta
+      tiene que responder por ESTE repositorio (`git rev-parse
+      --git-common-dir` desde dentro). Git sólo comprueba que
+      `<ruta>/.git` exista, así que una ruta que este repositorio registró
+      y borró, y que OTRO repositorio reutilizó después para un worktree
+      suyo, sigue en la lista como válida con el checkout del otro.
+
+    Sobre las rutas, que es donde se esconden los disgustos:
+
+    - Una ruta RELATIVA se interpreta contra `raiz`, nunca contra el
+      directorio desde el que se invocó el Supervisor, que puede ser
+      cualquiera. En Windows hay dos formas que NO son absolutas y que sin
+      embargo ignorarían la raíz al unirlas —`C:pruebas`, relativa a la
+      unidad, y `\\pruebas`, con raíz pero sin unidad—: se rechazan con un
+      mensaje propio en vez de resolverse contra el directorio actual del
+      proceso.
+    - `expanduser` resuelve `~`; `resolve` normaliza `..`, los enlaces
+      simbólicos y las junctions de Windows, y en Windows además unifica la
+      letra de unidad y el caso del sistema de archivos. Por eso la
+      comparación se hace SIEMPRE entre rutas resueltas.
+    - La ruta NO se recorta: un directorio cuyo nombre termina en espacio es
+      legal en POSIX y `git worktree add` lo crea sin protestar. Sólo se
+      recorta para decidir si la cadena está en blanco, que es otra cosa.
+    - Los espacios no necesitan nada especial porque nunca se construye una
+      línea de órdenes de texto: `subprocess` recibe una lista.
+    """
+    if declarado is None or not str(declarado).strip():
+        return Path(raiz).resolve()
+
+    try:
+        candidato = Path(str(declarado)).expanduser()
+    except RuntimeError as error:
+        # `~usuario` de un usuario que no existe: pathlib lanza RuntimeError
+        # y salía como traceback con código 1, no como ruta inválida (6).
+        raise ErrorWorktree(
+            "No se pudo expandir '~' en la ruta del worktree '"
+            + str(declarado) + "': " + str(error)
+        ) from None
+
+    if not candidato.is_absolute():
+        if candidato.drive or candidato.root:
+            # `C:pruebas` o `\\pruebas` en Windows. Unirlas a la raíz
+            # descartaría la raíz y acabarían resolviéndose contra el
+            # directorio actual del proceso, que es justo lo que esta
+            # función promete no hacer.
+            raise ErrorWorktree(
+                "La ruta del worktree '" + str(declarado) + "' no es "
+                "absoluta pero lleva unidad o raíz, así que no se puede "
+                "interpretar contra la raíz del repositorio. Decláralo con "
+                "una ruta absoluta o relativa sin unidad."
+            )
+
+        candidato = Path(raiz) / candidato
+
+    try:
+        candidato = candidato.resolve()
+    except OSError as error:
+        raise ErrorWorktree(
+            "No se pudo resolver la ruta del worktree '" + str(declarado)
+            + "': " + str(error)
+        ) from None
+
+    try:
+        existe = candidato.exists()
+        es_directorio = candidato.is_dir()
+    except OSError as error:
+        # Ruta demasiado larga, volumen desmontado, recurso de red que no
+        # responde. Decirlo así evita mandar al operador a buscar un
+        # directorio borrado que en realidad está ahí.
+        raise ErrorWorktree(
+            "No se pudo consultar la ruta del worktree '" + str(candidato)
+            + "': " + str(error)
+        ) from None
+
+    if not existe:
+        raise ErrorWorktree(
+            "El worktree registrado no existe: '" + str(candidato) + "'."
+        )
+
+    if not es_directorio:
+        raise ErrorWorktree(
+            "El worktree registrado no es un directorio: '"
+            + str(candidato) + "'."
+        )
+
+    try:
+        propia = Path(raiz).resolve()
+    except OSError:
+        propia = Path(raiz)
+
+    if candidato == propia:
+        return candidato
+
+    registrados, descartados = _inventario_de_arboles(raiz)
+
+    if candidato in descartados:
+        raise ErrorWorktree(
+            "La ruta '" + str(candidato) + "' figura en la lista de "
+            "worktrees de Git, pero no es utilizable: "
+            + descartados[candidato] + ". Repárala (`git worktree repair`) "
+            "o retírala (`git worktree prune`) antes de declararla."
+        )
+
+    if candidato not in registrados:
+        raise ErrorWorktree(
+            "La ruta '" + str(candidato) + "' no es un worktree registrado "
+            "de este repositorio. Git conoce estos: "
+            + (", ".join(sorted(str(uno) for uno in registrados)) or "ninguno")
+            + ". No se ejecuta una ruta ajena por el hecho de que exista."
+        )
+
+    # Y que el árbol que HAY AHÍ sea un checkout de este repositorio con
+    # la raíz justo en esa ruta. La lista de Git no lo garantiza: Git sólo
+    # comprueba que `<ruta>/.git` exista, así que si otro repositorio
+    # registra un worktree en una ruta que aquí se había registrado y
+    # borrado, esta lista la sigue dando por buena y el checkout es del
+    # otro. Reproducido: `verificar` habría corrido las pruebas del otro
+    # proyecto y grabado SU rama y SU commit como evidencia de esta tarea.
+    # Y si el `.git` de un worktree anidado en la raíz desaparece, `git`
+    # desde dentro SUBE y responde por la raíz: rama y commit de main
+    # sobre las pruebas del worktree. Comparar el directorio común no
+    # bastaba SOLO —un `.git` copiado lo declara igual—; junto con la
+    # lista y la raíz del checkout, sí: la lista descarta la copia, el
+    # directorio común descarta la ruta reutilizada y la raíz descarta el
+    # directorio que responde por otro árbol.
+    raiz_candidato, comun_candidato = _identidad_de_arbol(candidato)
+    _, comun_propio = _identidad_de_arbol(propia)
+
+    if raiz_candidato is None or comun_candidato is None:
+        raise ErrorWorktree(
+            "La ruta '" + str(candidato) + "' está registrada como "
+            "worktree, pero Git no responde desde dentro de ella: no hay "
+            "ahí un checkout que se pueda ejecutar."
+        )
+
+    if raiz_candidato != candidato:
+        raise ErrorWorktree(
+            "La ruta '" + str(candidato) + "' está registrada como "
+            "worktree, pero el árbol que Git ve desde ahí tiene su raíz en '"
+            + str(raiz_candidato) + "': no es un checkout propio y su rama "
+            "y su commit serían los de otro árbol."
+        )
+
+    if comun_propio is None or comun_candidato != comun_propio:
+        raise ErrorWorktree(
+            "La ruta '" + str(candidato) + "' está registrada como "
+            "worktree, pero el árbol que hay ahí responde por otro "
+            "repositorio (directorio común " + str(comun_candidato)
+            + " frente a " + str(comun_propio) + "). No se ejecuta un "
+            "árbol ajeno."
+        )
+
+    return candidato
+
+
+# El espejo JSON de las fichas está versionado y lo reescribe el propio
+# Supervisor: `tomar` lo deja modificado en cualquier rama que no sea la de
+# la tarea (el commit automático se rechaza), y `decidir` o un `latido`
+# manual lo regeneran. Si contara como «cambio del árbol», una decisión
+# humana resuelta MIENTRAS corre la batería —justo el caso que `verificar`
+# maneja releyendo las decisiones— haría abortar la corrida entera con
+# «el árbol cambió». Pasó: la huella del contenido lo introdujo y el
+# crítico de completitud de la revisión final lo destapó antes de cerrar.
+# Se excluye ese rastro de la huella y de «sucio»; el contenido que juzga
+# la evidencia es el del proyecto, no el del propio Supervisor.
+RASTRO_PROPIO_EXCLUIDO = ":(exclude)orquestacion/tareas/"
+
+
 class Git:
     """Acceso mínimo a Git, con los límites del Supervisor incorporados."""
 
@@ -790,14 +1401,26 @@ class Git:
         self.raiz = Path(raiz)
 
     def _ejecutar(self, *argumentos: str) -> subprocess.CompletedProcess:
-        return subprocess.run(
-            ["git", *argumentos],
-            cwd=str(self.raiz),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        try:
+            return subprocess.run(
+                ["git", *argumentos],
+                cwd=str(self.raiz),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                # Sin sanear, un `GIT_DIR` heredado (siempre presente dentro
+                # de un hook) haría que `git` ignorase `cwd` y respondiera
+                # por OTRO árbol: la evidencia de la corrida sería falsa.
+                env=entorno_git_limpio(),
+            )
+        except OSError as error:
+            # El árbol puede desaparecer mientras corren las pruebas. Eso no
+            # debe salir como un traceback de la biblioteca estándar: se
+            # devuelve un fallo normal y quien llama decide.
+            return subprocess.CompletedProcess(
+                ["git", *argumentos], 1, "", str(error)
+            )
 
     def disponible(self) -> bool:
         try:
@@ -822,6 +1445,54 @@ class Git:
             return None
 
         return resultado.stdout.strip() or None
+
+    def hay_cambios_sin_confirmar(self) -> bool:
+        """
+        Si el árbol tiene algo sin confirmar EN ARCHIVOS VERSIONADOS.
+
+        Hace falta junto al commit: un cambio sin confirmar no mueve el
+        hash, así que sin esto un archivo editado a mitad de la corrida
+        pasaría por «el árbol no se movió».
+
+        Los archivos sin versionar se excluyen a propósito
+        (`--untracked-files=no`). Una batería de pruebas normal deja
+        rastro —informes de cobertura, salidas, `__pycache__` cuando no se
+        desactiva—, y contarlo como «el árbol se movió» haría que ninguna
+        verificación pudiera aprobarse jamás en un proyecto real. Lo que
+        importa aquí es si cambió el CONTENIDO que el commit describe.
+        """
+        resultado = self._ejecutar(
+            "status", "--porcelain", "--untracked-files=no",
+            "--", ".", RASTRO_PROPIO_EXCLUIDO,
+        )
+
+        if resultado.returncode != 0:
+            return False
+
+        return bool(resultado.stdout.strip())
+
+    def huella_de_cambios(self) -> str | None:
+        """
+        Resumen (SHA-1) de TODO lo que difiere de HEAD en archivos
+        versionados, preparado o no. None si Git no puede responder.
+
+        Comparar sólo «¿hay cambios sin confirmar?» antes y después de la
+        corrida no detectaba que el CONTENIDO cambiara a mitad: un archivo
+        editado antes de correr y vuelto a editar durante la batería daba
+        `True == True` y pasaba por «árbol quieto». La huella cambia con
+        cualquier edición de un archivo versionado; los archivos sin
+        versionar siguen fuera, por lo mismo que en
+        `hay_cambios_sin_confirmar`.
+        """
+        resultado = self._ejecutar(
+            "diff", "HEAD", "--no-ext-diff", "--no-color",
+            "--", ".", RASTRO_PROPIO_EXCLUIDO,
+        )
+
+        if resultado.returncode != 0:
+            return None
+
+        return hashlib.sha1(resultado.stdout.encode("utf-8")).hexdigest()
 
     def commit_ficha(self, identificador: str, mensaje: str) -> dict:
         """
@@ -940,8 +1611,11 @@ def crear(
     """Crea una ficha nueva en estado NUEVO."""
     validar_id(identificador)
 
+    # Atajo amable, no la garantía: evita construir la ficha entera para
+    # nada en el caso normal. Quien decide de verdad es la comprobación de
+    # abajo, hecha con el bloqueo de escritura tomado.
     if existe(raiz, identificador):
-        raise ErrorSupervisor(
+        raise ErrorCreacion(
             "Ya existe la ficha '" + identificador + "'."
         )
 
@@ -960,9 +1634,17 @@ def crear(
         requiere_decision_humana=normalizar_decisiones(decisiones),
     )
 
+    # Las marcas se ponen aquí y no al escribir el JSON: el espejo se
+    # escribe DESPUÉS del COMMIT y con `marcar_actualizacion=False`, así
+    # que si no se fijaran ahora la fila nacería sin fechas.
+    nacimiento = ahora_utc()
+
+    ficha.creado_en = nacimiento
+    ficha.actualizado_en = nacimiento
+
     ficha.registrar_evento(
         {
-            "fecha": ahora_utc(),
+            "fecha": nacimiento,
             "tipo": global_.EVENTO_CREACION,
             "estado_anterior": None,
             "estado_nuevo": str(Estado.NUEVO),
@@ -971,20 +1653,54 @@ def crear(
         }
     )
 
-    # La definición es el contrato: primero el JSON versionable, después su
-    # incorporación al estado global (misma vía que el bootstrap).
+    # Crear es un acto único: o lo hace uno o no lo hace nadie (A3.3).
+    #
+    # La comprobación de existencia y el INSERT ocurren DENTRO de la misma
+    # transacción. Antes la comprobación se hacía en autocommit, con lo que
+    # dos procesos que crearan la misma tarea a la vez pasaban los dos, los
+    # dos escribían su JSON —el segundo pisando al primero— y sólo entonces
+    # la clave primaria rechazaba a uno. El perdedor se iba con un error,
+    # pero dejaba su definición escrita encima de la del ganador.
+    #
+    # Con BEGIN IMMEDIATE el segundo espera a que el primero confirme, y
+    # entonces ve la fila y se rechaza SIN escribir nada.
+    #
+    # EL JSON SE ESCRIBE DESPUÉS DEL COMMIT, y esto importa (auditoría R1).
+    # El sistema de archivos no es transaccional: `os.replace` es visible
+    # para todo el mundo en el acto y ningún ROLLBACK lo deshace. Con la
+    # escritura dentro, cualquier corte posterior —Ctrl-C, un `kill`, un
+    # apagón— dejaba exactamente lo que esta función declara imposible:
+    # ficha JSON sin fila. Y el huérfano no era inerte: `crear` fallaba
+    # para siempre con ese identificador, y la primera orden de LECTURA lo
+    # incorporaba en silencio, así que la tarea que no creó nadie acababa
+    # existiendo con la definición del proceso muerto.
+    #
+    # Al revés el daño es reparable y menor: si falla el espejo, hay fila
+    # sin ficha, y la base es la autoridad. Se dice y se puede regenerar.
+    #
+    # De paso, el candado de escritura de TODA la base deja de retenerse
+    # durante el `fsync` del archivo, que es lo que `tomar` ya evitaba a
+    # propósito.
     with global_.conexion(raiz) as con:
-        if global_.obtener_tarea(con, identificador) is not None:
-            raise ErrorSupervisor(
-                "La tarea '" + identificador + "' ya existe en el estado "
-                "global aunque su ficha JSON no esté: no se puede volver a "
-                "crear con el mismo identificador."
-            )
-
-        guardar(raiz, ficha)
-
         with global_.transaccion(con):
+            if global_.obtener_tarea(con, identificador) is not None:
+                raise ErrorCreacion(
+                    "La tarea '" + identificador + "' ya existe en el "
+                    "estado global: no se puede volver a crear con el "
+                    "mismo identificador."
+                )
+
+            # Se relee el árbol con el bloqueo tomado: entre la
+            # comprobación de arriba y este punto, otro proceso pudo haber
+            # creado la ficha y confirmado.
+            if existe(raiz, identificador):
+                raise ErrorCreacion(
+                    "Ya existe la ficha '" + identificador + "'."
+                )
+
             global_.importar_ficha(con, ficha, evento_importacion=False)
+
+    _regenerar_espejo(raiz, ficha)
 
     ficha.eventos_pendientes.clear()
 
@@ -1018,6 +1734,7 @@ def tomar(
     pid: int | None = None,
     ahora: datetime | None = None,
     git=None,
+    worktree: str | None = None,
 ) -> Ficha:
     """
     Reclama una tarea para trabajarla. Toma ATÓMICA desde A3.1.
@@ -1094,7 +1811,30 @@ def tomar(
             "repositorio. Patrones inválidos: " + ", ".join(invalidos) + "."
         )
 
-    momento = (ahora or ahora_datetime()).isoformat(timespec="seconds")
+    # El worktree se valida ANTES de abrir la transacción, porque mirar el
+    # sistema de archivos y preguntarle a Git son esperas de disco y no
+    # deben hacerse con el bloqueo de escritura tomado. Si la ruta no vale,
+    # la toma ni se intenta.
+    # El árbol lo declara CADA ejecución. Heredarlo de la anterior era una
+    # trampa: el trabajador nuevo, que no tiene forma de saberlo, acababa
+    # verificando en el árbol del que estuvo antes. Y si ese árbol había
+    # desaparecido, la toma se concedía igual y el fallo sólo aparecía al
+    # verificar, con el trabajo ya hecho.
+    #
+    # Se valida ANTES de abrir la transacción, porque mirar el sistema de
+    # archivos y preguntarle a Git son esperas de disco y no deben hacerse
+    # con el bloqueo de escritura tomado.
+    # Sin declararlo, el árbol de la ejecución es la raíz desde la que se
+    # TOMA. Grabar None significaba «la raíz desde la que se invoque la
+    # SIGUIENTE orden»: un trabajador que tomaba desde su worktree sin
+    # `--worktree` y un operador que verificaba desde main proponían una
+    # tarea cuyo trabajo nunca se ejecutó (reproducido en la revisión
+    # final). El árbol pertenece a la ejecución: se fija en la toma,
+    # siempre.
+    arbol_declarado = str(
+        resolver_worktree(raiz, worktree) if worktree
+        else Path(raiz).resolve()
+    )
 
     aspirante = trabajador_id or nuevo_trabajador_id()
     proceso = pid if pid is not None else os.getpid()
@@ -1104,7 +1844,9 @@ def tomar(
     commit_inicial = ficha.commit_inicial
 
     if git is not None and commit_inicial is None:
-        commit_inicial = git.hash_actual()
+        # El commit de partida es el del árbol donde se va a trabajar, no
+        # el de la raíz desde la que se ordena la toma.
+        commit_inicial = Git(Path(arbol_declarado)).hash_actual()
 
     # El árbol de trabajo y Git se leen ANTES de abrir la transacción.
     definiciones, ilegibles = listar_con_errores(raiz)
@@ -1126,6 +1868,12 @@ def tomar(
         global_.sincronizar_lista(con, definiciones, solo_importar=True)
 
         with global_.transaccion(con):
+            # El instante de la toma —que es también el primer latido— se
+            # toma con el candado ya pedido, por lo mismo que en el latido
+            # automático: `BEGIN IMMEDIATE` puede esperar segundos bajo
+            # contención y una marca tomada antes nacería ya rancia.
+            momento = (ahora or ahora_datetime()).isoformat(timespec="seconds")
+
             filas = global_.listar_tareas(con)
 
             # Estado previo tal como lo ve ESTA transacción. Sólo sirve
@@ -1235,6 +1983,10 @@ def tomar(
                     # más ni menos: grabar otra cosa dejaría la fila
                     # diciendo algo que nadie comprobó.
                     "ambito_archivos": global_._a_json(ambito_reclamado),
+                    # El árbol donde esta ejecución va a trabajar, ya
+                    # validado. Queda grabado con la toma porque pertenece a
+                    # la ejecución, no a la definición de la tarea.
+                    "worktree": arbol_declarado,
                 },
             )
 
@@ -1293,10 +2045,11 @@ def latido(
 
     Es una orden manual. Los latidos automáticos pertenecen a A3.3/B.
 
-    A3.2: sólo la escribe el propietario VIGENTE. Un latido rezagado del
-    dueño anterior es el caso más peligroso de todos, porque `persistir`
-    reescribe también `trabajador_id`, `pid` e `iniciado_en`: sin condición
-    resucitaría a un propietario ya desplazado.
+    A3.2: sólo la escribe el propietario VIGENTE, con identidad, generación
+    y estado EN_EJECUCION en el WHERE. A3.3: escribe únicamente
+    `ultimo_latido` (`CAMPOS_LATIDO`); un latido rezagado del dueño
+    anterior se rechaza por la generación, y aunque entrara no podría
+    tocar la identidad de nadie.
     """
     ficha = cargar(raiz, identificador)
 
@@ -1319,6 +2072,13 @@ def latido(
         exigir_propietario=propietario,
         estados_admitidos={Estado.EN_EJECUCION},
         exigir_generacion=esperada,
+        campos_propios=CAMPOS_LATIDO,
+        # La misma guarda que el latido automático: la marca de vida no
+        # retrocede. Un latido manual desde una máquina con el reloj
+        # atrasado podía reducir la antigüedad de la señal y dejar la
+        # tarea huérfana en el acto. Si ya hay una marca más nueva, la
+        # orden se rechaza y lo dice.
+        exigir_no_retroceso={"ultimo_latido": ficha.ultimo_latido},
     )
 
     return ficha
@@ -1361,6 +2121,7 @@ def devolver(
         exigir_propietario=propietario,
         estados_admitidos={Estado.EN_EJECUCION},
         exigir_generacion=esperada,
+        campos_propios=CAMPOS_DEVOLVER,
     )
 
     _registrar_en_git(git, ficha, motivo)
@@ -1373,6 +2134,7 @@ def _liberar_trabajador(ficha: Ficha) -> None:
     ficha.pid = None
     ficha.iniciado_en = None
     ficha.ultimo_latido = None
+    ficha.worktree = None
 
 
 def verificar(
@@ -1383,6 +2145,7 @@ def verificar(
     git=None,
     trabajador_id: str | None = None,
     generacion: int | None = None,
+    intervalo_latido_s: float | None = None,
 ) -> dict:
     """
     Corre el filtro completo y decide el estado resultante.
@@ -1395,8 +2158,9 @@ def verificar(
     Ámbar:  pruebas verdes pero con decisión humana pendiente
             ->  REQUIERE_REVISION, sin consumir un intento
 
-    A2: las pruebas se ejecutan sobre `raiz`, no sobre el worktree de la
-    tarea. La verificación consciente del worktree pertenece a A3/B.
+    A3.3: las pruebas se ejecutan en el worktree REGISTRADO de la tarea, y
+    el resultado guarda dónde se ejecutó —árbol, rama y commit— además de
+    comprobar que el árbol no se movió mientras corrían.
     """
     ficha = cargar(raiz, identificador)
 
@@ -1413,7 +2177,145 @@ def verificar(
         ficha, "verificar", trabajador_id, generacion
     )
 
-    corrida = corredor.ejecutar_todas(raiz, tiempo_limite_s, ejecutable)
+    # A3.3 — LA RAÍZ DE EJECUCIÓN ES LA DE LA TAREA, NO LA DEL MANDATO.
+    #
+    # Si la tarea declara un worktree, las pruebas se corren AHÍ, venga el
+    # Supervisor invocado desde donde venga. Antes se corrían siempre sobre
+    # `raiz`, de modo que una tarea que vivía en el worktree X y se
+    # verificaba desde main ejecutaba las pruebas de main y grababa ese
+    # resultado como si fuera el suyo: un verde que no dice nada del
+    # trabajo que se estaba juzgando.
+    arbol = resolver_worktree(raiz, ficha.worktree)
+
+    testigo = Git(arbol)
+
+    # Correr la batería entera es la espera más larga del sistema. Sin
+    # latidos, una verificación de diez minutos deja la tarea sin señal todo
+    # ese rato y la recuperación la ve caducada: el trabajo honesto parece
+    # abandono. El acompañante late mientras dura y se para solo al salir,
+    # también si la corrida lanza.
+    acompanante = LatidoAutomatico(
+        raiz,
+        ficha.id,
+        propietario,
+        esperada,
+        intervalo_s=intervalo_latido_s,
+    )
+
+    # La evidencia se toma ANTES de correr y se vuelve a tomar después.
+    #
+    # Leerla sólo al final era una afirmación falsa esperando a ocurrir:
+    # entre el arranque de la batería (hasta dos minutos por archivo) y la
+    # lectura del commit cabe cualquier `commit`, `rebase` o `checkout` del
+    # propio trabajador que sigue trabajando en ese árbol. Quedaba grabado
+    # «commit X, todo en verde» cuando X nunca se ejecutó y encima estaba
+    # rojo.
+    rama_inicio = testigo.rama_actual()
+    commit_inicio = testigo.hash_actual()
+    sucio_inicio = testigo.hay_cambios_sin_confirmar()
+    huella_inicio = testigo.huella_de_cambios()
+
+    try:
+        with acompanante:
+            corrida = corredor.ejecutar_todas(
+                arbol, tiempo_limite_s, ejecutable
+            )
+    except OSError as error:
+        # El corredor lanza cada prueba con `cwd=arbol`. Si el árbol
+        # desaparece ENTRE dos pruebas —`git worktree remove --force` de
+        # otra persona, una unidad extraíble—, `subprocess` falla con
+        # FileNotFoundError y eso salía como traceback de Python con
+        # código 1, no como el código 6 que la consola promete para un
+        # árbol que no vale. La tarea sigue EN_EJECUCION y nada se graba,
+        # igual que cuando el árbol se mueve.
+        if not Path(arbol).is_dir():
+            raise ErrorWorktree(
+                "El árbol '" + str(arbol) + "' desapareció MIENTRAS corrían "
+                "las pruebas (" + type(error).__name__ + ": " + str(error)
+                + "). El resultado no corresponde a ningún estado concreto "
+                "del árbol, así que no se graba."
+            ) from None
+
+        raise ErrorSupervisor(
+            "No se pudieron lanzar las pruebas en '" + str(arbol) + "': "
+            + type(error).__name__ + ": " + str(error)
+        ) from None
+
+    # Si durante la corrida la tarea cambió de manos, el acompañante lo
+    # detectó antes que nadie. Se dice aquí y no se disimula: el resultado
+    # de esa corrida ya no pertenece a nadie.
+    if acompanante.propiedad_perdida:
+        raise ErrorPropiedad(
+            {
+                "tarea": ficha.id,
+                "motivo": (
+                    acompanante.motivo or global_.MOTIVO_GENERACION_VENCIDA
+                ),
+                "detalle": "La tarea dejó de ser de '" + str(propietario)
+                + "' MIENTRAS se verificaba, así que el resultado de esa "
+                "corrida no es de nadie. " + str(acompanante.detalle),
+                "propietario": propietario,
+                "generacion": esperada,
+            }
+        )
+
+    # La evidencia de DÓNDE se ejecutó viaja con el resultado. Sin esto,
+    # dos corridas idénticas de árboles distintos son indistinguibles en el
+    # historial, y no se puede auditar después si se verificó lo correcto.
+    corrida["raiz"] = str(arbol)
+
+    try:
+        corrida["es_worktree"] = arbol != Path(raiz).resolve()
+    except OSError:
+        corrida["es_worktree"] = arbol != Path(raiz)
+
+    rama_fin = testigo.rama_actual()
+    commit_fin = testigo.hash_actual()
+    sucio_fin = testigo.hay_cambios_sin_confirmar()
+    huella_fin = testigo.huella_de_cambios()
+
+    corrida["rama"] = rama_inicio
+    corrida["commit"] = commit_inicio
+    corrida["commit_final"] = commit_fin
+    corrida["generacion"] = esperada
+    corrida["trabajador_id"] = propietario
+
+    # Si el árbol tenía cambios sin confirmar, el commit grabado NO contiene
+    # lo que se ejecutó, y quien audite después tiene que verlo: antes se
+    # calculaba, se usaba para comparar y se tiraba, y la evidencia decía
+    # «commit X en verde» a secas.
+    corrida["sin_confirmar"] = bool(sucio_inicio)
+
+    # Un árbol que cambió a mitad invalida la corrida entera: no se sabe qué
+    # se ejecutó. Se dice, y no se graba un verde que nadie puede reproducir.
+    # La huella compara el CONTENIDO de lo no confirmado, no sólo si lo hay:
+    # un archivo editado a mitad en un árbol que ya estaba sucio daba
+    # «sucio antes, sucio después» y pasaba por quieto.
+    corrida["arbol_estable"] = (
+        commit_inicio == commit_fin
+        and rama_inicio == rama_fin
+        and huella_inicio == huella_fin
+    )
+
+    if not corrida["arbol_estable"]:
+        raise ErrorWorktree(
+            "El árbol '" + str(arbol) + "' cambió MIENTRAS corrían las "
+            "pruebas (antes: " + str(rama_inicio) + " @ "
+            + str(commit_inicio) + (", con cambios sin confirmar"
+                                    if sucio_inicio else "")
+            + "; después: " + str(rama_fin) + " @ " + str(commit_fin)
+            + (", con cambios sin confirmar" if sucio_fin else "")
+            + (
+                "; el contenido sin confirmar cambió"
+                if commit_inicio == commit_fin and rama_inicio == rama_fin
+                else ""
+            )
+            + "). El resultado no corresponde a ningún estado concreto del "
+            "árbol, así que no se graba. Repite la verificación con el "
+            "árbol quieto."
+        )
+
+    consume_intento = False
 
     problemas = []
 
@@ -1433,6 +2335,53 @@ def verificar(
             "La ficha no declara ninguna prueba requerida: una tarea no "
             "puede proponerse sin prueba propia."
         )
+
+    # Las decisiones se releen DESPUÉS de la corrida, no antes.
+    #
+    # `decidir` no mueve ni el estado ni la generación, así que una
+    # resolución llegada mientras corrían las pruebas no invalida la
+    # escritura: el veredicto se dictaba con la foto de hace minutos. El
+    # resultado era una fila que se contradecía a sí misma —todas las
+    # decisiones resueltas y un `ultima_falla` diciendo que faltaban— y una
+    # batería completa tirada a la basura.
+    # También se relee lo DECLARADO en el archivo: una decisión humana
+    # recién escrita por una persona mientras corrían las pruebas es un
+    # freno, y con la foto vieja la tarea se iba a PROPUESTO saltándose
+    # justo la decisión que esa persona quería forzar.
+    declaradas = list(ficha.requiere_decision_humana)
+
+    try:
+        declaradas = leer(raiz, ficha.id).requiere_decision_humana
+    except (ErrorFicha, OSError):
+        pass
+
+    with global_.conexion(raiz) as con:
+        actual = global_.obtener_tarea(con, ficha.id)
+
+    # El presupuesto de intentos es declarativo y cualquier `cargar` de
+    # otro proceso —incluido `ver`— lo sincroniza desde el JSON. Decidir
+    # BLOQUEADO con la foto de antes de correr y grabar la fila con el
+    # valor nuevo dejaba «bloqueada con 1 de 5». Se decide con el vigente
+    # y se exige al escribir.
+    if actual is not None and actual.get("max_intentos"):
+        ficha.max_intentos = int(actual["max_intentos"])
+
+    # La resolución la manda la BASE. `fusionar_decisiones` se queda con la
+    # primera aparición de cada clave, y la lista en memoria iba primero:
+    # una decisión resuelta mientras corría la batería seguía contando como
+    # pendiente y la tarea se iba a REQUIERE_REVISION con la falla ámbar.
+    # La relectura «después de correr» no releía nada. Reproducido en la
+    # revisión final (comprobación 20).
+    operativas = list((actual or {}).get("decisiones") or [])
+
+    if actual is None:
+        operativas = global_.decisiones_operativas(
+            ficha.requiere_decision_humana
+        )
+
+    ficha.requiere_decision_humana = global_.fusionar_decisiones(
+        declaradas, operativas
+    )
 
     pendientes = ficha.decisiones_pendientes()
 
@@ -1458,6 +2407,12 @@ def verificar(
     )
 
     if problemas:
+        # El intento lo incrementa el MOTOR en el propio UPDATE
+        # (`incrementos`), no Python: sumar uno sobre una lectura anterior
+        # es un lost update en cuanto haya dos verificaciones. Aquí sólo se
+        # anota que esta orden lo consume, y el valor real se relee de la
+        # fila confirmada.
+        consume_intento = True
         ficha.intentos = ficha.intentos + 1
 
         ficha.ultima_falla = {
@@ -1499,6 +2454,10 @@ def verificar(
             "fecha": corrida["fecha"],
             "intento": ficha.intentos,
             "problemas": [motivo],
+            # Marca para que `decidir` pueda retirarla al resolver la
+            # última pendiente: sin ella la fila decía a la vez «resueltas»
+            # y «hay decisiones sin resolver» hasta la siguiente corrida.
+            "tipo": FALLA_DECISIONES_PENDIENTES,
         }
 
     else:
@@ -1525,6 +2484,9 @@ def verificar(
         exigir_propietario=propietario,
         estados_admitidos={Estado.EN_EJECUCION},
         exigir_generacion=esperada,
+        campos_propios=CAMPOS_VERIFICAR,
+        incrementos=("intentos",) if consume_intento else (),
+        exigir_iguales={"max_intentos": int(ficha.max_intentos)},
     )
 
     registro = _registrar_en_git(git, ficha, motivo)
@@ -1537,6 +2499,19 @@ def verificar(
         "estado": str(ficha.estado),
         "motivo": motivo,
         "git": registro,
+        "raiz": str(arbol),
+        "latidos": acompanante.emitidos,
+        # Que el latido muriera no invalida la corrida, pero tiene que
+        # verse: hasta ahora se calculaba y se tiraba, y una verificación
+        # larga sin ninguna señal acababa pareciendo una tarea abandonada.
+        "latido_error": acompanante.error,
+        "latido_cierre_incompleto": acompanante.cierre_incompleto,
+        "es_worktree": corrida["es_worktree"],
+        "rama": corrida["rama"],
+        "commit": corrida["commit"],
+        "commit_final": corrida["commit_final"],
+        "arbol_estable": corrida["arbol_estable"],
+        "sin_confirmar": corrida["sin_confirmar"],
     }
 
 
@@ -1552,42 +2527,71 @@ def decidir(
     La definición de la decisión (clave, descripción) vive en el JSON; su
     resolución (resuelta, resolución, fecha, origen) queda en SQLite.
 
+    La resolución la hace el MOTOR, dentro de la transacción (A3.3). Antes
+    se leía la lista de decisiones, se cambiaba un elemento en Python y se
+    reescribía la columna entera: dos `decidir` sobre claves distintas se
+    pisaban y una resolución humana volvía a «pendiente» sin error y sin
+    rastro. Medido: 24 de 25 carreras entre dos procesos perdían una.
+
     No genera commit automático: no es una transición de estado.
     """
     ficha = cargar(raiz, identificador)
 
-    encontrada = None
+    momento = ahora_utc()
 
-    for decision in ficha.requiere_decision_humana:
-        if str(decision.get("clave")) == str(clave):
-            encontrada = decision
-            break
+    with global_.conexion(raiz) as con:
+        with global_.transaccion(con):
+            informe = global_.resolver_decision(
+                con,
+                ficha.id,
+                clave,
+                resolucion,
+                momento,
+                ORIGEN_HUMANO,
+                declaradas=ficha.requiere_decision_humana,
+            )
 
-    if encontrada is None:
-        raise ErrorSupervisor(
-            "La tarea no tiene ninguna decisión con clave '"
-            + str(clave)
-            + "'."
-        )
+            if not informe["resuelta"]:
+                if informe["motivo"] == "inexistente":
+                    raise ErrorSupervisor(
+                        "La tarea no tiene ninguna decisión con clave '"
+                        + str(clave)
+                        + "'."
+                    )
 
-    if encontrada.get("resuelta"):
-        raise ErrorSupervisor(
-            "La decisión '" + str(clave) + "' ya estaba resuelta."
-        )
+                raise ErrorSupervisor(
+                    "La decisión '" + str(clave) + "' ya estaba resuelta."
+                )
 
-    encontrada["resuelta"] = True
-    encontrada["resolucion"] = resolucion
-    encontrada["resuelta_en"] = ahora_utc()
-    encontrada["origen"] = ORIGEN_HUMANO
+            global_.insertar_evento(
+                con,
+                ficha.id,
+                {
+                    "fecha": momento,
+                    "tipo": global_.EVENTO_DECISION,
+                    "estado_anterior": str(ficha.estado),
+                    "estado_nuevo": str(ficha.estado),
+                    "motivo": "Decisión humana '" + str(clave)
+                    + "' resuelta.",
+                    "origen": ORIGEN_HUMANO,
+                    "datos": {
+                        "clave": str(clave),
+                        "resolucion": resolucion,
+                    },
+                },
+            )
 
-    # Resolver una decisión no es una transición de estado, y el commit
-    # automático está reservado a las transiciones. La resolución queda en
-    # SQLite; el espejo JSON queda escrito en disco y su versionado
-    # corresponde al humano que decidió.
+            confirmada = global_.obtener_tarea(con, ficha.id)
+
+    historial = list(ficha.historial)
+    global_.aplicar_fila(ficha, confirmada)
+    ficha.historial = historial
+
+    ficha.requiere_decision_humana = informe["decisiones"]
 
     ficha.registrar_evento(
         {
-            "fecha": ahora_utc(),
+            "fecha": momento,
             "tipo": global_.EVENTO_DECISION,
             "estado_anterior": str(ficha.estado),
             "estado_nuevo": str(ficha.estado),
@@ -1596,8 +2600,12 @@ def decidir(
             "datos": {"clave": str(clave), "resolucion": resolucion},
         }
     )
+    ficha.eventos_pendientes.clear()
 
-    persistir(raiz, ficha)
+    # Resolver una decisión no es una transición de estado, y el commit
+    # automático está reservado a las transiciones. El espejo sí se
+    # regenera: es lo que hace visible la resolución en el archivo.
+    _regenerar_espejo(raiz, ficha)
 
     return ficha
 
@@ -1635,7 +2643,17 @@ def aprobar(
         ORIGEN_HUMANO,
     )
 
-    persistir(raiz, ficha)
+    # Lo que se comprobó arriba en Python se exige también al motor: una
+    # decisión DECLARADA entre la lectura y la escritura —la sincroniza
+    # cualquier `cargar`, incluido `ver` desde otro proceso— no mueve ni el
+    # estado ni la generación, y la tarea quedaba APROBADA con una decisión
+    # pendiente. Reproducido en la revisión final.
+    persistir(
+        raiz,
+        ficha,
+        campos_propios=CAMPOS_TRANSICION,
+        exigir_iguales={"requiere_decision_humana": 0},
+    )
 
     _registrar_en_git(git, ficha, "Aprobación humana.")
 
@@ -1658,7 +2676,7 @@ def rechazar(
 
     transicionar(ficha, Estado.RECHAZADO, motivo, ORIGEN_HUMANO)
 
-    persistir(raiz, ficha)
+    persistir(raiz, ficha, campos_propios=CAMPOS_DEVOLVER)
 
     _registrar_en_git(git, ficha, motivo)
 
@@ -1686,7 +2704,7 @@ def reabrir(
 
     transicionar(ficha, Estado.REABIERTO, motivo, ORIGEN_HUMANO)
 
-    persistir(raiz, ficha)
+    persistir(raiz, ficha, campos_propios=CAMPOS_REABRIR)
 
     _registrar_en_git(git, ficha, motivo)
 
@@ -1710,7 +2728,7 @@ def bloquear(
 
     transicionar(ficha, Estado.BLOQUEADO, motivo, origen)
 
-    persistir(raiz, ficha)
+    persistir(raiz, ficha, campos_propios=CAMPOS_DEVOLVER)
 
     _registrar_en_git(git, ficha, motivo)
 
@@ -1721,24 +2739,410 @@ def bloquear(
 # Recuperación tras cierre, cambio de sesión o apagón
 # ----------------------------------------------------------------------
 
+class LatidoAutomatico:
+    """
+    Emite latidos mientras dura una operación larga del Supervisor (A3.3).
+
+    A3.2 hizo segura la orden `latido`; alguien tenía que emitirla. Sin
+    esto, una verificación que tarda diez minutos deja la tarea sin señal
+    todo ese rato y la recuperación la ve caducada: el trabajo honesto
+    parece abandono.
+
+    Esto NO es un demonio de trabajadores. Es un acompañante de UNA
+    operación concreta, que empieza y termina con ella. El lanzamiento de
+    trabajadores es C.
+
+    Lo que garantiza, y por qué cada cosa
+    -------------------------------------
+    - Escribe SÓLO `ultimo_latido`, y con las precondiciones de A3.2:
+      identidad, generación y estado EN_EJECUCION. Un latido no puede
+      resucitar nada: si la ejecución terminó o la tarea cambió de manos,
+      la escritura se rechaza sola.
+
+    - Se PARA si pierde la propiedad, y lo deja anotado. Seguir latiendo
+      sobre una tarea ajena sería sostener artificialmente una ejecución
+      que ya no existe, y haría que la recuperación creyera viva a una
+      tarea muerta: justo al revés de para lo que sirve.
+
+    - Se para siempre al terminar la operación, salga bien o mal, porque
+      es un gestor de contexto y `__exit__` corre también cuando el
+      trabajo principal lanza.
+
+    - No mantiene ninguna conexión SQLite abierta entre latidos: abre,
+      escribe y cierra. Mantenerla abierta durante minutos estorbaría a
+      todos los demás para ahorrar una apertura que cuesta microsegundos.
+
+    - La espera es cancelable: se usa un `Event.wait`, que vuelve en el
+      acto cuando se pide parar, y no un `sleep` que habría que aguantar
+      entero. Por eso una prueba puede usar intervalos de milisegundos sin
+      quedarse esperando nada.
+    """
+
+    def __init__(
+        self,
+        raiz: Path,
+        identificador: str,
+        trabajador_id: str,
+        generacion: int,
+        intervalo_s: float = None,
+        reloj=None,
+    ):
+        self.raiz = Path(raiz)
+        self.identificador = identificador
+        self.trabajador_id = trabajador_id
+        self.generacion = int(generacion)
+        self.intervalo_s = (
+            INTERVALO_LATIDO_S if intervalo_s is None else float(intervalo_s)
+        )
+
+        # Un intervalo de cero o negativo convierte `Event.wait` en un bucle
+        # apretado: miles de `BEGIN IMMEDIATE` por segundo sobre la base
+        # COMPARTIDA, que es una denegación de servicio para el resto de
+        # trabajadores. Se rechaza en vez de dejarlo pasar.
+        if self.intervalo_s <= 0:
+            raise ErrorSupervisor(
+                "El intervalo del latido debe ser mayor que cero; se "
+                "recibió: " + repr(intervalo_s) + "."
+            )
+
+        self._reloj = reloj or ahora_utc
+
+        self.emitidos = 0
+        self.propiedad_perdida = False
+        self.detalle = None
+        self.motivo = None
+        self.error = None
+        self.fallos_seguidos = 0
+        self.fallos_totales = 0
+        self.retrocesos = 0
+        self.cierre_incompleto = False
+
+        self._parar = threading.Event()
+        self._hilo = None
+
+    def emitir_uno(self) -> bool:
+        """
+        Un latido. Devuelve False cuando ya no hay que seguir.
+
+        Público a propósito: una prueba puede emitir latidos uno a uno y
+        comprobar el efecto sin depender de ningún tiempo de reloj.
+        """
+        try:
+            con = global_.abrir(global_.ruta_base(self.raiz))
+
+            try:
+                with global_.transaccion(con):
+                    # El instante se toma con el candado ya pedido y no
+                    # antes: bajo contención, `BEGIN IMMEDIATE` puede
+                    # esperar hasta `busy_timeout` (segundos), y grabar una
+                    # marca tomada antes de esa espera equivale a registrar
+                    # una señal de vida ya rancia. La lectura del reloj
+                    # estuvo FUERA de este bloque mientras el comentario
+                    # decía lo contrario; la comprobación 33 lee ahora el
+                    # orden real: BEGIN, reloj, UPDATE.
+                    momento = self._reloj()
+
+                    informe = global_.actualizar_si_propietario(
+                        con,
+                        self.identificador,
+                        {"ultimo_latido": momento, "actualizado_en": momento},
+                        generacion=self.generacion,
+                        momento=momento,
+                        trabajador_id=self.trabajador_id,
+                        estados_admitidos={str(Estado.EN_EJECUCION)},
+                        # El reloj de pared no es monótono. Sin esta guarda,
+                        # un salto hacia atrás hacía que el propio latido
+                        # REDUJERA la marca de vida y la tarea pareciese
+                        # abandonada: el mecanismo que la defiende sería el
+                        # que la mata.
+                        exigir_no_retroceso={"ultimo_latido": momento},
+                    )
+            finally:
+                con.close()
+        except (sqlite3.Error, global_.ErrorEstadoGlobal) as error:
+            # `database is locked` es un fallo TRANSITORIO y esperable justo
+            # en el escenario para el que existe el latido: varios procesos
+            # escribiendo a la vez. Rendirse al primero dejaba la operación
+            # sin señal el resto del tiempo, en silencio, hasta que la
+            # recuperación la declaraba huérfana.
+            #
+            # Llega como ErrorEstadoGlobal, no como sqlite3.Error: `abrir` y
+            # `transaccion` envuelven TODO error de SQLite. Capturar sólo
+            # sqlite3.Error era código muerto en producción y el bloqueo
+            # real caía en «no es transitoria: se para» al primer choque
+            # (reproducido en la revisión final con un candado de otro
+            # proceso). Un fallo permanente sigue acotado por el límite.
+            self.error = type(error).__name__ + ": " + str(error)
+            self.fallos_seguidos += 1
+            self.fallos_totales += 1
+
+            return self.fallos_seguidos < FALLOS_LATIDO_SEGUIDOS
+        except Exception as error:
+            # Cualquier otra cosa no es transitoria: se anota y se para.
+            self.error = type(error).__name__ + ": " + str(error)
+            self.fallos_totales += 1
+
+            return False
+
+        self.fallos_seguidos = 0
+
+        if informe["resultado"] != global_.ESCRITURA_ACEPTADA:
+            # Un rechazo por la guarda de monotonía NO es perder la tarea:
+            # significa que ya hay una marca igual o más nueva, que es
+            # exactamente lo que el latido quería conseguir.
+            mia = self._sigue_siendo_mio()
+
+            if mia is None:
+                # No se pudo COMPROBAR, que no es lo mismo que haberla
+                # perdido. Tratarlo como pérdida hacía que `verificar`
+                # tirase una batería entera por un `database is locked` en
+                # esta relectura, con un diagnóstico falso. Cuenta como un
+                # fallo transitorio más, con el mismo límite.
+                self.fallos_seguidos += 1
+                self.fallos_totales += 1
+
+                return self.fallos_seguidos < FALLOS_LATIDO_SEGUIDOS
+
+            if mia:
+                self.retrocesos += 1
+
+                return True
+
+            self.propiedad_perdida = True
+            self.detalle = informe["detalle"]
+            self.motivo = informe.get("motivo")
+
+            return False
+
+        self.emitidos += 1
+
+        return True
+
+    def _sigue_siendo_mio(self):
+        """
+        Relee la fila para distinguir «reloj atrasado» de «perdí la tarea».
+
+        Devuelve True, False, o None si no se pudo leer: un error de lectura
+        no demuestra nada sobre la propiedad, y quien llama lo trata como
+        fallo transitorio. Sólo se llama tras un rechazo, que es raro: no
+        está en el camino normal del latido.
+        """
+        try:
+            con = global_.abrir(global_.ruta_base(self.raiz))
+
+            try:
+                fila = global_.obtener_tarea(con, self.identificador)
+            finally:
+                con.close()
+        except Exception as error:
+            self.error = type(error).__name__ + ": " + str(error)
+
+            return None
+
+        if fila is None:
+            return False
+
+        return (
+            fila.get("trabajador_id") == self.trabajador_id
+            and fila.get("generacion") == self.generacion
+            and str(fila.get("estado")) == str(Estado.EN_EJECUCION)
+        )
+
+    def _bucle(self) -> None:
+        # Se late nada más entrar. Esperando primero, una operación más
+        # corta que el intervalo (60 s por omisión) no dejaba ni una sola
+        # señal, que es justo lo contrario de lo que se pretende.
+        if not self.emitir_uno():
+            return
+
+        # `wait` devuelve True en cuanto se pide parar, así que el latido
+        # se corta en el acto en vez de esperar a que venza el intervalo.
+        while not self._parar.wait(self.intervalo_s):
+            if not self.emitir_uno():
+                return
+
+    def __enter__(self) -> "LatidoAutomatico":
+        if self._hilo is not None:
+            # Reutilizar la instancia arrancaba un hilo que salía en la
+            # primera vuelta —`_parar` seguía puesto del uso anterior— y
+            # emitía CERO latidos sin ninguna señal de avería. Mejor un
+            # error ruidoso que una garantía perdida en silencio.
+            raise ErrorSupervisor(
+                "Un LatidoAutomatico acompaña a UNA operación y no se "
+                "reutiliza. Construye otro."
+            )
+
+        self._parar.clear()
+
+        self._hilo = threading.Thread(
+            target=self._bucle,
+            name="latido-" + str(self.identificador),
+            daemon=True,
+        )
+
+        try:
+            self._hilo.start()
+        except BaseException:
+            # Si `__enter__` no retorna, `__exit__` NO se ejecuta nunca y el
+            # hilo quedaría latiendo para siempre sobre una tarea que ya no
+            # trabaja nadie: sostener artificialmente una ejecución muerta
+            # es justo lo que esto no debe hacer.
+            self._parar.set()
+            raise
+
+        return self
+
+    def __exit__(self, *_excepcion) -> bool:
+        self._parar.set()
+
+        if self._hilo is not None:
+            self._hilo.join(timeout=ESPERA_CIERRE_LATIDO_S)
+
+            # Si el `join` se agotó, el hilo sigue vivo y escribirá después
+            # de que este bloque haya devuelto el control. Queda anotado:
+            # antes no quedaba ningún rastro y `emitidos` se leía en carrera
+            # con un hilo que aún lo estaba tocando.
+            self.cierre_incompleto = self._hilo.is_alive()
+
+        # No se traga ninguna excepción del trabajo principal.
+        return False
+
+
+def vitalidad(
+    fila: dict,
+    ahora: datetime | None = None,
+    comprobar_proceso=proceso_vivo,
+    latido_maximo_s: int = LATIDO_MAXIMO_S,
+    latido_gracia_s: int = LATIDO_GRACIA_S,
+    latido_abandono_s: int = LATIDO_ABANDONO_S,
+) -> dict:
+    """
+    Vitalidad de una tarea, para INFORMAR. No decide ni cambia nada.
+
+    Devuelve uno de seis estados, que son distintos del estado de la tarea:
+
+        ACTIVA          hay una ejecución y da señales
+        LATIDO_VENCIDO  hay una ejecución, el latido caducó, pero no está
+                        demostrada muerta
+        HUERFANA        hay una ejecución y está demostrada perdida
+        REANUDABLE      no hay ejecución y la tarea se puede tomar
+        ESPERA_HUMANA   no hay ejecución y la tarea espera a una persona
+        FINALIZADA      no hay ejecución y la tarea está cerrada
+
+    Separar esto de `clasificar_ejecucion` es deliberado: aquélla decide si
+    la recuperación toca o no toca una tarea, y sólo mira las que están en
+    ejecución. Ésta responde a "¿qué le pasa a esta tarea?" para cualquiera,
+    que es lo que necesita el tablero.
+    """
+    ahora = ahora or ahora_datetime()
+
+    estado = str(fila.get("estado") or "")
+    latido = a_datetime(fila.get("ultimo_latido"))
+    edad = None if latido is None else int((ahora - latido).total_seconds())
+
+    informe = {
+        "estado": estado,
+        "trabajador_id": fila.get("trabajador_id"),
+        "generacion": fila.get("generacion"),
+        "pid": fila.get("pid"),
+        "iniciado_en": fila.get("iniciado_en"),
+        "ultimo_latido": fila.get("ultimo_latido"),
+        "edad_latido_s": edad,
+        "worktree": fila.get("worktree"),
+        "vitalidad": None,
+        "motivo": None,
+        # Lo decide el motor, no la interfaz. LATIDO_VENCIDO y HUÉRFANA
+        # piden que alguien mire; REANUDABLE y FINALIZADA, no: son el
+        # estado normal de una tarea que nadie está ejecutando.
+        "requiere_atencion": False,
+    }
+
+    if estado != str(Estado.EN_EJECUCION):
+        tomable = estado in {str(uno) for uno in ESTADOS_TOMABLES}
+        espera = estado in ESTADOS_QUE_ESPERAN_A_UNA_PERSONA
+
+        if tomable:
+            informe["vitalidad"] = VITALIDAD_REANUDABLE
+            detalle = "puede tomarse."
+        elif espera:
+            # PROPUESTO y BLOQUEADO no son finales: son las que MÁS piden
+            # atención. Decir de ellas lo mismo que de APROBADO escondía en
+            # el tablero justo lo que hay que mirar.
+            informe["vitalidad"] = VITALIDAD_ESPERA_HUMANA
+            detalle = "está esperando una decisión humana."
+        else:
+            informe["vitalidad"] = VITALIDAD_FINALIZADA
+            detalle = "está cerrada."
+
+        informe["motivo"] = "Sin ejecución en curso; la tarea " + detalle
+        informe["requiere_atencion"] = (
+            estado in ESTADOS_QUE_ESPERAN_A_UNA_PERSONA
+        )
+
+        return informe
+
+    prestada = Ficha(id=str(fila.get("id") or "T-0000"), titulo="")
+    prestada.estado = Estado.EN_EJECUCION
+    prestada.trabajador_id = fila.get("trabajador_id")
+    prestada.pid = fila.get("pid")
+    prestada.iniciado_en = fila.get("iniciado_en")
+    prestada.ultimo_latido = fila.get("ultimo_latido")
+
+    clase, motivo = clasificar_ejecucion(
+        prestada,
+        ahora,
+        comprobar_proceso,
+        latido_maximo_s,
+        latido_gracia_s,
+        latido_abandono_s,
+    )
+
+    # HUÉRFANA significa «demostrada perdida». Una fila incompleta no
+    # demuestra nada sobre el trabajador, así que INCONSISTENTE se informa
+    # como LATIDO_VENCIDO —hay ejecución y no está demostrada muerta—, que
+    # es la categoría de la duda. Y lo desconocido cae del lado seguro: si
+    # mañana aparece otra clase, se informará como duda y no como ACTIVA,
+    # que era el valor más tranquilizador y el peor por omisión.
+    informe["vitalidad"] = {
+        CLASE_ACTIVA: VITALIDAD_ACTIVA,
+        CLASE_LATIDO_VENCIDO: VITALIDAD_LATIDO_VENCIDO,
+        CLASE_HUERFANA: VITALIDAD_HUERFANA,
+        CLASE_INCONSISTENTE: VITALIDAD_LATIDO_VENCIDO,
+    }.get(clase, VITALIDAD_LATIDO_VENCIDO)
+    informe["motivo"] = motivo
+    informe["requiere_atencion"] = informe["vitalidad"] in (
+        VITALIDAD_LATIDO_VENCIDO,
+        VITALIDAD_HUERFANA,
+    )
+
+    return informe
+
+
 def clasificar_ejecucion(
     ficha: Ficha,
     ahora: datetime,
     comprobar_proceso=proceso_vivo,
     latido_maximo_s: int = LATIDO_MAXIMO_S,
     latido_gracia_s: int = LATIDO_GRACIA_S,
+    latido_abandono_s: int = LATIDO_ABANDONO_S,
 ) -> tuple[str, str]:
     """
     Clasifica una tarea EN_EJECUCION como ACTIVA, HUERFANA o INCONSISTENTE.
 
-    Nunca se juzga sólo por el PID:
+    Nunca se juzga por UNA sola señal, ni por el PID ni por el latido, y
+    ningún umbral decide solo:
 
-    - un latido vencido basta por sí solo para declarar abandono;
+    - un latido vencido NO basta por sí solo: HUÉRFANA exige además el
+      proceso local confirmado muerto. Con el proceso vivo se devuelve
+      LATIDO_VENCIDO, que informa sin arrebatar; el umbral de abandono
+      sólo añade al motivo que el latido probablemente murió;
     - la desaparición del proceso sólo cuenta si además el latido dejó de
-      ser reciente, porque el proceso que reclamó la tarea puede haber sido
-      un mandato breve de línea de comandos ya terminado;
-    - si la ficha proviene de otro equipo, el PID local carece de sentido y
-      se juzga únicamente por el latido.
+      ser reciente (margen de cortesía), porque el proceso que reclamó la
+      tarea puede haber sido un mandato breve de línea de comandos ya
+      terminado. Para una toma desde la consola ésa es la ventana real;
+    - si la ficha proviene de OTRO equipo, el PID local carece de sentido
+      y no hay segunda señal posible: con latido reciente es ACTIVA y con
+      latido vencido es LATIDO_VENCIDO, nunca HUÉRFANA. Decide una persona.
     """
     if (
         not ficha.trabajador_id
@@ -1763,26 +3167,91 @@ def clasificar_ejecucion(
         )
 
     antiguedad = ahora - latido
+    segundos = int(antiguedad.total_seconds())
 
-    if antiguedad > timedelta(seconds=latido_maximo_s):
+    # Una marca en el FUTURO no es frescura: es un reloj mal puesto, una
+    # hora local escrita sin zona horaria por otra máquina, o una fila
+    # manipulada. Tratándola como reciente, la tarea quedaba ACTIVA para
+    # siempre —la antigüedad negativa no supera ningún umbral—, bloqueando
+    # su ámbito sin que ninguna recuperación pudiera tocarla nunca.
+    if antiguedad < -timedelta(seconds=latido_gracia_s):
         return (
-            CLASE_HUERFANA,
-            "Latido vencido: "
-            + str(int(antiguedad.total_seconds()))
-            + " s sin señal (máximo permitido "
-            + str(latido_maximo_s)
-            + " s).",
+            CLASE_INCONSISTENTE,
+            "El último latido está " + str(abs(segundos)) + " s en el "
+            "FUTURO (" + str(ficha.ultimo_latido) + "). Reloj "
+            "desincronizado o marca sin zona horaria: no se puede juzgar "
+            "esta ejecución por el tiempo.",
         )
 
     equipo_ficha = equipo_de(ficha.trabajador_id)
     equipo_actual = socket.gethostname()
 
-    if equipo_ficha != equipo_actual:
+    # Ajeno significa "declara OTRA máquina", no "no declara ninguna".
+    #
+    # `equipo_de` devuelve None cuando el identificador no lleva equipo, y
+    # tratar eso como ajeno sería un error con consecuencias: el PID local
+    # dejaría de poder confirmar nada y ninguna ejecución con un
+    # identificador libre podría recuperarse hasta el umbral de abandono.
+    # Desconocido no es ajeno: es desconocido, y entonces la señal del
+    # proceso sí vale.
+    ajeno = equipo_ficha is not None and equipo_ficha != equipo_actual
+
+    if antiguedad > timedelta(seconds=latido_maximo_s):
+        # El latido caducó. Eso NO basta para declarar abandono: es una
+        # señal débil, y decidir con ella sola es arrebatarle la tarea a
+        # quien quizá sigue trabajando. Se busca una segunda.
+        #
+        # El umbral de abandono TAMPOCO decide solo. Antes sí lo hacía, y
+        # con un `return` colocado por delante de todo: `comprobar_proceso`
+        # ni se llegaba a llamar. Un trabajador local con su proceso vivo y
+        # comprobable perdía la tarea por llevar una hora sin latir —que es
+        # exactamente lo que pasa si el hilo del latido muere—, y un
+        # trabajador remoto la perdía con que el reloj de su máquina fuera
+        # una hora distinto. Un proceso vivo es una señal FUERTE que
+        # contradice al latido: mientras exista, no hay abandono demostrado.
+        if not ajeno and not comprobar_proceso(ficha.pid):
+            return (
+                CLASE_HUERFANA,
+                "Latido vencido (" + str(segundos) + " s, máximo "
+                + str(latido_maximo_s) + " s) Y el proceso "
+                + str(ficha.pid) + " ya no existe: dos señales.",
+            )
+
+        if ajeno:
+            # Aquí no hay segunda señal posible y no la habrá nunca: el PID
+            # es de otra máquina. Se informa y decide una persona; liberar
+            # por el reloj solo es justo lo que esta función no debe hacer.
+            return (
+                CLASE_LATIDO_VENCIDO,
+                "Latido vencido (" + str(segundos) + " s, máximo "
+                + str(latido_maximo_s) + " s) y el trabajador es de otro "
+                "equipo (" + str(equipo_ficha) + "): aquí no se puede "
+                "comprobar su proceso, así que no hay segunda señal y no se "
+                "libera sola. Decide una persona (`reabrir`).",
+            )
+
+        return (
+            CLASE_LATIDO_VENCIDO,
+            "Latido vencido (" + str(segundos) + " s, máximo "
+            + str(latido_maximo_s) + " s) pero el proceso "
+            + str(ficha.pid) + " sigue vivo"
+            + (
+                ", y lleva más del umbral de abandono ("
+                + str(latido_abandono_s) + " s) sin latir: probablemente su "
+                "latido murió. Míralo"
+                if antiguedad > timedelta(seconds=latido_abandono_s)
+                else ""
+            )
+            + ". No se declara abandonada con una sola señal.",
+        )
+
+    if ajeno:
         return (
             CLASE_ACTIVA,
             "Trabajador de otro equipo ("
             + str(equipo_ficha)
-            + ") con latido reciente.",
+            + ") con latido reciente: aquí no se puede comprobar su "
+            "proceso, y el latido es la señal que sí vale.",
         )
 
     if comprobar_proceso(ficha.pid):
@@ -1818,6 +3287,7 @@ def reanudar(
     latido_maximo_s: int = LATIDO_MAXIMO_S,
     latido_gracia_s: int = LATIDO_GRACIA_S,
     git=None,
+    latido_abandono_s: int = LATIDO_ABANDONO_S,
 ) -> dict:
     """
     Recuperación tras un cierre, un cambio de sesión o un apagón.
@@ -1825,9 +3295,14 @@ def reanudar(
     Ninguna tarea se pierde: las ejecuciones interrumpidas se registran como
     tales, conservando el historial, y la tarea vuelve a REABIERTO.
 
-    A2: es una orden manual que juzga por PID y por el latido registrado.
-    La detección avanzada de trabajadores huérfanos y los latidos
-    automáticos pertenecen a A3/B.
+    Sigue siendo una orden manual. A3.3: clasifica cada ejecución con
+    `clasificar_ejecucion` (nunca con una sola señal); libera sólo las
+    HUÉRFANAS, exigiendo en el WHERE la generación y el latido sobre el
+    que decidió (`exigir_iguales`); deja sin tocar, informándolas, las
+    ACTIVAS, las de LATIDO_VENCIDO y las INCONSISTENTES; avisa del
+    worktree ausente de toda ejecución revisada; y un fallo del espejo de
+    una tarea no detiene la pasada. El lanzamiento y la expiración
+    automática de trabajadores siguen siendo de C.
     """
     ahora = ahora or ahora_datetime()
 
@@ -1841,6 +3316,25 @@ def reanudar(
         "temporales_eliminados": [],
         "fichas_ilegibles": [],
         "reclamadas_mientras_tanto": [],
+        # Ejecuciones con el latido caducado que NO se recuperan porque no
+        # están demostradas muertas (A3.3).
+        "latido_vencido": [],
+        # Ejecuciones cuyo worktree registrado ya no resuelve (A3.3), se
+        # toquen o no: también las ACTIVAS y las de latido vencido. La ruta
+        # se conserva en el informe y en el evento de recuperación; en la
+        # fila se suelta con el turno, porque el árbol pertenece a la
+        # ejecución y no a la tarea.
+        "worktree_ausente": [],
+        # Filas en ejecución con la identidad incompleta (A3.3). NO se
+        # liberan: una fila rota no demuestra que el trabajador esté
+        # muerto, y liberarla le quitaba la tarea a alguien que podía
+        # estar vivo y latiendo. Se informan para que una persona decida
+        # (la salida es `reabrir`, que es una orden humana).
+        "inconsistentes_sin_tocar": [],
+        # Tareas recuperadas en la base cuyo espejo JSON no se pudo
+        # regenerar. Antes esto abortaba la pasada entera y dejaba sin
+        # revisar todo lo que venía detrás.
+        "espejo_no_regenerado": [],
     }
 
     for temporal in temporales_huerfanos(raiz):
@@ -1889,11 +3383,64 @@ def reanudar(
         ficha.eventos_pendientes.clear()
 
         clase, motivo = clasificar_ejecucion(
-            ficha, ahora, comprobar_proceso, latido_maximo_s, latido_gracia_s
+            ficha,
+            ahora,
+            comprobar_proceso,
+            latido_maximo_s,
+            latido_gracia_s,
+            latido_abandono_s,
         )
+
+        # El árbol se comprueba para TODA ejecución revisada, se toque o no
+        # la fila. Antes sólo se miraba en las que se liberaban, así que una
+        # ejecución ACTIVA o con el latido vencido cuyo worktree había
+        # desaparecido no se avisaba: `reanudar` decía «sigue activa» y
+        # nada más, y la persona que tenía que decidir no recibía justo el
+        # dato que necesitaba. Es sólo informar: no cambia nada de la fila.
+        if ficha.worktree:
+            try:
+                resolver_worktree(raiz, ficha.worktree)
+            except ErrorWorktree as problema:
+                informe["worktree_ausente"].append(
+                    {
+                        "id": ficha.id,
+                        "titulo": ficha.titulo,
+                        "worktree": ficha.worktree,
+                        "clase": clase,
+                        "motivo": str(problema),
+                    }
+                )
 
         if clase == CLASE_ACTIVA:
             informe["activas"].append(
+                {
+                    "id": ficha.id,
+                    "titulo": ficha.titulo,
+                    "trabajador_id": ficha.trabajador_id,
+                    "pid": ficha.pid,
+                    "motivo": motivo,
+                }
+            )
+            continue
+
+        if clase == CLASE_INCONSISTENTE:
+            informe["inconsistentes_sin_tocar"].append(
+                {
+                    "id": ficha.id,
+                    "titulo": ficha.titulo,
+                    "trabajador_id": ficha.trabajador_id,
+                    "pid": ficha.pid,
+                    "motivo": motivo,
+                }
+            )
+            continue
+
+        if clase == CLASE_LATIDO_VENCIDO:
+            # Caducó el latido pero NO está demostrada muerta. No se toca:
+            # recuperarla sería arrebatársela a quien quizá sigue
+            # trabajando. Se informa para que una persona lo mire, que es
+            # justo lo que hay que hacer con una duda.
+            informe["latido_vencido"].append(
                 {
                     "id": ficha.id,
                     "titulo": ficha.titulo,
@@ -1943,6 +3490,10 @@ def reanudar(
             }
         )
 
+        # Se guarda ANTES de liberar: es la prueba de vida sobre la que se
+        # tomó la decisión, y tiene que viajar en el WHERE de la escritura.
+        latido_juzgado = ficha.ultimo_latido
+
         _liberar_trabajador(ficha)
 
         transicionar(
@@ -1958,7 +3509,17 @@ def reanudar(
             # la tarea, la generación ya no casa y se rechaza. Es lo
             # correcto: una tarea recién reclamada NO está abandonada, y
             # devolverla a REABIERTO se la quitaría a su nuevo dueño.
-            persistir(raiz, ficha)
+            # `exigir_iguales` cierra el hueco que la generación no ve: un
+            # latido no mueve ni el estado ni la generación, así que si el
+            # dueño daba señal de vida justo entre la clasificación y esta
+            # escritura, el UPDATE casaba igual y se le quitaba la tarea a
+            # alguien que acababa de demostrar que seguía ahí.
+            persistir(
+                raiz,
+                ficha,
+                campos_propios=CAMPOS_RECUPERAR,
+                exigir_iguales={"ultimo_latido": latido_juzgado},
+            )
         except ErrorPropiedad as rechazo:
             informe["reclamadas_mientras_tanto"].append(
                 {
@@ -1968,8 +3529,27 @@ def reanudar(
                 }
             )
             continue
-
-        _registrar_en_git(git, ficha, "Recuperación tras interrupción.")
+        except ErrorSupervisor as problema:
+            # La base YA quedó confirmada: `persistir` sólo lanza
+            # ErrorSupervisor después del COMMIT, cuando no puede regenerar
+            # el espejo JSON (sus validaciones previas no dependen de la
+            # fila y con estos argumentos fijos no pueden fallar; un error
+            # de SQLite es ErrorEstadoGlobal y sí aborta, porque entonces
+            # la base no está bien). Se anota y se sigue: abortar aquí
+            # dejaba sin revisar todas las tareas que venían detrás, y
+            # ésta, recuperada en la base, sin figurar en el informe.
+            # Reproducido en la revisión final: el `except` estaba puesto
+            # alrededor de `_registrar_en_git`, que ni regenera el espejo
+            # ni lanza ErrorSupervisor, así que no protegía nada.
+            informe["espejo_no_regenerado"].append(
+                {
+                    "id": ficha.id,
+                    "titulo": ficha.titulo,
+                    "motivo": str(problema),
+                }
+            )
+        else:
+            _registrar_en_git(git, ficha, "Recuperación tras interrupción.")
 
         destino = (
             informe["huerfanas"]
@@ -2017,8 +3597,54 @@ def resumen_de_tarea(fila: dict, definicion: Ficha | None) -> dict:
 
     verificacion = fila.get("ultima_verificacion")
 
+    # A3.3 — lo que hace falta para saber QUÉ LE PASA a la tarea, no sólo
+    # en qué estado está. Son cosas distintas: REABIERTO es un estado;
+    # que nadie la esté ejecutando y desde cuándo, otra cosa.
+    #
+    # Se calcula aquí y no en la plantilla porque el tablero no debe
+    # reimplementar el criterio de vitalidad: si lo hiciera, tarde o
+    # temprano diría algo distinto de lo que decide la recuperación.
+    senales = vitalidad(fila)
+
+    # Si la verificación guardada es de una ejecución anterior, el verde no
+    # dice nada de la actual. Lo decide el motor y no la interfaz: ni el
+    # tablero ni la consola deben reimplementar este criterio.
+    vigente = None
+
+    if verificacion:
+        registrada = verificacion.get("generacion")
+        vigente = (
+            registrada is not None
+            and registrada == fila.get("generacion")
+        )
+
     return {
         "id": fila["id"],
+        "vitalidad": senales["vitalidad"],
+        "vitalidad_motivo": senales["motivo"],
+        "edad_latido_s": senales["edad_latido_s"],
+        # Qué merece la atención de una persona. Lo dice el motor: la
+        # plantilla lo tenía en una lista propia y marcaba en alerta toda
+        # tarea NUEVA o REABIERTA, que es el estado normal de lo que nadie
+        # ha tomado todavía. Un tablero donde lo normal está en rojo deja
+        # de leerse.
+        "requiere_atencion": senales["requiere_atencion"],
+        "verificacion_vigente": vigente,
+        "verificacion_raiz": (
+            verificacion.get("raiz") if verificacion else None
+        ),
+        "verificacion_commit": (
+            verificacion.get("commit") if verificacion else None
+        ),
+        "verificacion_rama": (
+            verificacion.get("rama") if verificacion else None
+        ),
+        "verificacion_sin_confirmar": (
+            bool(verificacion.get("sin_confirmar")) if verificacion else None
+        ),
+        "verificacion_fecha": (
+            verificacion.get("fecha") if verificacion else None
+        ),
         "titulo": fila["titulo"],
         "objetivo": definicion.objetivo if definicion else "",
         "estado": fila["estado"],
@@ -2050,9 +3676,70 @@ def resumen_de_tarea(fila: dict, definicion: Ficha | None) -> dict:
     }
 
 
+def _entero_o_cero(valor) -> int:
+    try:
+        return int(valor or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _resumen_ilegible(fila: dict, definicion: Ficha | None = None) -> dict:
+    """
+    Tarjeta mínima para una fila que no se pudo interpretar.
+
+    Se muestra igual, diciendo la verdad, en vez de hacer desaparecer el
+    tablero entero por una fila mala. Y la verdad incluye que el JSON
+    puede estar perfectamente bien: `definicion_legible` habla del archivo
+    y `fila_legible` de la base, y antes la tarjeta culpaba al archivo e
+    inventaba «0 / 0» intentos.
+    """
+    return {
+        "id": str(fila.get("id") or "?"),
+        "titulo": str(fila.get("titulo") or "(sin título)"),
+        "objetivo": definicion.objetivo if definicion else "",
+        "estado": str(fila.get("estado") or ""),
+        "vitalidad": None,
+        "vitalidad_motivo": "La fila de la base no se pudo interpretar.",
+        "requiere_atencion": True,
+        "edad_latido_s": None,
+        "verificacion_raiz": None,
+        "verificacion_commit": None,
+        "verificacion_rama": None,
+        "verificacion_sin_confirmar": None,
+        "verificacion_fecha": None,
+        "verificacion_vigente": None,
+        "rama": fila.get("rama"),
+        "worktree": fila.get("worktree"),
+        "intentos": _entero_o_cero(fila.get("intentos")),
+        "max_intentos": _entero_o_cero(fila.get("max_intentos")),
+        "pruebas_ok": 0,
+        "pruebas_total": 0,
+        "pruebas_requeridas": [],
+        "ambito_archivos": [],
+        "actualizado_en": fila.get("actualizado_en"),
+        "creado_en": fila.get("creado_en"),
+        "ultima_falla": None,
+        "decisiones_pendientes": [],
+        "decisiones_totales": 0,
+        "requiere_decision_humana": False,
+        "trabajador_id": fila.get("trabajador_id"),
+        "generacion": fila.get("generacion"),
+        "pid": fila.get("pid"),
+        "iniciado_en": fila.get("iniciado_en"),
+        "ultimo_latido": fila.get("ultimo_latido"),
+        "ultima_verificacion": None,
+        "commit_inicial": fila.get("commit_inicial"),
+        "definicion_ruta": fila.get("definicion_ruta"),
+        "definicion_legible": definicion is not None,
+        "fila_legible": False,
+    }
+
+
 def _resumen_vacio() -> dict:
     return {
         "agentes_activos": 0,
+        "agentes_sin_senal": [],
+        "sin_importar": [],
         "totales": 0,
         "nuevas": 0,
         "en_ejecucion": 0,
@@ -2070,13 +3757,19 @@ def tablero(raiz: Path, maximo_actividad: int = 20) -> dict:
     """
     Estado completo del Supervisor para la interfaz de sólo lectura.
 
-    Todo el estado operativo proviene de la base SQLite global. Antes de
-    leer se sincronizan las definiciones JSON legibles (idempotente), de
-    modo que una ficha recién añadida aparece sin pasos manuales.
+    Todo el estado operativo proviene de la base SQLite global.
 
-    Nunca lanza excepción: una ficha corrupta se reporta, y si la base
-    global no está disponible el tablero lo dice (estado ERROR) en lugar de
-    inventar datos a partir de los JSON.
+    NO ESCRIBE NADA (auditoría R1). Antes incorporaba a la base las fichas
+    que no conocía, es decir: pedía `BEGIN IMMEDIATE` —el candado de
+    escritura de toda la base— desde un GET de la API web, y una tarea
+    podía nacer con sólo refrescar el tablero. Las fichas que la base no
+    conoce se reportan en `sin_importar`, como ya hace `diagnostico`, y se
+    incorporan con `sincronizar-definiciones`, que es una orden explícita.
+
+    Nunca lanza excepción: una ficha corrupta se reporta, una FILA
+    corrupta se degrada a una tarjeta que lo dice, y si la base global no
+    está disponible el tablero lo dice (estado ERROR) en lugar de inventar
+    datos a partir de los JSON.
     """
     raiz = Path(raiz)
 
@@ -2103,10 +3796,6 @@ def tablero(raiz: Path, maximo_actividad: int = 20) -> dict:
         base["ubicacion_resumida"] = global_.ubicacion_resumida(ruta)
 
         with global_.conexion(raiz) as con:
-            # Camino de sólo lectura: incorpora tareas ausentes, no
-            # refresca definiciones (ver sincronizar_lista).
-            global_.sincronizar_lista(con, fichas, solo_importar=True)
-
             base["version_esquema"] = global_.version_esquema(con)
             base["journal_mode"] = con.execute(
                 "PRAGMA journal_mode"
@@ -2131,19 +3820,64 @@ def tablero(raiz: Path, maximo_actividad: int = 20) -> dict:
         base["estado"] = "ERROR"
         base["detalle"] = str(error)
 
-    tareas = [
-        resumen_de_tarea(fila, definiciones.get(fila["id"]))
-        for fila in filas
-    ]
+    tareas = []
+
+    for fila in filas:
+        try:
+            tareas.append(
+                resumen_de_tarea(fila, definiciones.get(fila["id"]))
+            )
+        except Exception as problema:
+            # Una sola fila con un JSON operativo malformado tumbaba el
+            # tablero ENTERO —desaparecían todas las tareas— y el navegador
+            # mostraba «sin conexión con el motor local», que además es
+            # falso: el motor contestó perfectamente. Se degrada esa fila y
+            # las demás se ven.
+            errores.append(
+                {
+                    # Es la FILA de la base la que está mal, no el archivo:
+                    # nombrar aquí la ruta del JSON mandaba a arreglar una
+                    # ficha que estaba bien.
+                    "archivo": "base global, fila de '" + str(fila.get("id"))
+                    + "'",
+                    "motivo": "La fila de '" + str(fila.get("id"))
+                    + "' no se pudo interpretar: "
+                    + type(problema).__name__ + ": " + str(problema),
+                }
+            )
+            tareas.append(
+                _resumen_ilegible(fila, definiciones.get(fila["id"]))
+            )
 
     def contar(estado: Estado) -> int:
         return sum(1 for una in tareas if una["estado"] == str(estado))
 
+    # «Agente activo» significa que hay alguien trabajando, no que quede
+    # una fila con nombre de dueño. Una ejecución muerta hace horas contaba
+    # igual que una viva, y el resumen decía que había gente trabajando
+    # cuando no había nadie.
     agentes = {
         una["trabajador_id"]
         for una in tareas
-        if una["estado"] == str(Estado.EN_EJECUCION) and una["trabajador_id"]
+        if una["estado"] == str(Estado.EN_EJECUCION)
+        and una["trabajador_id"]
+        and una.get("vitalidad") == VITALIDAD_ACTIVA
     }
+
+    sin_senal = sorted(
+        {
+            una["trabajador_id"]
+            for una in tareas
+            if una["estado"] == str(Estado.EN_EJECUCION)
+            and una["trabajador_id"]
+            and una.get("vitalidad") != VITALIDAD_ACTIVA
+        }
+    )
+
+    conocidas = {fila["id"] for fila in filas}
+    sin_importar = sorted(
+        ficha.id for ficha in fichas if ficha.id not in conocidas
+    )
 
     actividad = [
         {
@@ -2165,6 +3899,8 @@ def tablero(raiz: Path, maximo_actividad: int = 20) -> dict:
         resumen.update(
             {
                 "agentes_activos": len(agentes),
+                "agentes_sin_senal": sin_senal,
+                "sin_importar": sin_importar,
                 "totales": len(tareas),
                 "nuevas": contar(Estado.NUEVO),
                 "en_ejecucion": contar(Estado.EN_EJECUCION),

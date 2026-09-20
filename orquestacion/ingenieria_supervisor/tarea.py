@@ -37,6 +37,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -418,6 +419,11 @@ def leer(raiz: Path, identificador: str) -> Ficha:
     return ficha
 
 
+# Reintentos del reemplazo atómico ante un lector concurrente (Windows).
+REINTENTOS_REEMPLAZO = 10
+ESPERA_REEMPLAZO_S = 0.05
+
+
 def guardar(
     raiz: Path,
     ficha: Ficha,
@@ -472,7 +478,20 @@ def guardar(
         comprobacion = json.loads(temporal.read_text(encoding="utf-8"))
         Ficha.desde_dict(comprobacion)
 
-        os.replace(temporal, destino)
+        # En Windows, reemplazar un archivo que otro proceso tiene abierto
+        # para leer —el tablero web lo lee cada pocos segundos, otra consola
+        # también— falla con PermissionError durante esos milisegundos. Se
+        # reintenta brevemente antes de rendirse; en POSIX el reemplazo no
+        # depende de los lectores y el bucle no interviene.
+        for intento in range(REINTENTOS_REEMPLAZO):
+            try:
+                os.replace(temporal, destino)
+                break
+            except PermissionError:
+                if intento + 1 == REINTENTOS_REEMPLAZO:
+                    raise
+
+                time.sleep(ESPERA_REEMPLAZO_S)
 
     except BaseException:
         temporal.unlink(missing_ok=True)
@@ -541,11 +560,39 @@ def listar_con_errores(raiz: Path) -> tuple[list[Ficha], list[dict]]:
     return fichas, errores
 
 
-def temporales_huerfanos(raiz: Path) -> list[Path]:
-    """Temporales abandonados por un corte ocurrido durante una escritura."""
+# Un temporal recién creado NO está abandonado: es una escritura en vuelo.
+# Sin este margen, la recuperación borraba el temporal de OTRO proceso que
+# estaba guardando en ese instante, su `os.replace` fallaba con ENOENT y la
+# pasada entera se abortaba a medias.
+EDAD_TEMPORAL_HUERFANO_S = 300
+
+
+def temporales_huerfanos(
+    raiz: Path, edad_minima_s: int = EDAD_TEMPORAL_HUERFANO_S
+) -> list[Path]:
+    """
+    Temporales abandonados por un corte ocurrido durante una escritura.
+
+    Sólo cuentan los que llevan parados más de `edad_minima_s`. Un temporal
+    joven pertenece con toda probabilidad a una escritura en curso, y
+    borrarlo rompería a quien la está haciendo.
+    """
     carpeta = carpeta_tareas(raiz)
 
     if not carpeta.is_dir():
         return []
 
-    return sorted(carpeta.glob(PREFIJO_TEMPORAL + "*" + SUFIJO_TEMPORAL))
+    limite = time.time() - max(0, edad_minima_s)
+    abandonados = []
+
+    for temporal in sorted(
+        carpeta.glob(PREFIJO_TEMPORAL + "*" + SUFIJO_TEMPORAL)
+    ):
+        try:
+            if temporal.stat().st_mtime <= limite:
+                abandonados.append(temporal)
+        except OSError:
+            # Desapareció mientras mirábamos: no es asunto nuestro.
+            continue
+
+    return abandonados

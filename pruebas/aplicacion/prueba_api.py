@@ -13,6 +13,10 @@ Cubren:
 """
 
 import json
+import shutil
+import subprocess
+import tempfile
+import time
 import sys
 import warnings
 from pathlib import Path
@@ -36,7 +40,10 @@ warnings.filterwarnings("ignore", message=".*httpx.*")
 
 from fastapi.testclient import TestClient
 
+from aplicacion.ingenieria_app import servidor
 from aplicacion.ingenieria_app.servidor import app
+from ingenieria_supervisor import supervisor as nucleo
+from ingenieria_supervisor import tarea as fichas
 
 
 cliente = TestClient(app)
@@ -238,7 +245,7 @@ def prueba_pagina_desarrollo():
         )
 
 
-def _comprobar_estado_desarrollo() -> dict:
+def _comprobar_estado_desarrollo(carpeta_tareas: Path) -> dict:
     respuesta = cliente.get("/api/desarrollo/tareas")
 
     assert respuesta.status_code == 200
@@ -328,13 +335,26 @@ def _comprobar_estado_desarrollo() -> dict:
     # SQLite y cambia legítimamente en cuanto se trabaja una tarea.
     por_id = {tarea["id"]: tarea for tarea in datos["tareas"]}
 
-    for ruta_ficha in sorted(CARPETA_TAREAS.glob("T-*.json")):
+    # Desde A3.3 el tablero NO escribe: una ficha que la base global todavía
+    # no conoce no se importa al refrescar, sino que se anuncia en
+    # `sin_importar` hasta que una orden explícita la incorpore. En un clon
+    # limpio, sin ninguna orden previa, ése es el caso de TODAS las fichas;
+    # exigir que aparecieran publicadas hacía que esta prueba dependiera del
+    # estado operativo de la máquina (pasaba donde la base ya las conocía y
+    # fallaba en un clon recién hecho).
+    sin_importar = set(datos["resumen"].get("sin_importar") or [])
+
+    for ruta_ficha in sorted(carpeta_tareas.glob("T-*.json")):
         identificador = ruta_ficha.stem
         declarada = json.loads(ruta_ficha.read_text(encoding="utf-8"))
 
-        assert identificador in por_id, (
-            "La ficha " + identificador + " no aparece en el tablero."
+        assert identificador in por_id or identificador in sin_importar, (
+            "La ficha " + identificador + " no aparece en el tablero ni está "
+            "anunciada como pendiente de importar."
         )
+
+        if identificador not in por_id:
+            continue
 
         publicada = por_id[identificador]
 
@@ -368,7 +388,73 @@ def _comprobar_estado_desarrollo() -> dict:
 
 
 def prueba_api_desarrollo():
-    _comprobar_estado_desarrollo()
+    """
+    Sobre un repositorio TEMPORAL, no sobre el real.
+
+    La API lee la raíz que `servidor.RAIZ` señala. Con la raíz real, lo que
+    se publicaba dependía de que la base operativa de esta máquina ya
+    conociera las fichas (en un clon limpio, ninguna), así que las
+    aserciones sobre lo publicado no se ejecutaban. Aquí se crean dos
+    fichas registradas y una escrita a mano, y se comprueba que las dos
+    primeras se publican con sus campos y que la tercera se anuncia como
+    pendiente de importar. No se toca la base del repositorio real.
+    """
+    raiz = Path(tempfile.mkdtemp(prefix="api_desarrollo_"))
+    raiz_real = servidor.RAIZ
+
+    try:
+        inicio = subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(raiz)],
+            capture_output=True, text=True,
+        )
+        assert inicio.returncode == 0, inicio.stderr
+
+        fichas.carpeta_tareas(raiz).mkdir(parents=True)
+
+        nucleo.crear(
+            raiz, "T-0001",
+            titulo="Tarea publicada",
+            objetivo="Aparecer en el tablero.",
+            ambito_archivos=["modulos/a/*.py"],
+            pruebas_requeridas=["pruebas/a/prueba_a.py"],
+            decisiones=[{"clave": "D-9", "descripcion": "una decisión"}],
+        )
+        nucleo.crear(
+            raiz, "T-0002",
+            titulo="Segunda publicada",
+            ambito_archivos=["modulos/b/*.py"],
+            pruebas_requeridas=["pruebas/b/prueba_b.py"],
+        )
+
+        # Escrita a mano: la base no la conoce y el tablero no la importa.
+        a_mano = fichas.Ficha(
+            id="T-0003",
+            titulo="Escrita a mano",
+            ambito_archivos=["modulos/c/*.py"],
+            pruebas_requeridas=["pruebas/c/prueba_c.py"],
+        )
+        fichas.guardar(raiz, a_mano)
+
+        servidor.RAIZ = raiz
+
+        datos = _comprobar_estado_desarrollo(fichas.carpeta_tareas(raiz))
+
+        publicadas = {tarea["id"] for tarea in datos["tareas"]}
+
+        assert publicadas == {"T-0001", "T-0002"}, repr(publicadas)
+        assert datos["resumen"]["sin_importar"] == ["T-0003"], (
+            repr(datos["resumen"]["sin_importar"])
+        )
+        assert datos["resumen"]["totales"] == 2
+    finally:
+        servidor.RAIZ = raiz_real
+
+        for intento in range(3):
+            try:
+                shutil.rmtree(raiz)
+                break
+            except OSError:
+                time.sleep(0.2)
 
 
 # ----------------------------------------------------------------------

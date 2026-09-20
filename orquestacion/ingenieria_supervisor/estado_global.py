@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 import time
@@ -147,6 +148,12 @@ MOTIVO_SIN_PROPIETARIO = "sin_propietario"
 MOTIVO_OTRO_PROPIETARIO = "otro_propietario"
 MOTIVO_GENERACION_VENCIDA = "generacion_vencida"
 MOTIVO_ESTADO_INCOMPATIBLE = "estado_incompatible"
+# La fila sigue siendo del mismo dueño, generación y estado, pero una
+# columna sobre la que la orden DECIDIÓ cambió entre su lectura y su
+# escritura (A3.3, `exigir_iguales`), o la marca que traía es más vieja que
+# la grabada (`exigir_no_retroceso`).
+MOTIVO_PRECONDICION_CAMBIADA = "precondicion_cambiada"
+MOTIVO_MARCA_MAS_NUEVA = "marca_mas_nueva"
 
 # Migraciones versionadas. Cada versión es una lista de sentencias que se
 # aplican dentro de una única transacción. Nunca se edita una versión ya
@@ -297,6 +304,29 @@ def _comun_declarado(raiz: Path):
         return None
 
 
+_VARIABLES_GIT_HEREDADAS = (
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+)
+
+
+def _entorno_git_limpio() -> dict:
+    """Copia del entorno sin las variables que redirigen a `git`."""
+    entorno = dict(os.environ)
+
+    for nombre in _VARIABLES_GIT_HEREDADAS:
+        entorno.pop(nombre, None)
+
+    return entorno
+
+
 def git_common_dir(raiz: Path) -> Path:
     """
     Directorio común de Git del repositorio que contiene `raiz`.
@@ -351,6 +381,11 @@ def git_common_dir(raiz: Path) -> Path:
             text=True,
             encoding="utf-8",
             errors="replace",
+            # Un `GIT_DIR` heredado —siempre presente dentro de un hook, y
+            # también en `git rebase --exec` o `git bisect run`— hace que
+            # `git` ignore `cwd` y responda por otro repositorio. La base
+            # global se ubicaría entonces en el sitio equivocado.
+            env=_entorno_git_limpio(),
         )
     except OSError as error:
         raise ErrorEstadoGlobal(
@@ -467,7 +502,12 @@ def _convertir_journal(con: sqlite3.Connection, ruta: Path) -> str:
     """Bucle de conversión propiamente dicho. Ver `_activar_journal`."""
     espera = ESPERA_JOURNAL_S
     ultimo = None
-    nunca_se_bloqueo = True
+
+    # Lo que decide el diagnóstico es el ÚLTIMO desenlace, no si alguna vez
+    # hubo contención. Con un acumulado, unos primeros intentos bloqueados
+    # seguidos de un sistema de archivos que no admite WAL daban el mensaje
+    # equivocado y mandaban a buscar un proceso que no existía.
+    ultimo_fue_bloqueo = False
 
     for intento in range(INTENTOS_JOURNAL):
         try:
@@ -486,13 +526,14 @@ def _convertir_journal(con: sqlite3.Connection, ruta: Path) -> str:
             # El motor no se quejó y aun así no cambió de modo. Eso ya no
             # es contención: es que este sistema de archivos no admite WAL.
             ultimo = "quedó en '" + str(modo) + "'"
+            ultimo_fue_bloqueo = False
         except sqlite3.OperationalError as error:
             # Sólo se reintenta el choque con otro que tiene la base.
             # Cualquier otro error operativo es real y sale sin disfrazarse.
             if "locked" not in str(error).lower() and "busy" not in str(error).lower():
                 raise
 
-            nunca_se_bloqueo = False
+            ultimo_fue_bloqueo = True
             ultimo = str(error)
 
         if intento + 1 < INTENTOS_JOURNAL:
@@ -500,9 +541,9 @@ def _convertir_journal(con: sqlite3.Connection, ruta: Path) -> str:
             espera = min(espera * 2, ESPERA_JOURNAL_MAXIMA_S)
 
     # Los dos desenlaces piden diagnósticos distintos, y antes se daba
-    # siempre el mismo. Si el motor nunca se quejó de bloqueo, no hay
+    # siempre el mismo. Si el último intento no chocó con nadie, no hay
     # ninguna contención que esperar: el sistema de archivos no admite WAL.
-    if nunca_se_bloqueo:
+    if not ultimo_fue_bloqueo:
         raise ErrorEstadoGlobal(
             "SQLite no pudo activar journal_mode=" + JOURNAL_MODE + " en '"
             + str(ruta) + "' (" + str(ultimo) + "), y no por estar ocupada."
@@ -677,14 +718,29 @@ def inicializar(con: sqlite3.Connection) -> dict:
     Cada versión se aplica en su propia transacción: un corte a mitad de una
     migración deja la base en la versión anterior, íntegra.
     """
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS esquema (
-            version     INTEGER PRIMARY KEY,
-            aplicado_en TEXT NOT NULL
-        )
-        """
-    )
+    # Este DDL se ejecutaba en autocommit en CADA apertura de conexión, y
+    # la regla del proyecto es que toda escritura va dentro de una
+    # transacción. Envolverlo sin más tenía un precio: `BEGIN IMMEDIATE`
+    # pide el bloqueo de escritura de toda la base, así que cada `ver` o
+    # cada refresco del tablero lo habría pedido para no escribir nada.
+    #
+    # Se pregunta primero —una lectura, sin candado— y sólo se crea cuando
+    # de verdad falta. La regla queda sin excepciones y el camino normal no
+    # paga nada.
+    existe_esquema = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'esquema'"
+    ).fetchone()
+
+    if existe_esquema is None:
+        with transaccion(con):
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS esquema (
+                    version     INTEGER PRIMARY KEY,
+                    aplicado_en TEXT NOT NULL
+                )
+                """
+            )
 
     anterior = version_esquema(con)
 
@@ -823,6 +879,11 @@ def hash_definicion(ficha: Ficha) -> str:
         "criterios_aceptacion": list(ficha.criterios_aceptacion),
         "ambito_archivos": list(ficha.ambito_archivos),
         "pruebas_requeridas": list(ficha.pruebas_requeridas),
+        # El presupuesto de intentos es declarativo: decide cuándo una
+        # tarea acaba BLOQUEADA. Estaba fuera de la huella y ninguna orden
+        # lo escribía, así que una persona podía editarlo en la ficha y no
+        # pasaba nada; encima el espejo le deshacía la edición sin avisar.
+        "max_intentos": int(ficha.max_intentos),
         "decisiones": [
             {
                 "clave": str(decision.get("clave")),
@@ -855,13 +916,31 @@ def decisiones_operativas(decisiones: list[dict]) -> list[dict]:
     return resultado
 
 
+# Descripción que se da a una decisión registrada en la base cuya clave la
+# definición de ESTE árbol de trabajo no declara.
+DESCRIPCION_NO_DECLARADA = (
+    "(no declarada en la definición de este árbol de trabajo)"
+)
+
+
 def fusionar_decisiones(declaradas: list[dict], operativas: list[dict]) -> list[dict]:
     """
     Une la definición (JSON: clave, descripción) con el estado (SQLite).
 
-    El orden y el conjunto de claves los manda la definición. Una clave
-    declarada sin estado registrado es una decisión pendiente. El estado
-    registrado para una clave que la definición ya no declara se ignora.
+    El orden lo manda la definición. Una clave declarada sin estado
+    registrado es una decisión pendiente.
+
+    Una clave REGISTRADA que esta definición no declara se conserva al
+    final (A3.3). Antes se descartaba, y el efecto era grave: el conjunto
+    de claves lo mandaba el JSON de ESTE árbol de trabajo, así que abrir la
+    tarea desde otra rama que la declarase con menos decisiones borraba de
+    la base —que es la autoridad— la resolución de las que faltaban.
+    Restituir la clave en el JSON no la devolvía: volvía como pendiente. Y
+    para borrarla bastaba una orden de SÓLO LECTURA, porque `cargar` pasa
+    por la sincronización.
+
+    Una resolución humana no se tira porque un archivo de otra rama no la
+    mencione. Se conserva y se dice que no está declarada aquí.
     """
     por_clave = {}
 
@@ -871,9 +950,15 @@ def fusionar_decisiones(declaradas: list[dict], operativas: list[dict]) -> list[
             por_clave[clave] = operativa
 
     fusionadas = []
+    vistas = set()
 
     for declarada in declaradas:
         clave = str(declarada.get("clave"))
+
+        if clave in vistas:
+            continue
+
+        vistas.add(clave)
         estado = por_clave.get(clave, {})
 
         fusionadas.append(
@@ -887,7 +972,124 @@ def fusionar_decisiones(declaradas: list[dict], operativas: list[dict]) -> list[
             }
         )
 
+    for clave, estado in por_clave.items():
+        if clave in vistas:
+            continue
+
+        fusionadas.append(
+            {
+                "clave": clave,
+                "descripcion": DESCRIPCION_NO_DECLARADA,
+                "resuelta": bool(estado.get("resuelta", False)),
+                "resolucion": estado.get("resolucion"),
+                "resuelta_en": estado.get("resuelta_en"),
+                "origen": estado.get("origen"),
+            }
+        )
+
     return fusionadas
+
+
+def resolver_decision(
+    con: sqlite3.Connection,
+    identificador: str,
+    clave: str,
+    resolucion: str,
+    momento: str,
+    origen: str,
+    declaradas: list[dict] | None = None,
+) -> dict:
+    """
+    Marca UNA decisión como resuelta, fusionando con lo que la fila tiene.
+
+    DEBE ejecutarse dentro de `transaccion(con)`.
+
+    Por qué esto vive en el motor y no en Python
+    --------------------------------------------
+    `decisiones` es UNA columna con el JSON de todas las decisiones dentro.
+    Resolver una leyendo la lista, cambiando un elemento y reescribiendo la
+    columna entera es el lost update de manual, y aquí no lo frenaba nada:
+    dos `decidir` sobre claves DISTINTAS son dos órdenes perfectamente
+    válidas —misma generación, mismo estado, sin propietario que exigir—,
+    así que las dos pasan el WHERE y la segunda devuelve a «pendiente» lo
+    que la primera acababa de resolver. Sin error y sin rastro: al humano
+    que decidió se le devolvía su decisión como resuelta.
+
+    Medido antes de arreglarlo: 24 de 25 carreras entre dos procesos
+    perdían una resolución.
+
+    Leyendo la fila DENTRO de la misma transacción, la segunda orden ve lo
+    que la primera confirmó y las dos resoluciones sobreviven.
+    """
+    if not con.in_transaction:
+        raise ErrorEstadoGlobal(
+            "resolver_decision debe ejecutarse dentro de una transacción."
+        )
+
+    fila = obtener_tarea(con, identificador)
+
+    if fila is None:
+        raise ErrorEstadoGlobal(
+            "La tarea '" + str(identificador) + "' no existe en el estado "
+            "global."
+        )
+
+    registradas = list(fila.get("decisiones") or [])
+    fusionadas = fusionar_decisiones(declaradas or [], registradas)
+
+    objetivo = None
+
+    for decision in fusionadas:
+        if decision["clave"] == str(clave):
+            objetivo = decision
+            break
+
+    if objetivo is None:
+        return {
+            "resuelta": False,
+            "motivo": "inexistente",
+            "decisiones": fusionadas,
+        }
+
+    if objetivo["resuelta"]:
+        return {
+            "resuelta": False,
+            "motivo": "ya_resuelta",
+            "decisiones": fusionadas,
+        }
+
+    objetivo["resuelta"] = True
+    objetivo["resolucion"] = resolucion
+    objetivo["resuelta_en"] = momento
+    objetivo["origen"] = origen
+
+    pendientes = [una for una in fusionadas if not una["resuelta"]]
+
+    campos = {
+        "decisiones": _a_json(decisiones_operativas(fusionadas)),
+        "requiere_decision_humana": 1 if pendientes else 0,
+        "actualizado_en": momento,
+    }
+
+    # Si lo único que frenaba la propuesta eran decisiones pendientes y se
+    # acaba de resolver la última, esa falla ya no describe nada: dejarla
+    # hacía que la fila dijera a la vez «resueltas» y «hay decisiones sin
+    # resolver» hasta la siguiente corrida.
+    falla = fila.get("ultima_falla") or {}
+
+    if not pendientes and isinstance(falla, dict) and falla.get("tipo") == (
+        "decisiones_pendientes"
+    ):
+        campos["ultima_falla"] = None
+
+    actualizar_tarea(con, identificador, campos)
+
+    return {
+        "resuelta": True,
+        "motivo": None,
+        "decisiones": fusionadas,
+        "pendientes": pendientes,
+    }
 
 
 def resumen_de_corrida(corrida: dict | None) -> dict | None:
@@ -904,6 +1106,25 @@ def resumen_de_corrida(corrida: dict | None) -> dict | None:
         "fecha": corrida.get("fecha"),
         "resultado": corrida.get("resultado"),
         "motivo": corrida.get("motivo"),
+        # A3.3 — DÓNDE se ejecutó. Sin esto, dos corridas idénticas de
+        # árboles distintos son indistinguibles en el historial y nadie
+        # puede auditar después si se verificó lo correcto.
+        "raiz": corrida.get("raiz"),
+        "es_worktree": corrida.get("es_worktree"),
+        "rama": corrida.get("rama"),
+        "commit": corrida.get("commit"),
+        "commit_final": corrida.get("commit_final"),
+        "arbol_estable": corrida.get("arbol_estable"),
+        # Si había cambios sin confirmar, el commit no contiene lo que se
+        # ejecutó. Se guarda para que la evidencia no diga «commit X en
+        # verde» a secas.
+        "sin_confirmar": corrida.get("sin_confirmar"),
+        # A QUIÉN pertenece esta verificación. `ultima_verificacion`
+        # sobrevive a `reabrir`, a `reanudar` y a una retoma, así que sin
+        # esto el tablero seguía enseñando el verde de una ejecución muerta
+        # como si fuera el de la que está en curso.
+        "generacion": corrida.get("generacion"),
+        "trabajador_id": corrida.get("trabajador_id"),
         "total": corrida.get("total", 0),
         "ok": corrida.get("ok", 0),
         "fallidas": corrida.get("fallidas", 0),
@@ -945,7 +1166,13 @@ def fila_desde_ficha(ficha: Ficha, ahora: str | None = None) -> dict:
         "titulo": ficha.titulo,
         "estado": str(ficha.estado),
         "rama": ficha.rama,
-        "worktree": ficha.worktree,
+        # El árbol de trabajo NO se importa del JSON, igual que la
+        # generación. Es estado de ejecución, no definición: lo concede
+        # `tomar` tras validarlo contra `git worktree list`. Si viniera del
+        # archivo, escribir "worktree": "cualquier/cosa" en una ficha
+        # bastaba para que `verificar` corriera ahí, porque la validación
+        # de la toma sólo miraba el argumento explícito.
+        "worktree": None,
         "intentos": int(ficha.intentos),
         "max_intentos": int(ficha.max_intentos),
         "trabajador_id": ficha.trabajador_id,
@@ -1045,6 +1272,10 @@ def aplicar_fila(ficha: Ficha, fila: dict) -> Ficha:
 # ----------------------------------------------------------------------
 # Lectura y escritura de tareas y eventos
 # ----------------------------------------------------------------------
+
+# Columnas que una orden puede INCREMENTAR en vez de fijar, para que el
+# valor lo resuelva el motor y no una lectura anterior (ver A3.3).
+COLUMNAS_NUMERICAS = ("intentos",)
 
 COLUMNAS_TAREA = (
     "id", "titulo", "estado", "rama", "worktree", "intentos", "max_intentos",
@@ -1352,6 +1583,9 @@ def actualizar_si_propietario(
     momento: str,
     trabajador_id: str | None = None,
     estados_admitidos=None,
+    incrementos=None,
+    exigir_iguales=None,
+    exigir_no_retroceso=None,
 ) -> dict:
     """
     Escritura CONDICIONADA a que quien ordena siga siendo el dueño vigente.
@@ -1373,14 +1607,50 @@ def actualizar_si_propietario(
     3. La decisión se toma con `rowcount`, no deduciéndola de una lectura
        anterior hecha en Python.
 
+    Dos precondiciones más, ambas opcionales (A3.3)
+    -----------------------------------------------
+    `exigir_iguales` añade `columna IS ?` por cada entrada. Sirve para las
+    órdenes que deciden mirando una columna que otra orden legítima puede
+    cambiar sin mover ni el estado ni la generación. El caso real: la
+    recuperación clasifica una ejecución leyendo `ultimo_latido` y escribe
+    después; si entre medias el dueño late, ni el estado ni la generación
+    cambian, así que el UPDATE casaba y la tarea se le arrebataba a alguien
+    que acababa de demostrar que estaba vivo. Exigiendo el latido sobre el
+    que se clasificó, esa escritura cae y se informa como rechazada.
+
+    `exigir_no_retroceso` añade `(columna IS NULL OR columna <= ?)`. Sirve
+    para que una marca de tiempo no pueda RETROCEDER: el reloj de pared no es
+    monótono —NTP, cambio de zona, una máquina virtual restaurada— y un
+    latido con la hora atrasada reducía la antigüedad registrada de la
+    señal hasta hacer que la propia tarea pareciese huérfana.
+
     Un rechazo NO es una excepción aquí: se devuelve descrito, igual que en
     `reclamar`. Y no escribe nada: ni estado, ni intentos, ni marcas de
     tiempo. Quien llama decide si lo convierte en error.
     """
-    if not campos:
+    incrementos = tuple(incrementos or ())
+
+    if not campos and not incrementos:
         raise ErrorEstadoGlobal(
             "Una escritura condicionada necesita al menos una columna."
         )
+
+    for columna in incrementos:
+        # Un incremento se resuelve DENTRO del motor, sobre el valor real de
+        # la fila en el instante de escribir. Calcularlo en Python a partir
+        # de una lectura anterior es un lost update de manual: dos órdenes
+        # que hubieran leído el mismo valor escribirían el mismo resultado y
+        # una de las dos se perdería sin que nadie se enterase.
+        if columna not in COLUMNAS_NUMERICAS:
+            raise ErrorEstadoGlobal(
+                "No se puede incrementar la columna '" + str(columna) + "'."
+            )
+
+        if columna in campos:
+            raise ErrorEstadoGlobal(
+                "La columna '" + str(columna) + "' no puede fijarse y "
+                "además incrementarse en la misma escritura."
+            )
 
     for columna in campos:
         if columna not in COLUMNAS_TAREA or columna in ("id", "generacion"):
@@ -1426,10 +1696,37 @@ def actualizar_si_propietario(
         )
         parametros.extend(estados)
 
-    asignaciones = ", ".join(columna + " = ?" for columna in campos)
+    for nombre, valores in (
+        ("exigir_iguales", exigir_iguales),
+        ("exigir_no_retroceso", exigir_no_retroceso),
+    ):
+        for columna in (valores or {}):
+            if columna not in COLUMNAS_TAREA:
+                raise ErrorEstadoGlobal(
+                    "Columna desconocida en " + nombre + ": '"
+                    + str(columna) + "'."
+                )
+
+    for columna, valor in (exigir_iguales or {}).items():
+        # `IS` y no `=`: con `=`, NULL nunca casa consigo mismo y una fila
+        # cuya columna esté vacía rechazaría una orden correcta.
+        condiciones.append(columna + " IS ?")
+        parametros.append(valor)
+
+    for columna, valor in (exigir_no_retroceso or {}).items():
+        # `<=` y no `<`: escribir el MISMO valor no es un retroceso. Las
+        # marcas están truncadas a segundos, así que dos latidos del mismo
+        # segundo llevan el mismo texto y rechazarlos sería rechazar un
+        # latido correcto.
+        condiciones.append("(" + columna + " IS NULL OR " + columna + " <= ?)")
+        parametros.append(valor)
+
+    partes = [columna + " = ?" for columna in campos]
+    partes += [columna + " = " + columna + " + 1" for columna in incrementos]
 
     cursor = con.execute(
-        "UPDATE tareas SET " + asignaciones + " WHERE " + " AND ".join(condiciones),
+        "UPDATE tareas SET " + ", ".join(partes)
+        + " WHERE " + " AND ".join(condiciones),
         tuple(parametros),
     )
 
@@ -1456,6 +1753,8 @@ def actualizar_si_propietario(
         generacion,
         momento,
         estados,
+        exigir_iguales=exigir_iguales,
+        exigir_no_retroceso=exigir_no_retroceso,
     )
 
 
@@ -1466,6 +1765,8 @@ def rechazo_propiedad(
     generacion: int,
     momento: str,
     estados_admitidos=None,
+    exigir_iguales=None,
+    exigir_no_retroceso=None,
 ) -> dict:
     """
     Describe por qué se rechaza una orden del ciclo, con un formato único.
@@ -1474,6 +1775,13 @@ def rechazo_propiedad(
     son fallos distintos. El segundo es el caso del MISMO trabajador que
     vuelve a tomar la tarea, y es justo el que un control por identidad
     dejaría pasar.
+
+    Las precondiciones de A3.3 también se describen. Sin esto, un rechazo
+    por `exigir_iguales` —el dueño latió mientras la recuperación decidía—
+    caía en «estado incompatible» con un detalle que se contradecía a sí
+    mismo («está en en_ejecucion, que no admite esta orden; la admiten:
+    en_ejecucion»), y eso era lo que la consola le enseñaba al operador
+    bajo el rótulo de «reclamada».
     """
     base = {
         "resultado": ESCRITURA_RECHAZADA,
@@ -1535,6 +1843,58 @@ def rechazo_propiedad(
         )
 
         return base
+
+    if estados_admitidos and str(fila["estado"]) not in {
+        str(uno) for uno in estados_admitidos
+    }:
+        base.update(
+            {
+                "motivo": MOTIVO_ESTADO_INCOMPATIBLE,
+                "detalle": "La tarea '" + str(identificador) + "' está en "
+                "estado '" + str(fila["estado"]) + "', que no admite esta "
+                "orden. La admiten: " + ", ".join(estados_admitidos) + ".",
+            }
+        )
+
+        return base
+
+    for columna, valor in (exigir_iguales or {}).items():
+        actual = fila.get(columna)
+
+        if actual != valor:
+            base.update(
+                {
+                    "motivo": MOTIVO_PRECONDICION_CAMBIADA,
+                    "detalle": "La columna '" + str(columna) + "' de '"
+                    + str(identificador) + "' cambió entre la lectura y la "
+                    "escritura de esta orden (era " + repr(valor)
+                    + ", ahora " + repr(actual) + ")"
+                    + (
+                        ": el propietario dio señal de vida entre medias"
+                        if columna == "ultimo_latido"
+                        else ": otra orden legítima escribió entre medias"
+                    )
+                    + ". No se modificó nada.",
+                }
+            )
+
+            return base
+
+    for columna, valor in (exigir_no_retroceso or {}).items():
+        actual = fila.get(columna)
+
+        if actual is not None and valor is not None and actual > valor:
+            base.update(
+                {
+                    "motivo": MOTIVO_MARCA_MAS_NUEVA,
+                    "detalle": "La columna '" + str(columna) + "' de '"
+                    + str(identificador) + "' ya tiene una marca más nueva ("
+                    + repr(actual) + ") que la que traía esta orden ("
+                    + repr(valor) + "). No se modificó nada.",
+                }
+            )
+
+            return base
 
     base.update(
         {
@@ -1856,6 +2216,7 @@ def sincronizar_ficha(con: sqlite3.Connection, ficha: Ficha, ahora: str | None =
         {
             "titulo": ficha.titulo,
             "ambito_archivos": _a_json(list(ficha.ambito_archivos)),
+            "max_intentos": int(ficha.max_intentos),
             "decisiones": _a_json(decisiones_operativas(fusionadas)),
             "requiere_decision_humana": 1 if pendientes else 0,
             "definicion_hash": huella,

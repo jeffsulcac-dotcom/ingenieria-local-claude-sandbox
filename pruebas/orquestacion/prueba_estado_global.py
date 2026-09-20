@@ -871,7 +871,12 @@ def prueba_cli_estado_lee_sqlite():
     try:
         identificadores = escribir_definiciones(raiz)
 
-        # Sin base todavía: la CLI la crea e importa sola.
+        # Sin base todavía: la CLI la crea, pero NO importa nada.
+        #
+        # Desde A3.3 el tablero es de verdad de sólo lectura: antes pedía
+        # el candado de escritura de toda la base e insertaba filas, así
+        # que una tarea podía nacer con sólo refrescar la página web. Las
+        # fichas que la base no conoce se REPORTAN.
         salida = _cli(raiz, "estado", "--json")
 
         assert salida.returncode == 0, salida.stderr
@@ -880,9 +885,24 @@ def prueba_cli_estado_lee_sqlite():
 
         assert datos["base_global"]["estado"] == "ACTIVA"
         assert Path(datos["base_global"]["ruta"]) == estado_global.ruta_base(raiz)
+        assert datos["resumen"]["totales"] == 0, (
+            "Una lectura incorporó tareas a la base: " + repr(datos["resumen"])
+        )
+        assert sorted(datos["resumen"]["sin_importar"]) == sorted(
+            identificadores
+        ), repr(datos["resumen"].get("sin_importar"))
+
+        # Se incorporan con la orden explícita, que es lo que sí escribe.
+        sincronizada = _cli(raiz, "sincronizar-definiciones")
+
+        assert sincronizada.returncode == 0, sincronizada.stderr
+
+        datos = json.loads(_cli(raiz, "estado", "--json").stdout)
+
         assert datos["resumen"]["totales"] == len(identificadores)
         assert datos["resumen"]["nuevas"] == len(identificadores)
         assert datos["resumen"]["agentes_activos"] == 0
+        assert datos["resumen"]["sin_importar"] == []
 
         # Cambio de estado hecho en ESTE proceso...
         nucleo.tomar(raiz, "T-0902")
