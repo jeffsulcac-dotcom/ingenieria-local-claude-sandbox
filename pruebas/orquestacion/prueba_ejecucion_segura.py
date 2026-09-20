@@ -1777,7 +1777,7 @@ def prueba_s_el_worktree_que_desaparece_se_avisa_y_frena_la_retoma():
        existía. Fallar al conceder cuesta un mensaje; fallar al verificar
        cuesta el trabajo entero.
     """
-    print(" 17. un worktree que desaparece se avisa y frena la retoma:",
+    print(" 17. un worktree que desaparece se avisa y no se hereda:",
           end=" ")
 
     principal, aparte, arboles = montar_tres_arboles()
@@ -1835,13 +1835,26 @@ def prueba_s_el_worktree_que_desaparece_se_avisa_y_frena_la_retoma():
         fila = fila_de(principal, "T-0903")
 
         assert fila["estado"] == str(Estado.REABIERTO)
-        assert fila["worktree"] == str(arboles["A"].resolve()), (
-            "Se borró el worktree registrado en vez de avisar."
+
+        # El árbol pertenece a la EJECUCIÓN, así que se suelta con ella. Si
+        # se quedara pegado, el trabajador siguiente —que no puede saberlo—
+        # acabaría verificando en el árbol del anterior: sus pruebas
+        # correrían sobre trabajo ajeno y el resultado se grabaría como
+        # suyo. Por eso la ruta muerta se informa y NO se hereda.
+        assert fila["worktree"] is None, (
+            "El árbol quedó pegado a la tarea tras recuperarla: "
+            + repr(fila["worktree"])
         )
 
-        # La retoma sin declarar árbol hereda la ruta muerta: se rechaza.
+        # Declarar explícitamente la ruta muerta sí se rechaza, y en la
+        # TOMA, no al verificar con el trabajo ya hecho.
         try:
-            nucleo.tomar(principal, "T-0903", trabajador_id="worker-B")
+            nucleo.tomar(
+                principal,
+                "T-0903",
+                trabajador_id="worker-B",
+                worktree=str(arboles["A"]),
+            )
             raise AssertionError(
                 "Se concedió la toma sobre un worktree que no existe."
             )

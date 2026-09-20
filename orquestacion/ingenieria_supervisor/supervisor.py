@@ -621,7 +621,17 @@ COLUMNAS_OPERATIVAS = (
 CAMPOS_LATIDO = ("ultimo_latido",)
 
 # Soltar al trabajador: lo hacen todas las órdenes que cierran un turno.
-CAMPOS_LIBERACION = ("trabajador_id", "pid", "iniciado_en", "ultimo_latido")
+# Al soltar el turno se suelta también el árbol. El worktree pertenece a la
+# EJECUCIÓN, no a la tarea: si se quedaba pegado, el trabajador siguiente
+# —que no puede saberlo— acababa verificando en el árbol del anterior. Sus
+# pruebas corrían sobre trabajo ajeno y el resultado se grababa como suyo.
+CAMPOS_LIBERACION = (
+    "trabajador_id",
+    "pid",
+    "iniciado_en",
+    "ultimo_latido",
+    "worktree",
+)
 
 CAMPOS_TRANSICION = ("estado",)
 
@@ -678,6 +688,11 @@ def persistir(
     incrementos=None,
     exigir_iguales=None,
 ) -> Ficha:
+    # `campos_propios` es OBLIGATORIO. Su valor por omisión era escribir
+    # las dieciséis columnas operativas, es decir, exactamente el defecto
+    # que A3.3 vino a eliminar: la siguiente orden que alguien añadiera lo
+    # haría mal por descuido y ninguna prueba lo notaría. Quien de verdad
+    # necesite escribirlo todo, que pase `COLUMNAS_OPERATIVAS` a mano.
     """
     Confirma el estado operativo de la ficha, si la propiedad sigue vigente.
 
@@ -741,9 +756,14 @@ def persistir(
     # las dieciséis, que es lo que hacía A3.2 y lo que abre la puerta al
     # lost update: queda disponible para quien deba escribir de verdad todo
     # el estado operativo, pero ninguna orden del ciclo lo usa ya.
-    propios = tuple(
-        COLUMNAS_OPERATIVAS if campos_propios is None else campos_propios
-    )
+    if campos_propios is None:
+        raise ErrorSupervisor(
+            "persistir() exige declarar qué columnas escribe esta orden "
+            "(campos_propios). Escribirlas todas es lo que provocaba que "
+            "dos órdenes válidas se pisaran."
+        )
+
+    propios = tuple(campos_propios)
 
     incrementos = tuple(incrementos or ())
 
@@ -1575,17 +1595,18 @@ def tomar(
     # sistema de archivos y preguntarle a Git son esperas de disco y no
     # deben hacerse con el bloqueo de escritura tomado. Si la ruta no vale,
     # la toma ni se intenta.
-    if worktree:
-        arbol_declarado = str(resolver_worktree(raiz, worktree))
-    elif ficha.worktree:
-        # Heredado de una ejecución anterior. Se valida IGUAL que el
-        # declarado: si no, una retoma después de recuperar concedería la
-        # tarea sobre un árbol que ya no existe, y el fallo aparecería
-        # mucho más tarde, al verificar, con el trabajo ya hecho. Quien
-        # quiera trabajarla en otro sitio lo declara con `--worktree`.
-        arbol_declarado = str(resolver_worktree(raiz, ficha.worktree))
-    else:
-        arbol_declarado = None
+    # El árbol lo declara CADA ejecución. Heredarlo de la anterior era una
+    # trampa: el trabajador nuevo, que no tiene forma de saberlo, acababa
+    # verificando en el árbol del que estuvo antes. Y si ese árbol había
+    # desaparecido, la toma se concedía igual y el fallo sólo aparecía al
+    # verificar, con el trabajo ya hecho.
+    #
+    # Se valida ANTES de abrir la transacción, porque mirar el sistema de
+    # archivos y preguntarle a Git son esperas de disco y no deben hacerse
+    # con el bloqueo de escritura tomado.
+    arbol_declarado = (
+        str(resolver_worktree(raiz, worktree)) if worktree else None
+    )
 
     momento = (ahora or ahora_datetime()).isoformat(timespec="seconds")
 
@@ -1872,6 +1893,7 @@ def _liberar_trabajador(ficha: Ficha) -> None:
     ficha.pid = None
     ficha.iniciado_en = None
     ficha.ultimo_latido = None
+    ficha.worktree = None
 
 
 def verificar(
@@ -3098,6 +3120,7 @@ def reanudar(
         # Se guarda ANTES de liberar: es la prueba de vida sobre la que se
         # tomó la decisión, y tiene que viajar en el WHERE de la escritura.
         latido_juzgado = ficha.ultimo_latido
+        arbol_juzgado = ficha.worktree
 
         _liberar_trabajador(ficha)
 
@@ -3167,15 +3190,15 @@ def reanudar(
         # La tarea ya está recuperada; lo que sigue es sólo informar. Se
         # comprueba después de persistir para no dejar sin recuperar una
         # tarea por un problema de su árbol: son cosas independientes.
-        if ficha.worktree:
+        if arbol_juzgado:
             try:
-                resolver_worktree(raiz, ficha.worktree)
+                resolver_worktree(raiz, arbol_juzgado)
             except ErrorWorktree as problema:
                 informe["worktree_ausente"].append(
                     {
                         "id": ficha.id,
                         "titulo": ficha.titulo,
-                        "worktree": ficha.worktree,
+                        "worktree": arbol_juzgado,
                         "motivo": str(problema),
                     }
                 )

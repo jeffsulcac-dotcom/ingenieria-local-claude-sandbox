@@ -496,7 +496,12 @@ def _convertir_journal(con: sqlite3.Connection, ruta: Path) -> str:
     """Bucle de conversión propiamente dicho. Ver `_activar_journal`."""
     espera = ESPERA_JOURNAL_S
     ultimo = None
-    nunca_se_bloqueo = True
+
+    # Lo que decide el diagnóstico es el ÚLTIMO desenlace, no si alguna vez
+    # hubo contención. Con un acumulado, unos primeros intentos bloqueados
+    # seguidos de un sistema de archivos que no admite WAL daban el mensaje
+    # equivocado y mandaban a buscar un proceso que no existía.
+    ultimo_fue_bloqueo = False
 
     for intento in range(INTENTOS_JOURNAL):
         try:
@@ -515,13 +520,14 @@ def _convertir_journal(con: sqlite3.Connection, ruta: Path) -> str:
             # El motor no se quejó y aun así no cambió de modo. Eso ya no
             # es contención: es que este sistema de archivos no admite WAL.
             ultimo = "quedó en '" + str(modo) + "'"
+            ultimo_fue_bloqueo = False
         except sqlite3.OperationalError as error:
             # Sólo se reintenta el choque con otro que tiene la base.
             # Cualquier otro error operativo es real y sale sin disfrazarse.
             if "locked" not in str(error).lower() and "busy" not in str(error).lower():
                 raise
 
-            nunca_se_bloqueo = False
+            ultimo_fue_bloqueo = True
             ultimo = str(error)
 
         if intento + 1 < INTENTOS_JOURNAL:
@@ -529,9 +535,9 @@ def _convertir_journal(con: sqlite3.Connection, ruta: Path) -> str:
             espera = min(espera * 2, ESPERA_JOURNAL_MAXIMA_S)
 
     # Los dos desenlaces piden diagnósticos distintos, y antes se daba
-    # siempre el mismo. Si el motor nunca se quejó de bloqueo, no hay
+    # siempre el mismo. Si el último intento no chocó con nadie, no hay
     # ninguna contención que esperar: el sistema de archivos no admite WAL.
-    if nunca_se_bloqueo:
+    if not ultimo_fue_bloqueo:
         raise ErrorEstadoGlobal(
             "SQLite no pudo activar journal_mode=" + JOURNAL_MODE + " en '"
             + str(ruta) + "' (" + str(ultimo) + "), y no por estar ocupada."
@@ -706,14 +712,29 @@ def inicializar(con: sqlite3.Connection) -> dict:
     Cada versión se aplica en su propia transacción: un corte a mitad de una
     migración deja la base en la versión anterior, íntegra.
     """
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS esquema (
-            version     INTEGER PRIMARY KEY,
-            aplicado_en TEXT NOT NULL
-        )
-        """
-    )
+    # Este DDL se ejecutaba en autocommit en CADA apertura de conexión, y
+    # la regla del proyecto es que toda escritura va dentro de una
+    # transacción. Envolverlo sin más tenía un precio: `BEGIN IMMEDIATE`
+    # pide el bloqueo de escritura de toda la base, así que cada `ver` o
+    # cada refresco del tablero lo habría pedido para no escribir nada.
+    #
+    # Se pregunta primero —una lectura, sin candado— y sólo se crea cuando
+    # de verdad falta. La regla queda sin excepciones y el camino normal no
+    # paga nada.
+    existe_esquema = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'esquema'"
+    ).fetchone()
+
+    if existe_esquema is None:
+        with transaccion(con):
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS esquema (
+                    version     INTEGER PRIMARY KEY,
+                    aplicado_en TEXT NOT NULL
+                )
+                """
+            )
 
     anterior = version_esquema(con)
 
@@ -1126,7 +1147,13 @@ def fila_desde_ficha(ficha: Ficha, ahora: str | None = None) -> dict:
         "titulo": ficha.titulo,
         "estado": str(ficha.estado),
         "rama": ficha.rama,
-        "worktree": ficha.worktree,
+        # El árbol de trabajo NO se importa del JSON, igual que la
+        # generación. Es estado de ejecución, no definición: lo concede
+        # `tomar` tras validarlo contra `git worktree list`. Si viniera del
+        # archivo, escribir "worktree": "cualquier/cosa" en una ficha
+        # bastaba para que `verificar` corriera ahí, porque la validación
+        # de la toma sólo miraba el argumento explícito.
+        "worktree": None,
         "intentos": int(ficha.intentos),
         "max_intentos": int(ficha.max_intentos),
         "trabajador_id": ficha.trabajador_id,
