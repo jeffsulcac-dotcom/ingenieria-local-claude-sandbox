@@ -2388,6 +2388,44 @@ def prueba_u_un_arbol_que_se_mueve_invalida_la_corrida():
             + repr(fila["ultima_verificacion"])
         )
 
+        # Y el otro lado: una prueba que deja rastro SIN versionar —un
+        # informe de cobertura, una salida, `__pycache__`— no puede
+        # invalidar la corrida. Si lo hiciera, ninguna verificación podría
+        # aprobarse jamás en un proyecto real.
+        nucleo.reabrir(principal, "T-0905", "Segundo intento.")
+        segunda = nucleo.tomar(principal, "T-0905", trabajador_id="worker-A")
+        METRICAS["OPERACIONES"] += 2
+        METRICAS["ACEPTADAS"] += 2
+
+        (carpeta / "prueba_lenta.py").write_text(
+            "import time\n"
+            "from pathlib import Path\n"
+            "Path('informe_de_cobertura.txt').write_text('rastro')\n"
+            "time.sleep(0.2)\n"
+            "print('PRUEBA_LENTA=OK')\n",
+            encoding="utf-8",
+        )
+        _git(principal, "add", "-A")
+        _git(principal, "commit", "-q", "-m", "prueba que deja rastro")
+
+        informe = nucleo.verificar(
+            principal,
+            "T-0905",
+            trabajador_id="worker-A",
+            generacion=segunda.generacion,
+        )
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        assert (principal / "informe_de_cobertura.txt").exists(), (
+            "La prueba no llegó a dejar rastro: no se probó nada."
+        )
+        assert informe["arbol_estable"] is True, (
+            "Un archivo sin versionar creado por las propias pruebas "
+            "invalidó la corrida."
+        )
+        assert informe["estado"] == str(Estado.PROPUESTO), informe["estado"]
+
         comprobar_integridad(principal)
     finally:
         borrar(principal)

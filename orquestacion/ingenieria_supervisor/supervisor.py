@@ -1261,13 +1261,20 @@ class Git:
 
     def hay_cambios_sin_confirmar(self) -> bool:
         """
-        Si el árbol tiene algo sin confirmar.
+        Si el árbol tiene algo sin confirmar EN ARCHIVOS VERSIONADOS.
 
         Hace falta junto al commit: un cambio sin confirmar no mueve el
         hash, así que sin esto un archivo editado a mitad de la corrida
         pasaría por «el árbol no se movió».
+
+        Los archivos sin versionar se excluyen a propósito
+        (`--untracked-files=no`). Una batería de pruebas normal deja
+        rastro —informes de cobertura, salidas, `__pycache__` cuando no se
+        desactiva—, y contarlo como «el árbol se movió» haría que ninguna
+        verificación pudiera aprobarse jamás en un proyecto real. Lo que
+        importa aquí es si cambió el CONTENIDO que el commit describe.
         """
-        resultado = self._ejecutar("status", "--porcelain")
+        resultado = self._ejecutar("status", "--porcelain", "--untracked-files=no")
 
         if resultado.returncode != 0:
             return False
