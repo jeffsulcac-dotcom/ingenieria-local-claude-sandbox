@@ -1199,6 +1199,14 @@ con la comprobación que ahora lo fija):
   FINALIZADA; `reanudar` devolvía 0 con fichas ilegibles; el reemplazo del
   espejo no toleraba un lector concurrente en Windows; y `prueba_api.py`
   pasó a correr sobre un repositorio temporal (3, 4, 14, 20, 29, 30, 31).
+- Al repetir la batería en Windows, la comprobación 5 falló por una
+  comparación TEXTUAL de la revisión con la salida de `git worktree list`
+  (`C:/Users/...` frente a `C:\Users\...`); reproducido en Linux con
+  `TMPDIR` a través de un enlace simbólico y corregido comparando rutas
+  resueltas, como hace el motor. Los cinco casos de seguridad (propio,
+  `prunable`, copiado, anidado sin `.git`, reutilizado por otro
+  repositorio) siguen fallando la batería cuando se reintroducen, y la
+  red para un Git sin línea `prunable` tiene ahora su caso (R29).
 
 **Evidencia real de esta implementación.** Batería de 37 comprobaciones
 (`PRUEBA_EJECUCION_SEGURA=OK`), con métricas medidas y comprobadas, no
@@ -1253,7 +1261,7 @@ Once de estos veintidós no se detectaban cuando se probaron por primera
 vez. Las comprobaciones 9, 17 y 19 a 32 son exactamente los huecos que
 destaparon: el motor hacía lo correcto y nada lo comprobaba.
 
-**Veintiocho mutaciones más, de la revisión final: 28 de 28 detectadas.**
+**Veintinueve mutaciones más, de la revisión final: 29 de 29 detectadas.**
 
 | | Defecto reintroducido | La detecta |
 |---|---|---|
@@ -1285,6 +1293,7 @@ destaparon: el motor hacía lo correcto y nada lo comprobaba.
 | R26 | la lista en memoria vuelve a mandar sobre la base al releer decisiones | 20 |
 | R27 | `decidir` deja la falla ámbar rancia | 31 |
 | R28 | PROPUESTO y BLOQUEADO vuelven a rotularse FINALIZADA | 14 |
+| R29 | no se exige que la raíz del checkout sea la ruta (la red para un Git sin `prunable`) | 5 |
 
 **Verificación en Windows (gate ejecutado el 19/09/2026 sobre la punta
 17530d0; resultados en `ESTADO.md`).** Los cambios de la revisión final
@@ -1490,8 +1499,8 @@ Prueba correspondiente:
   confirmados en la primera, con los críticos y altos cerrados; la
   revisión final cerró
   además los de worktrees `prunable` o reutilizados, el espejo que
-  abortaba la recuperación y la consola que callaba), y 50 mutaciones del
-  código que la batería detecta (22 de la ronda R1 y 28 de la revisión
+  abortaba la recuperación y la consola que callaba), y 51 mutaciones del
+  código que la batería detecta (22 de la ronda R1 y 29 de la revisión
   final).
 
 Pruebas correspondientes:

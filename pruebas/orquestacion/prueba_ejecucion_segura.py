@@ -849,11 +849,49 @@ def prueba_e_una_ruta_ajena_no_se_ejecuta():
         assert alta.returncode == 0, alta.stderr
         (anidado / ".git").unlink()
 
+        # Precondiciones de los dos casos nuevos, leídas del porcelain de
+        # Git. Las rutas se comparan RESUELTAS, nunca como texto: Git
+        # imprime `C:/Users/...` donde Python escribe `C:\Users\...`, y en
+        # POSIX imprime la ruta real donde Python puede llevar un enlace
+        # simbólico (`TMPDIR` a través de uno bastaba para que la
+        # comparación textual fallara). Es la misma regla que sigue el motor.
+        def bloque_de(listado: str, ruta: Path) -> list:
+            """Líneas del bloque porcelain cuya ruta resuelve a `ruta`."""
+            objetivo = ruta.resolve()
+
+            for bloque in listado.replace("\r\n", "\n").split("\n\n"):
+                lineas = bloque.splitlines()
+
+                if (
+                    lineas
+                    and lineas[0].startswith("worktree ")
+                    and Path(lineas[0][len("worktree "):]).resolve() == objetivo
+                ):
+                    return lineas
+
+            return []
+
         listado = _git(principal, "worktree", "list", "--porcelain").stdout
-        assert "worktree " + str(reutilizada) + "\n" in listado, listado
-        assert "prunable" not in listado.split(str(reutilizada), 1)[1].split("\n\n")[0], (
+
+        # La ruta reutilizada sigue listada como válida: Git sólo mira que
+        # `<ruta>/.git` exista. Si un Git futuro la marcara `prunable`, el
+        # caso dejaría de probar lo que dice, y aquí se sabría.
+        bloque = bloque_de(listado, reutilizada)
+
+        assert bloque, "Git no lista la ruta reutilizada:\n" + listado
+        assert not any(linea.startswith("prunable") for linea in bloque), (
             "Git marcó la ruta reutilizada como prunable: el caso ya no "
             "prueba lo que dice."
+        )
+
+        # Y la carpeta recreada sin `.git` sí está marcada `prunable`: es lo
+        # que el motor tiene que descartar.
+        bloque = bloque_de(listado, fantasma)
+
+        assert bloque, "Git no lista el worktree recreado:\n" + listado
+        assert any(linea.startswith("prunable") for linea in bloque), (
+            "Git no marcó como prunable la carpeta recreada sin .git: el "
+            "caso ya no prueba lo que dice."
         )
 
         casos = (
@@ -923,6 +961,36 @@ def prueba_e_una_ruta_ajena_no_se_ejecuta():
                 raise AssertionError(
                     "Se aceptó una ruta que no debía: " + caso
                 )
+
+        # Un Git anterior a 2.36 no imprime la línea `prunable`. Entonces la
+        # última red para el worktree anidado sin `.git` es que Git, desde
+        # dentro, responda con OTRA raíz (la de main): se simula ese Git
+        # dejando pasar los descartados del inventario.
+        inventario_real = nucleo._inventario_de_arboles
+
+        def inventario_sin_prunable(raiz_):
+            utilizables, descartados = inventario_real(raiz_)
+
+            return utilizables | set(descartados), {}
+
+        nucleo._inventario_de_arboles = inventario_sin_prunable
+
+        try:
+            METRICAS["OPERACIONES"] += 1
+
+            try:
+                nucleo.resolver_worktree(principal, str(anidado))
+            except nucleo.ErrorWorktree as error:
+                METRICAS["RECHAZADAS"] += 1
+                assert "tiene su raíz en" in str(error), str(error)
+            else:
+                METRICAS["ACEPTADAS"] += 1
+                raise AssertionError(
+                    "Sin la marca prunable se aceptó un worktree anidado sin "
+                    ".git: git desde dentro responde por la raíz."
+                )
+        finally:
+            nucleo._inventario_de_arboles = inventario_real
 
         # El worktree legítimo sí se acepta: la validación no es un muro.
         assert nucleo.resolver_worktree(principal, str(legitimo)) == (

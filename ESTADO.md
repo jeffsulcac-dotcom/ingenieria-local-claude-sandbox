@@ -857,6 +857,12 @@ Defectos reales encontrados y cerrados en esta rama:
     y BLOQUEADO se rotulaban FINALIZADA; `reanudar` devolvía 0 con fichas
     ilegibles; `os.replace` del espejo sin reintento ante un lector en
     Windows; `prueba_api.py` ahora corre sobre un repositorio temporal.
+12. Corrección de gate: en Windows la comprobación 5 falló por una
+    comparación textual (introducida en esta revisión) entre una ruta de
+    Python y la que imprime `git worktree list --porcelain`. Reproducido
+    en Linux con `TMPDIR` a través de un enlace simbólico; corregido
+    comparando rutas resueltas. Los cinco casos de seguridad de
+    worktrees siguen detectándose al reintroducir cada defecto.
 
 Marcado para decisión humana, sin cambiar el comportamiento (detalle en
 la deuda conocida del README): la ventana de 120 s de una toma desde la
@@ -874,8 +880,8 @@ Comprobado en esta rama (Linux):
   proceso padre y 483 conexiones SQLite, 0 vivas al terminar.
 - Las otras cuatro baterías de orquestación y `prueba_api.py`: OK.
   Corredor único (`pruebas --detalle`): 8 de 8 APROBADO en un clon limpio.
-- Mutación: las 28 reintroducciones de la tabla R1–R28 del README, una a
-  una sobre copias limpias: 28 fallos de la batería, en la comprobación
+- Mutación: las 29 reintroducciones de la tabla R1–R29 del README, una a
+  una sobre copias limpias: 29 fallos de la batería, en la comprobación
   esperada cada una.
 
 Pendiente en Windows: los cambios de esta revisión (`resolver_worktree`,
