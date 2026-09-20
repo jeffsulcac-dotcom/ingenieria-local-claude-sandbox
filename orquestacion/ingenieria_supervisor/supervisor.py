@@ -247,6 +247,20 @@ class ErrorPropiedad(ErrorSupervisor):
         self.generacion_vigente = informe.get("generacion_vigente")
 
 
+class ErrorEspejo(ErrorSupervisor):
+    """
+    El estado global YA QUEDÓ CONFIRMADO en SQLite, pero el espejo JSON
+    no se pudo reescribir (archivo abierto por otro proceso, carpeta
+    sin permisos). No es un rechazo: la transición, la toma o la
+    adopción que la lanzó están hechas, y la siguiente persistencia
+    regenera el espejo. Quien la reciba tiene que tratarla como éxito
+    con aviso, nunca como «no se hizo» (auditoría R2: tres llamadores
+    la confundían con un rechazo y salían con la tarea colgada).
+    """
+
+    confirmado = True
+
+
 class ErrorToma(ErrorSupervisor):
     """
     La tarea no se pudo reclamar: otro trabajador se adelantó, la tarea no
@@ -316,8 +330,12 @@ def proceso_vivo(pid: int | None) -> bool:
     """
     Comprueba si un proceso sigue existiendo.
 
-    Nunca se usa como única señal: el Supervisor exige además un latido
-    reciente, porque el sistema operativo puede reutilizar un PID.
+    Nunca se usa como única señal para LIBERAR nada: el Supervisor exige
+    además un latido vencido, porque el sistema operativo puede
+    reutilizar un PID. En la dirección contraria sí basta sola: la
+    reconciliación de la cola (T-0003) no reencola ni cierra una
+    entrada mientras su proceso figure vivo, y un PID reutilizado sólo
+    cuesta que una persona lo mire (`desencolar`).
     """
     if pid is None or pid <= 0:
         return False
@@ -1006,7 +1024,7 @@ def _regenerar_espejo(raiz: Path, ficha: Ficha) -> None:
     try:
         guardar(raiz, ficha, marcar_actualizacion=False)
     except (ErrorFicha, OSError) as error:
-        raise ErrorSupervisor(
+        raise ErrorEspejo(
             "El estado global de '" + ficha.id + "' quedó confirmado en "
             "SQLite (" + str(ficha.estado) + "), pero no se pudo regenerar "
             "el espejo JSON: " + str(error) + ". La siguiente operación lo "
@@ -1064,6 +1082,12 @@ def entorno_git_limpio() -> dict:
 
     for nombre in VARIABLES_GIT_HEREDADAS:
         entorno.pop(nombre, None)
+
+    # Mensajes SIN traducir: el inventario de worktrees interpreta
+    # `locked initializing` y `prunable`, y con git en español (el del
+    # usuario) escribía «inicializando» y nada casaba (auditoría R2).
+    entorno["LC_ALL"] = "C"
+    entorno["LANGUAGE"] = "C"
 
     return entorno
 
@@ -1192,12 +1216,17 @@ def _inventario_de_arboles(raiz: Path) -> tuple:
                 )
             elif atributo.startswith("locked") and atributo[
                 len("locked"):
-            ].strip().startswith("initializing"):
+            ].strip().lower().startswith(MOTIVOS_DE_CANDADO_EN_CREACION):
                 # `git worktree add` registra el árbol y escribe HEAD
                 # antes de poblarlo, y mientras tanto lo deja bloqueado
                 # con este motivo. Un despacho que llegara ahora vería
                 # un árbol a medio extraer (T-0003, auditoría R1).
-                motivo = "Git la está creando todavía (locked initializing)"
+                motivo = (
+                    "Git la está creando todavía (locked initializing). Si "
+                    "ningún `git worktree add` sigue en curso, el candado "
+                    "quedó huérfano: `git worktree unlock <ruta>` y después "
+                    "`git worktree remove --force <ruta>`"
+                )
 
         bloque = []
 
@@ -1217,6 +1246,12 @@ def _inventario_de_arboles(raiz: Path) -> tuple:
             descartados[resuelta] = motivo
 
     return utilizables, descartados
+
+
+# Lo que `git worktree add` escribe en `locked` mientras extrae el árbol,
+# en inglés y en las traducciones habituales (un candado escrito por el
+# git del usuario, en su idioma, no pasa por `entorno_git_limpio`).
+MOTIVOS_DE_CANDADO_EN_CREACION = ("initializ", "inicializ", "initialis")
 
 
 def arboles_registrados(raiz: Path) -> set:
@@ -1356,8 +1391,11 @@ def resolver_worktree(raiz: Path, declarado: str | None) -> Path:
         raise ErrorWorktree(
             "La ruta '" + str(candidato) + "' figura en la lista de "
             "worktrees de Git, pero no es utilizable: "
-            + descartados[candidato] + ". Repárala (`git worktree repair`) "
-            "o retírala (`git worktree prune`) antes de declararla."
+            + descartados[candidato] + ". Una entrada prunable se retira "
+            "con `git worktree prune` (retira TODAS las prunables del "
+            "repositorio: mira antes `git worktree list`); una movida, con "
+            "`git worktree repair`; una bloqueada sin nadie detrás, con "
+            "`git worktree unlock`."
         )
 
     if candidato not in registrados:
@@ -2266,8 +2304,9 @@ def adoptar(
     `ErrorPropiedad` y no toca nada: no puede adoptar lo que no es suyo,
     y por eso no puede tampoco resucitarlo.
 
-    `pid_anterior` es el PID que la fila tiene que seguir teniendo —el del
-    despacho— para que la adopción entre. Con él, la adopción es EXCLUSIVA:
+    `pid_anterior` es OBLIGATORIO (desde la auditoría R1): el PID que la
+    fila tiene que seguir teniendo —el del despacho— para que la adopción
+    entre. Con él, la adopción es EXCLUSIVA:
     un segundo proceso lanzado por accidente con el mismo argv llega
     cuando la fila ya lleva el PID del primero, su UPDATE no casa y sale
     sin haber tocado el árbol. Sin esta condición los dos habrían
@@ -3156,6 +3195,14 @@ class LatidoAutomatico:
             self.fallos_totales += 1
 
             return self.fallos_seguidos < FALLOS_LATIDO_SEGUIDOS
+        except ErrorEspejo as aviso:
+            # El latido SÍ quedó confirmado; sólo falló el espejo JSON
+            # (archivo abierto por otro proceso). No es motivo para parar
+            # la señal de vida (auditoría R2).
+            self.error = type(aviso).__name__ + ": " + str(aviso)
+            self.fallos_seguidos = 0
+
+            return True
         except Exception as error:
             # Cualquier otra cosa no es transitoria: se anota y se para.
             self.error = type(error).__name__ + ": " + str(error)

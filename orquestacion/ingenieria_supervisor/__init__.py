@@ -3,7 +3,9 @@ Supervisor de Desarrollo V1 de Ingeniería Local.
 
 Coordina el ciclo: tarea -> desarrollo -> prueba -> corrección -> aprobación.
 
-El estado persistente vive únicamente en fichas JSON versionadas en Git.
+La definición de cada tarea vive en una ficha JSON versionada en Git; el
+estado operativo, desde A2, en la base SQLite del directorio común del
+repositorio, y el JSON es su espejo.
 No utiliza PostgreSQL, Redis ni n8n como origen de verdad.
 No requiere Internet.
 

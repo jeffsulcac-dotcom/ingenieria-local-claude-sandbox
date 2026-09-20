@@ -33,21 +33,29 @@ Qué añade sobre el Supervisor de A3.3
   la fila liberada y la entrada de la cola cerrada con el resultado.
 
 - RECUPERACIÓN de la cola: `reconciliar_cola` devuelve a `pendiente` la
-  entrada de una tarea cuya ejecución `reanudar` liberó por huérfana, y
+  entrada de una tarea cuya ejecución `reanudar` liberó por huérfana (o
+  que está EN_EJECUCION en OTRAS manos: alguien la tomó entre medias), y
   cierra la de una tarea que ya terminó. Lo que `reanudar` NO libera —un
   latido vencido con el proceso vivo, un trabajador de otra máquina, una
   fila incompleta— aquí tampoco se toca: la entrada sigue `despachada` y se
-  informa. Ante la duda no se libera nada; decide una persona.
+  informa. Y una entrada ADOPTADA cuyo proceso trabajador o cuyo trabajo
+  siguen vivos en esta máquina, o cuyo trabajador es de otro equipo (sin
+  segunda señal posible), no se reencola ni se cierra: se informa como
+  duda (`vivas_sin_tarea`) y decide una persona (`desencolar` la retira).
+  Ante la duda no se libera nada.
 
 Lo que NO hace (V2): lanzar trabajadores por sí solo en bucle (cada
 `despachar` lanza a lo sumo uno), expirar trabajadores por tiempo, matar
-un proceso que no responde, ni acciones desde el tablero.
+un TRABAJADOR que no late (el TRABAJO y su grupo sí se matan: al agotar
+el tiempo, por señal, y lo que deje vivo al terminar), ni acciones desde
+el tablero.
 
 Este módulo no realiza cálculos de ingeniería.
 """
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -86,6 +94,17 @@ CARPETA_REGISTROS = ".registros"
 
 # Tiempo máximo del trabajo de una entrada cuando no se indica otro.
 TIEMPO_LIMITE_TRABAJO_S = 3600
+
+# Un directorio vacío en la ranura sólo se da por resto de un `worktree
+# add` interrumpido cuando tiene al menos esta edad: Git crea el
+# directorio ANTES de registrarlo, y un `rmdir` inmediato podía borrar el
+# de un despacho ajeno en ese instante (auditoría R2).
+EDAD_MINIMA_DE_RESTOS_S = 5.0
+
+# Tope de la única orden de Git que corre con el candado de escritura
+# tomado (`worktree remove` en `limpiar_arbol`): el candado es de toda la
+# base y no puede depender de que Git termine.
+TIEMPO_GIT_BAJO_CANDADO_S = 30
 
 # Reintentos de `git worktree add` cuando dos despachos preparan a la vez el
 # árbol de la misma tarea (ver `preparar_arbol`), y la espera base entre
@@ -611,7 +630,9 @@ def _validar_trabajo(trabajo) -> list[str]:
     if argumentos and not argumentos[0].strip():
         raise ErrorCola("El ejecutable del trabajo está en blanco.")
 
-    if argumentos and argumentos[0].lower().endswith(EXTENSIONES_INTERPRETADAS):
+    # Windows recorta los puntos y espacios finales de un nombre:
+    # `trabajo.cmd.` es `trabajo.cmd` (auditoría R2).
+    if argumentos and _es_guion_de_cmd(argumentos[0]):
         raise ErrorCola(
             "El ejecutable del trabajo '" + argumentos[0] + "' es un guion de "
             "cmd.exe, que reinterpreta la línea de órdenes: no se acepta. "
@@ -751,7 +772,20 @@ def encolar(
 
 
 def desencolar(raiz: Path, identificador: str, motivo: str = "") -> dict:
-    """Retira la entrada PENDIENTE de una tarea. Una despachada no se retira."""
+    """
+    Retira la entrada viva de una tarea. Es una orden humana.
+
+    La PENDIENTE, siempre. La DESPACHADA sólo si su ejecución YA NO EXISTE
+    (la tarea no está EN_EJECUCION con ese trabajador y esa generación):
+    es la salida que decide una persona cuando la reconciliación la deja
+    como duda —un PID reutilizado por otro programa, un trabajador de
+    otro equipo que nadie puede comprobar— y sin ella la entrada no
+    tenía ninguna (auditoría R2). Una despachada con la ejecución viva la
+    cierra el trabajador; si su proceso murió, `reanudar` libera la
+    tarea y entonces sí se puede retirar. El PID del trabajador y el del
+    trabajo quedan en el resultado para que quien retira compruebe que
+    nada sigue escribiendo en el árbol antes de limpiarlo.
+    """
     raiz = Path(raiz).resolve()
     validar_id(identificador)
 
@@ -766,12 +800,32 @@ def desencolar(raiz: Path, identificador: str, motivo: str = "") -> dict:
                     "La tarea '" + identificador + "' no está en la cola."
                 )
 
-            if viva["estado_cola"] != global_.COLA_PENDIENTE:
+            fila = global_.obtener_tarea(con, identificador)
+            estado_tarea = None if fila is None else str(fila["estado"])
+
+            if viva["estado_cola"] == global_.COLA_DESPACHADA and _ejecucion_viva(
+                fila, viva
+            ):
                 raise ErrorCola(
                     "La entrada " + str(viva["secuencia"]) + " de '"
-                    + identificador + "' ya está despachada: la cierra el "
-                    "trabajador, o la recuperación si el trabajador murió."
+                    + identificador + "' está despachada y su ejecución sigue "
+                    "viva (trabajador " + str(viva.get("trabajador_id"))
+                    + ", generación " + str(viva.get("generacion")) + "): la "
+                    "cierra el trabajador. Si su proceso murió, `reanudar` "
+                    "liberará la tarea y entonces se podrá retirar."
                 )
+
+            resultado = {
+                "tipo": "retirada",
+                "motivo": motivo or "Retirada a mano.",
+                "estaba": viva["estado_cola"],
+                "estado": estado_tarea,
+                "trabajador_id": viva.get("trabajador_id"),
+                "generacion": viva.get("generacion"),
+                "pid": viva.get("pid"),
+                "pid_trabajo": viva.get("pid_trabajo"),
+                "worktree": viva.get("worktree"),
+            }
 
             cursor = con.execute(
                 "UPDATE cola SET estado_cola = ?, actualizado_en = ?, "
@@ -781,12 +835,9 @@ def desencolar(raiz: Path, identificador: str, motivo: str = "") -> dict:
                     global_.COLA_RETIRADA,
                     momento,
                     momento,
-                    json.dumps(
-                        {"tipo": "retirada", "motivo": motivo or "Retirada a mano."},
-                        ensure_ascii=False,
-                    ),
+                    json.dumps(resultado, ensure_ascii=False),
                     viva["secuencia"],
-                    global_.COLA_PENDIENTE,
+                    viva["estado_cola"],
                 ),
             )
 
@@ -795,9 +846,6 @@ def desencolar(raiz: Path, identificador: str, motivo: str = "") -> dict:
                     "La entrada " + str(viva["secuencia"]) + " cambió mientras "
                     "se retiraba."
                 )
-
-            fila = global_.obtener_tarea(con, identificador)
-            estado_tarea = None if fila is None else str(fila["estado"])
 
             global_.insertar_evento(
                 con,
@@ -808,20 +856,39 @@ def desencolar(raiz: Path, identificador: str, motivo: str = "") -> dict:
                     "estado_anterior": estado_tarea,
                     "estado_nuevo": estado_tarea,
                     "motivo": "Retirada de la cola (entrada "
-                    + str(viva["secuencia"]) + ").",
+                    + str(viva["secuencia"]) + ", estaba " + str(viva["estado_cola"])
+                    + (
+                        " a '" + str(viva.get("trabajador_id")) + "'"
+                        if viva["estado_cola"] == global_.COLA_DESPACHADA else ""
+                    )
+                    + ").",
                     "origen": nucleo.ORIGEN_HUMANO,
-                    "datos": {"secuencia": viva["secuencia"], "motivo": motivo},
+                    "datos": {"secuencia": viva["secuencia"], "motivo": motivo,
+                              "resultado": resultado},
                 },
             )
 
             return _obtener_entrada(con, viva["secuencia"])
 
 
+def _ejecucion_viva(fila, entrada) -> bool:
+    """Si la tarea sigue EN_EJECUCION con el trabajador y la generación de
+    la entrada: la ejecución que la entrada registra existe todavía."""
+    return (
+        fila is not None
+        and fila["estado"] == str(Estado.EN_EJECUCION)
+        and fila["trabajador_id"] == entrada["trabajador_id"]
+        and int(fila["generacion"] or 0) == int(entrada["generacion"] or -1)
+    )
+
+
 # ----------------------------------------------------------------------
 # Worktrees automáticos
 # ----------------------------------------------------------------------
 
-def _git(raiz: Path, *argumentos: str) -> subprocess.CompletedProcess:
+def _git(
+    raiz: Path, *argumentos: str, tiempo_limite_s: float | None = None,
+) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
             ["git", *argumentos],
@@ -831,6 +898,12 @@ def _git(raiz: Path, *argumentos: str) -> subprocess.CompletedProcess:
             encoding="utf-8",
             errors="replace",
             env=entorno_git_limpio(),
+            timeout=tiempo_limite_s,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            ["git", *argumentos], 124, "",
+            "git no terminó en " + str(tiempo_limite_s) + " s y se interrumpió.",
         )
     except OSError as error:
         return subprocess.CompletedProcess(["git", *argumentos], 1, "", str(error))
@@ -862,7 +935,9 @@ def _esperar_checkout(arbol: Path) -> None:
     if candado.exists():
         raise ErrorWorktree(
             "El árbol '" + str(arbol) + "' sigue con un checkout en curso ("
-            + str(candado) + ") tras " + str(ESPERA_CHECKOUT_S) + " s."
+            + str(candado) + ") tras " + str(ESPERA_CHECKOUT_S) + " s. Si "
+            "ningún `git` sigue trabajando en ese árbol, el candado quedó "
+            "huérfano (un `git` matado a mitad): bórralo a mano y repite."
         )
 
 
@@ -875,9 +950,12 @@ def _reparar_restos(raiz: Path, destino: Path) -> bool:
     - un directorio VACÍO que Git no lista (murió nada más crearlo): se
       retira con `rmdir`, que sólo borra si de verdad está vacío;
     - metadatos de un árbol cuyo directorio ya no existe (murió a mitad
-      del `remove`, o alguien hizo `rm -rf`): `git worktree prune`, que
-      sólo borra metadatos de árboles sin directorio y no toca ramas ni
-      archivos.
+      del `remove`, o alguien hizo `rm -rf`): se retiran SÓLO los
+      metadatos de esa ruta (`<común>/worktrees/<x>` cuyo `gitdir` apunta
+      a ella), que es lo que `git worktree prune` haría con esa entrada.
+      No se llama a `prune`: poda TODAS las prunables del repositorio, y
+      un worktree del usuario en un disco desconectado en ese instante
+      perdía su índice y su reflog (auditoría R2).
 
     Un directorio con contenido pero sin `.git` (prunable por dentro) NO
     se toca: puede tener trabajo de alguien; lo dice `resolver_worktree`.
@@ -891,10 +969,14 @@ def _reparar_restos(raiz: Path, destino: Path) -> bool:
     if destino.is_dir():
         try:
             vacio = not any(destino.iterdir())
+            edad = time.time() - destino.stat().st_mtime
         except OSError:
             vacio = False
+            edad = 0.0
 
-        if vacio:
+        # Git crea el directorio ANTES de registrar el árbol: uno vacío y
+        # recién nacido puede ser el de un `worktree add` ajeno en curso.
+        if vacio and edad >= EDAD_MINIMA_DE_RESTOS_S:
             registrados, descartados = nucleo._inventario_de_arboles(raiz)
             resuelto = destino.resolve()
 
@@ -906,17 +988,66 @@ def _reparar_restos(raiz: Path, destino: Path) -> bool:
                     pass
 
     if not destino.exists():
-        # Metadatos huérfanos de ESTA ruta: `prune` los retira. Si no los
-        # hay, `prune` no hace nada.
+        # Metadatos huérfanos de ESTA ruta, y sólo de ésta.
         _, descartados = nucleo._inventario_de_arboles(raiz)
 
         for ruta, motivo in descartados.items():
             if ruta == destino.resolve() and "prunable" in motivo:
-                if _git(raiz, "worktree", "prune").returncode == 0:
-                    reparado = True
+                reparado = _podar_metadatos_de(raiz, destino) or reparado
                 break
 
     return reparado
+
+
+def _podar_metadatos_de(raiz: Path, destino: Path) -> bool:
+    """
+    Retira `<común>/worktrees/<x>` cuando su `gitdir` apunta a
+    `<destino>/.git` y ese archivo ya no existe: exactamente lo que `git
+    worktree prune` hace con ESA entrada, sin tocar ninguna otra. Una
+    entrada bloqueada (`locked`: en creación, o a propósito) no se toca,
+    igual que hace Git. Devuelve si retiró algo.
+    """
+    try:
+        comun = Path(global_.git_common_dir(raiz))
+    except global_.ErrorEstadoGlobal:
+        return False
+
+    carpeta = comun / "worktrees"
+
+    if not carpeta.is_dir():
+        return False
+
+    try:
+        objetivo = (Path(destino) / ".git").resolve()
+    except OSError:
+        return False
+
+    if objetivo.exists():
+        return False
+
+    retirado = False
+
+    for metadatos in sorted(carpeta.iterdir()):
+        try:
+            apunta = (metadatos / "gitdir").read_text(
+                encoding="utf-8", errors="replace"
+            ).strip()
+        except OSError:
+            continue
+
+        try:
+            if not apunta or Path(apunta).resolve() != objetivo:
+                continue
+        except OSError:
+            continue
+
+        if (metadatos / "locked").exists():
+            continue
+
+        shutil.rmtree(metadatos, ignore_errors=True)
+        retirado = retirado or not metadatos.exists()
+
+    return retirado
 
 
 def _base_de_la_rama(raiz: Path, base: str | None) -> str:
@@ -965,8 +1096,17 @@ def preparar_arbol(raiz: Path, ficha, base: str | None = None) -> tuple:
     ultimo_error = ""
     partida = None
 
-    zona_de_arboles(raiz).mkdir(parents=True, exist_ok=True)
+    # Enlaces ANTES de crear nada: con `.arboles -> /no/existe`, el `mkdir`
+    # reventaba con un traceback en vez de rechazar (auditoría R2).
     ranura = _exigir_zona_sin_enlaces(raiz, ficha.id)
+
+    try:
+        zona_de_arboles(raiz).mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise ErrorWorktree(
+            "No se pudo crear la zona controlada '" + str(zona_de_arboles(raiz))
+            + "': " + str(error)
+        ) from None
 
     # Dos despachos pueden llegar aquí a la vez para la misma tarea. Git
     # sólo deja ganar a uno (`-b` no puede crear dos veces la rama y la
@@ -981,7 +1121,6 @@ def preparar_arbol(raiz: Path, ficha, base: str | None = None) -> tuple:
         if destino.exists():
             break
 
-        destino.parent.mkdir(parents=True, exist_ok=True)
         excluir_zona_de_git(raiz)
 
         if _rama_existe(raiz, rama):
@@ -1015,8 +1154,13 @@ def preparar_arbol(raiz: Path, ficha, base: str | None = None) -> tuple:
             arbol = resolver_worktree(raiz, str(destino))
             break
         except ErrorWorktree as todavia:
-            if "creando todavía" not in str(todavia) or time.monotonic() >= limite:
+            if "creando todavía" not in str(todavia):
                 raise
+
+            if time.monotonic() >= limite:
+                raise ErrorWorktree(
+                    str(todavia) + " Se esperó " + str(ESPERA_CHECKOUT_S) + " s."
+                ) from None
 
             time.sleep(ESPERA_CREAR_ARBOL_S)
 
@@ -1342,17 +1486,44 @@ def _despachar_entrada(
             },
         )
 
+    aspirante = trabajador_id or nucleo.nuevo_trabajador_id()
+    avisos = []
+
     try:
         ficha = nucleo.tomar(
             raiz,
             identificador,
-            trabajador_id=trabajador_id or nucleo.nuevo_trabajador_id(),
+            trabajador_id=aspirante,
             pid=os.getpid(),
             ahora=ahora,
             git=Git(raiz),
             worktree=str(arbol),
             al_conceder=al_conceder,
         )
+    except nucleo.ErrorEspejo as aviso:
+        # La toma y la marca de la cola SE CONFIRMARON; sólo falló el
+        # espejo JSON (archivo abierto por otro proceso). Tratarlo como
+        # rechazo dejaba la tarea EN_EJECUCION con el PID del despacho y
+        # sin trabajador (auditoría R2). Se sigue con lo que la fila
+        # tiene; la adopción regenera el espejo.
+        avisos.append(str(aviso))
+        ficha = _ficha_desde_la_fila(raiz, identificador)
+
+        if (
+            ficha is None
+            or str(ficha.estado) != str(Estado.EN_EJECUCION)
+            or ficha.trabajador_id != aspirante
+        ):
+            raise ErrorDespacho(
+                {
+                    "tarea": identificador,
+                    "secuencia": secuencia,
+                    "motivo": RECHAZO_FICHA,
+                    "detalle": "La toma dio por confirmada la fila de '"
+                    + identificador + "' pero la fila no la refleja: "
+                    + str(aviso),
+                }
+            ) from None
     except nucleo.ErrorToma as perdida:
         raise ErrorDespacho(
             {
@@ -1437,7 +1608,23 @@ def _despachar_entrada(
         "pid_trabajador": None if proceso is None else proceso.pid,
         "proceso": proceso,
         "rechazos": [],
+        "avisos": avisos,
     }
+
+
+class _FilaComoFicha:
+    """Lo que el despacho necesita de una ficha, leído de la fila."""
+
+    def __init__(self, fila: dict):
+        for clave, valor in fila.items():
+            setattr(self, clave, valor)
+
+
+def _ficha_desde_la_fila(raiz: Path, identificador: str):
+    with global_.conexion(raiz) as con:
+        fila = global_.obtener_tarea(con, identificador)
+
+    return None if fila is None else _FilaComoFicha(dict(fila))
 
 
 def despachar(
@@ -1712,6 +1899,17 @@ def reconciliar_cola(raiz: Path, comprobar_proceso=nucleo.proceso_vivo) -> dict:
       la recuperación: ante la duda, no se libera nada;
     - la tarea espera a una persona o está cerrada (propuesta, bloqueada,
       aprobada, rechazada): la entrada se cierra como TERMINADA con nota.
+      Con la MISMA salvedad: si el proceso trabajador o el trabajo siguen
+      vivos (una orden humana cerró la tarea con el trabajo en marcha),
+      no se cierra —una limpieza borraría el árbol debajo del trabajo— y
+      el trabajador la cerrará él mismo al terminar (auditoría R2).
+
+    La duda vale sólo para entradas ADOPTADAS (`adoptado_en`): antes de
+    la adopción `cola.pid` es el del despacho, que no ejecuta nada en el
+    árbol, y un trabajador que llegara tarde ya no puede adoptar una fila
+    que cambió de manos. Para un trabajador de OTRO equipo no hay segunda
+    señal posible desde aquí: una entrada adoptada suya es duda, no se
+    reencola (la regla de `clasificar_ejecucion`, auditoría R2).
 
     Y una entrada PENDIENTE de una tarea APROBADA se retira: aprobada no
     vuelve a ningún estado tomable, y dejarla ahí sería una entrada que
@@ -1780,22 +1978,19 @@ def reconciliar_cola(raiz: Path, comprobar_proceso=nucleo.proceso_vivo) -> dict:
                     informe["cerradas"].append(_resumen(entrada, None))
                     continue
 
+                # ¿Hay motivo para NO dar por muerta la ejecución? Vale para
+                # las dos salidas (reencolar y cerrar): reencolar lanzaría un
+                # segundo trabajo sobre el mismo árbol; cerrar dejaría que la
+                # limpieza lo borrara debajo del que corre.
+                duda = _duda_sobre_la_entrada(entrada, comprobar_proceso)
+
+                if duda is not None:
+                    informe["vivas_sin_tarea"].append(_resumen(entrada, fila, duda))
+                    continue
+
                 if fila["estado"] in tomables or fila["estado"] == str(
                     Estado.EN_EJECUCION
                 ):
-                    # ¿Sigue vivo AQUÍ el proceso que adoptó la entrada?
-                    # `cola.pid` es el del trabajador desde la adopción (y
-                    # el del despacho antes de ella, que muere en el acto).
-                    # Si vive, reencolar lanzaría un segundo trabajo sobre
-                    # el mismo árbol: se deja despachada y se informa.
-                    if entrada.get("pid") and comprobar_proceso(entrada["pid"]) and (
-                        nucleo.equipo_de(entrada.get("trabajador_id")) in (
-                            None, socket.gethostname()
-                        )
-                    ):
-                        informe["vivas_sin_tarea"].append(_resumen(entrada, fila))
-                        continue
-
                     _cambiar_entrada(
                         con, entrada, global_.COLA_PENDIENTE, momento,
                         None, cerrar=False,
@@ -1825,7 +2020,35 @@ def reconciliar_cola(raiz: Path, comprobar_proceso=nucleo.proceso_vivo) -> dict:
     return informe
 
 
-def _resumen(entrada: dict, fila: dict | None) -> dict:
+def _duda_sobre_la_entrada(entrada: dict, comprobar_proceso) -> str | None:
+    """
+    Por qué NO se puede dar por muerta la ejecución de una entrada
+    despachada, o None si no hay duda. Sólo para entradas adoptadas.
+    """
+    if not entrada.get("adoptado_en"):
+        return None
+
+    equipo = nucleo.equipo_de(entrada.get("trabajador_id"))
+
+    if equipo not in (None, socket.gethostname()):
+        return (
+            "el trabajador es del equipo '" + str(equipo) + "': desde aquí no "
+            "se puede comprobar su proceso"
+        )
+
+    for clave, papel in (("pid", "trabajador"), ("pid_trabajo", "trabajo")):
+        pid = entrada.get(clave)
+
+        if pid and comprobar_proceso(int(pid)):
+            return (
+                "el proceso " + str(pid) + " (" + papel + ") sigue vivo en "
+                "esta máquina"
+            )
+
+    return None
+
+
+def _resumen(entrada: dict, fila: dict | None, motivo: str | None = None) -> dict:
     return {
         "secuencia": entrada["secuencia"],
         "tarea": entrada["tarea_id"],
@@ -1833,6 +2056,10 @@ def _resumen(entrada: dict, fila: dict | None) -> dict:
         "estado_tarea": None if fila is None else fila["estado"],
         "trabajador_id": entrada["trabajador_id"],
         "generacion": entrada["generacion"],
+        "pid": entrada.get("pid"),
+        "pid_trabajo": entrada.get("pid_trabajo"),
+        "adoptada": bool(entrada.get("adoptado_en")),
+        "motivo": motivo,
     }
 
 
@@ -1938,12 +2165,19 @@ def limpiar_arbol(raiz: Path, identificador: str) -> dict:
 
     Se rechaza, con `ErrorLimpieza`, cuando:
 
+    - la zona o la ranura de la tarea son enlaces simbólicos;
     - la base registra para esa tarea un árbol FUERA de la zona: aunque
       exista `<zona>/<id>`, tocar algo de esa tarea sería adivinar;
     - Git no reconoce `<zona>/<id>` como worktree de este repositorio
-      (`resolver_worktree`): no se borra lo que no se puede verificar;
-    - la tarea está EN_EJECUCION o tiene una entrada despachada;
-    - el árbol tiene CUALQUIER cosa sin confirmar, versionada o no.
+      (`resolver_worktree`), o lo resuelve a otra ruta que la ranura: no
+      se borra lo que no se puede verificar;
+    - el árbol no está en la rama de la tarea (otra rama, HEAD separada):
+      un commit que sólo viviera ahí se perdería;
+    - el árbol tiene CUALQUIER cosa sin confirmar, versionada o no, o
+      archivos ignorados por Git (salvo el bytecode de Python), o Git no
+      puede decirlo;
+    - la tarea está EN_EJECUCION o tiene una entrada despachada (esto, y
+      el `worktree remove`, con el candado de escritura tomado).
 
     Devuelve el informe cuando lo borra, o cuando no había nada que borrar.
     """
@@ -1989,7 +2223,12 @@ def limpiar_arbol(raiz: Path, identificador: str) -> dict:
             "tarea dentro de la zona controlada: no se toca."
         )
 
-    rama = nucleo.PREFIJO_RAMA + identificador
+    # La rama que la ficha exige, como en `preparar_arbol` y `tomar` (una
+    # ficha con otra `rama` tendría si no un árbol que nunca se limpia).
+    with global_.conexion(raiz) as con:
+        previa = global_.obtener_tarea(con, identificador)
+
+    rama = (previa or {}).get("rama") or nucleo.PREFIJO_RAMA + identificador
     actual = Git(arbol).rama_actual()
 
     if actual != rama:
@@ -2001,15 +2240,58 @@ def limpiar_arbol(raiz: Path, identificador: str) -> dict:
             "ahí se perdería. Vuelve a la rama o confírmalo a mano."
         )
 
-    # Decidir y borrar CON EL CANDADO DE ESCRITURA TOMADO. Es la única
-    # operación del paquete que hace Git dentro de una transacción, y es
-    # a propósito (R1): con las lecturas en autocommit, un `despachar`
-    # simultáneo reutilizaba el árbol, confirmaba la toma y lanzaba el
-    # trabajador mientras la limpieza, que ya había decidido, ejecutaba
-    # el `remove`: ejecución viva con el árbol borrado. Con el candado,
-    # la toma espera a que la limpieza confirme y entonces `al_conceder`
-    # ve que el árbol ya no está. Es una orden manual, rara y local, y
-    # retirar un árbol limpio tarda milisegundos.
+    # Lo que el árbol contiene se mira SIN el candado: `status` sobre un
+    # árbol grande tarda segundos, y el candado de escritura es el de toda
+    # la base (un despacho, una adopción o un cierre que esperara más que
+    # `busy_timeout` fallaban; auditoría R2). `worktree remove` sin
+    # `--force` vuelve a rechazar por sí mismo un árbol con cambios
+    # versionados o sin versionar que aparecieran entre medias.
+    cambios = Git(arbol).cambios_del_arbol()
+
+    if cambios is None:
+        raise ErrorLimpieza(
+            "Git no pudo decir si '" + str(arbol) + "' tiene cambios "
+            "sin confirmar: no se borra lo que no se puede verificar."
+        )
+
+    if cambios:
+        raise ErrorLimpieza(
+            "El árbol '" + str(arbol) + "' tiene " + str(len(cambios))
+            + " cambio(s) sin confirmar (" + ", ".join(cambios[:5])
+            + ("..." if len(cambios) > 5 else "") + "). No se borra "
+            "trabajo que nadie confirmó; confírmalo o descártalo a mano."
+        )
+
+    # Lo IGNORADO por Git también es de alguien: salidas, modelos, un
+    # `.env`. `worktree remove` sin `--force` lo borraría sin decir nada
+    # (auditoría R1). El bytecode de Python se exceptúa: se regenera solo
+    # y bloquearía toda limpieza.
+    ignorados = _ignorados_del_arbol(arbol)
+
+    if ignorados is None:
+        raise ErrorLimpieza(
+            "Git no pudo listar los archivos ignorados de '" + str(arbol)
+            + "': no se borra lo que no se puede verificar."
+        )
+
+    if ignorados:
+        raise ErrorLimpieza(
+            "El árbol '" + str(arbol) + "' tiene " + str(len(ignorados))
+            + " archivo(s) ignorados por Git (" + ", ".join(ignorados[:5])
+            + ("..." if len(ignorados) > 5 else "") + "). No se borran "
+            "sin que alguien los mire; retíralos a mano si sobran."
+        )
+
+    # El estado de la tarea y de su entrada se deciden, y el árbol se
+    # retira, CON EL CANDADO DE ESCRITURA TOMADO. Es la única orden de
+    # Git del paquete dentro de una transacción, y es a propósito (R1):
+    # con la decisión en autocommit, un `despachar` simultáneo reutilizaba
+    # el árbol, confirmaba la toma y lanzaba el trabajador mientras la
+    # limpieza, que ya había decidido, ejecutaba el `remove`: ejecución
+    # viva con el árbol borrado. Con el candado, la toma espera a que la
+    # limpieza confirme y entonces `al_conceder` ve que el árbol ya no
+    # está. Retirar un árbol limpio tarda milisegundos, y aun así tiene
+    # tope: el candado no puede depender de que Git termine.
     with global_.conexion(raiz) as con:
         with global_.transaccion(con):
             fila = global_.obtener_tarea(con, identificador)
@@ -2029,43 +2311,10 @@ def limpiar_arbol(raiz: Path, identificador: str) -> dict:
                     "borra hasta que el trabajador o la recuperación la cierren."
                 )
 
-            cambios = Git(arbol).cambios_del_arbol()
-
-            if cambios is None:
-                raise ErrorLimpieza(
-                    "Git no pudo decir si '" + str(arbol) + "' tiene cambios "
-                    "sin confirmar: no se borra lo que no se puede verificar."
-                )
-
-            if cambios:
-                raise ErrorLimpieza(
-                    "El árbol '" + str(arbol) + "' tiene " + str(len(cambios))
-                    + " cambio(s) sin confirmar (" + ", ".join(cambios[:5])
-                    + ("..." if len(cambios) > 5 else "") + "). No se borra "
-                    "trabajo que nadie confirmó; confírmalo o descártalo a mano."
-                )
-
-            # Lo IGNORADO por Git también es de alguien: salidas, modelos,
-            # un `.env`. `worktree remove` sin `--force` lo borraría sin
-            # decir nada (auditoría R1). El bytecode de Python se
-            # exceptúa: se regenera solo y bloquearía toda limpieza.
-            ignorados = _ignorados_del_arbol(arbol)
-
-            if ignorados is None:
-                raise ErrorLimpieza(
-                    "Git no pudo listar los archivos ignorados de '" + str(arbol)
-                    + "': no se borra lo que no se puede verificar."
-                )
-
-            if ignorados:
-                raise ErrorLimpieza(
-                    "El árbol '" + str(arbol) + "' tiene " + str(len(ignorados))
-                    + " archivo(s) ignorados por Git (" + ", ".join(ignorados[:5])
-                    + ("..." if len(ignorados) > 5 else "") + "). No se borran "
-                    "sin que alguien los mire; retíralos a mano si sobran."
-                )
-
-            resultado = _git(raiz, "worktree", "remove", str(arbol))
+            resultado = _git(
+                raiz, "worktree", "remove", str(arbol),
+                tiempo_limite_s=TIEMPO_GIT_BAJO_CANDADO_S,
+            )
 
             if resultado.returncode != 0:
                 raise ErrorLimpieza(
@@ -2136,6 +2385,12 @@ def limpiar_arboles(raiz: Path) -> dict:
 
     informe = {"limpiados": [], "rechazados": [], "sin_arbol": []}
 
+    if zona.is_symlink():
+        raise ErrorLimpieza(
+            "La zona '" + str(zona) + "' es un enlace simbólico: no se limpia "
+            "nada a través de un enlace."
+        )
+
     if not zona.is_dir():
         return informe
 
@@ -2201,8 +2456,10 @@ def matar_grupo(proceso) -> None:
     """
     Mata el trabajo Y todo lo que haya lanzado: en POSIX el trabajo es
     líder de su propia sesión y `killpg` alcanza a los nietos; en Windows
-    sólo se mata al hijo directo (un Job Object queda para V2, y el gate
-    de Windows lo anota).
+    `taskkill /T` recorre el árbol de procesos por PID padre, así que
+    alcanza a los nietos que sigan colgando del trabajo, pero no a uno
+    que se hubiera desligado (un Job Object queda para V2, y el gate de
+    Windows lo anota).
     """
     if proceso is None or proceso.poll() is not None:
         return
@@ -2211,6 +2468,14 @@ def matar_grupo(proceso) -> None:
         if os.name != "nt":
             os.killpg(proceso.pid, signal.SIGKILL)
         else:
+            try:
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(proceso.pid)],
+                    capture_output=True, timeout=15,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+
             proceso.kill()
     except OSError:
         try:
@@ -2222,6 +2487,61 @@ def matar_grupo(proceso) -> None:
         proceso.wait(timeout=10)
     except subprocess.TimeoutExpired:
         pass
+
+
+def _matar_descendencia(proceso):
+    """
+    Cuando el trabajo YA terminó: mata lo que hubiera dejado vivo en su
+    grupo. Un trabajo que salía con 0 dejando un nieto seguía escribiendo
+    en el árbol después de PROPUESTO, y la limpieza lo borraba debajo
+    (auditoría R2). En POSIX el grupo existe mientras quede un miembro y
+    su número no se reutiliza entre tanto, así que `killpg` no alcanza a
+    nadie ajeno. Devuelve si mató algo; None si no se puede saber (en
+    Windows no hay grupo que consultar sin Job Object, V2).
+    """
+    if os.name == "nt":
+        return None
+
+    try:
+        os.killpg(proceso.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return None
+
+    return True
+
+
+@contextlib.contextmanager
+def _senales_de_terminacion_bloqueadas():
+    """
+    Aplaza SIGTERM/SIGINT/SIGHUP mientras dura el bloque (POSIX). Entre
+    el `Popen` del trabajo y su anotación en `_TRABAJO_EN_CURSO` una
+    señal hacía saltar `Interrumpido` con el trabajo ya vivo y sin nadie
+    que lo matara: la tarea se devolvía y el trabajo seguía escribiendo
+    (auditoría R2). La señal pendiente se entrega al salir del bloque,
+    cuando el manejador ya encuentra el trabajo anotado y lo mata.
+    """
+    if not hasattr(signal, "pthread_sigmask"):
+        yield
+        return
+
+    senales = {
+        senal for senal in (
+            getattr(signal, nombre, None) for nombre in ("SIGTERM", "SIGINT", "SIGHUP")
+        ) if senal is not None
+    }
+
+    try:
+        anterior = signal.pthread_sigmask(signal.SIG_BLOCK, senales)
+    except (OSError, ValueError):
+        yield
+        return
+
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, anterior)
 
 
 def _cola_del_archivo(ruta: Path) -> str:
@@ -2238,25 +2558,62 @@ def _cola_del_archivo(ruta: Path) -> str:
     return _recortar(datos.decode("utf-8", errors="replace"))
 
 
-def _resolver_ejecutable(argv: list[str]) -> str | None:
+def _es_guion_de_cmd(ruta: str) -> bool:
+    return str(ruta).rstrip(". ").lower().endswith(EXTENSIONES_INTERPRETADAS)
+
+
+def _resolver_ejecutable(argv: list[str]) -> tuple:
     """
     `argv[0]` sin separador de rutas se resuelve por PATH, aquí, y se
-    entrega ya resuelto. En Windows `CreateProcess` buscaría antes en el
-    directorio del ejecutable padre y en el cwd del padre, que es la
-    raíz del Supervisor: un `git.exe` dejado ahí ganaría al del PATH.
+    entrega ya resuelto: (ruta, None), o (None, motivo) si no vale.
+
+    En Windows `CreateProcess` buscaría antes en el directorio del
+    ejecutable padre y en el cwd del padre, que es la raíz del
+    Supervisor: un `git.exe` dejado ahí ganaría al del PATH. Y
+    `shutil.which` (hasta Python 3.11) hace lo mismo con el cwd, así que
+    lo RESUELTO se vuelve a comprobar: tiene que estar en un directorio
+    del PATH. Lo mismo con PATHEXT: `which("npm")` devuelve `npm.cmd`, y
+    un `.cmd` pasa por `cmd.exe`, que reinterpreta los argumentos; se
+    rechaza la RUTA resuelta, no sólo lo que se encoló (auditoría R2).
     """
     ejecutable = argv[0]
 
     if "/" in ejecutable or os.sep in ejecutable or (
         os.altsep and os.altsep in ejecutable
     ):
-        return ejecutable
+        ruta = ejecutable
+    else:
+        ruta = shutil.which(ejecutable)
 
-    return shutil.which(ejecutable)
+        if ruta is None:
+            return None, "no se encontró el ejecutable en PATH"
+
+        carpeta = os.path.normcase(
+            os.path.abspath(os.path.dirname(ruta) or os.curdir)
+        )
+        en_path = {
+            os.path.normcase(os.path.abspath(una))
+            for una in os.environ.get("PATH", "").split(os.pathsep) if una
+        }
+
+        if carpeta not in en_path:
+            return None, (
+                "se resolvió en '" + str(ruta) + "', que no está en ningún "
+                "directorio del PATH (el directorio actual no cuenta)"
+            )
+
+    if _es_guion_de_cmd(ruta):
+        return None, (
+            "'" + str(ruta) + "' es un guion de cmd.exe, que reinterpreta la "
+            "línea de órdenes: no se ejecuta"
+        )
+
+    return ruta, None
 
 
 def correr_trabajo(
     argv: list[str], arbol: Path, tiempo_limite_s: int, salida: Path | None = None,
+    al_lanzar=None,
 ) -> dict:
     """
     Ejecuta el trabajo encolado dentro del árbol, como lista de argumentos.
@@ -2281,6 +2638,12 @@ def correr_trabajo(
     árbol, no a las del Supervisor, para que el trabajo y las pruebas
     vean el mismo código. Lo demás del entorno se hereda: el trabajo
     corre como el usuario, sin aislamiento (documentado).
+
+    `al_lanzar(pid)`, si se da, se llama con el PID del trabajo nada más
+    lanzarlo; si lanza, el trabajo se mata y cuenta como no lanzado: un
+    trabajo cuyo PID nadie pudo anotar sería invisible a la recuperación
+    (auditoría R2). Al terminar el trabajo, lo que dejara vivo en su
+    grupo se mata también (`descendencia_matada`).
     """
     global _TRABAJO_EN_CURSO
 
@@ -2290,7 +2653,7 @@ def correr_trabajo(
 
     inicio = time.monotonic()
 
-    ejecutable = _resolver_ejecutable(argv)
+    ejecutable, problema = _resolver_ejecutable(argv)
 
     if ejecutable is None:
         return {
@@ -2299,7 +2662,8 @@ def correr_trabajo(
             "duracion_s": 0.0,
             "salida": "",
             "detalle": "No se pudo lanzar el trabajo " + repr(argv[:1])
-            + ": no se encontró el ejecutable en PATH.",
+            + ": " + str(problema) + ".",
+            "descendencia_matada": None,
         }
 
     temporal = salida is None
@@ -2327,13 +2691,19 @@ def correr_trabajo(
             "duracion_s": round(time.monotonic() - inicio, 3),
             "salida": texto,
             "detalle": detalle,
+            "descendencia_matada": None,
         }
 
     try:
-        with open(salida, "ab") as archivo:
-            proceso = _lanzar_desligado(
-                [ejecutable] + argv[1:], str(arbol), entorno, archivo,
-            )
+        # El lanzamiento y su anotación van juntos, sin que una señal
+        # pueda colarse entre los dos.
+        with _senales_de_terminacion_bloqueadas():
+            with open(salida, "ab") as archivo:
+                proceso = _lanzar_desligado(
+                    [ejecutable] + argv[1:], str(arbol), entorno, archivo,
+                )
+
+            _TRABAJO_EN_CURSO = proceso
     except OSError as error:
         return informe(
             None, False,
@@ -2341,9 +2711,22 @@ def correr_trabajo(
             + type(error).__name__ + ": " + str(error),
         )
 
-    _TRABAJO_EN_CURSO = proceso
+    descendencia = None
 
     try:
+        if al_lanzar is not None:
+            try:
+                al_lanzar(proceso.pid)
+            except Exception as error:
+                matar_grupo(proceso)
+
+                return informe(
+                    None, False,
+                    "No se pudo anotar el PID del trabajo (" + str(proceso.pid)
+                    + "): " + type(error).__name__ + ": " + str(error) + ". Se "
+                    "interrumpió para no dejar un trabajo que nadie vigile.",
+                )
+
         try:
             codigo = proceso.wait(timeout=int(tiempo_limite_s))
         except subprocess.TimeoutExpired:
@@ -2352,20 +2735,29 @@ def correr_trabajo(
             return informe(
                 None, True,
                 "El trabajo superó su tiempo límite de " + str(int(tiempo_limite_s))
-                + " s y fue interrumpido, con todo lo que hubiera lanzado.",
+                + " s y fue interrumpido" + (
+                    ", con todo lo que hubiera lanzado." if os.name != "nt"
+                    else " (taskkill /T sobre su árbol de procesos; sin Job "
+                    "Object, un nieto desligado escaparía)."
+                ),
             )
         except BaseException:
             # Una señal (SIGTERM, Ctrl-C) o cualquier otra interrupción de
             # este proceso: el trabajo no sobrevive a su trabajador.
             matar_grupo(proceso)
             raise
+
+        descendencia = _matar_descendencia(proceso)
     finally:
         _TRABAJO_EN_CURSO = None
 
-    return informe(
+    resultado = informe(
         codigo, False,
         None if codigo == 0 else "El trabajo terminó con código " + str(codigo) + ".",
     )
+    resultado["descendencia_matada"] = descendencia
+
+    return resultado
 
 
 def interrumpir_trabajo_en_curso() -> None:
@@ -2439,11 +2831,13 @@ def huella_de_la_raiz(raiz: Path) -> dict | None:
     """
     Lo que un trabajo NO debe cambiar y no está en su árbol: el checkout
     de la raíz (salvo el espejo JSON del Supervisor), la configuración
-    del repositorio común y sus hooks. Se toma antes y después del
-    trabajo; si difiere, el trabajo escribió fuera del árbol (un `../..`
-    mal calculado, un `git config`), y se bloquea con el motivo. Es una
-    red contra el descuido, no contra un trabajo malicioso: el trabajo
-    corre como el usuario. None si no se puede calcular.
+    del repositorio común, su `info/exclude` y sus hooks. Se toma antes
+    y después del trabajo; si difiere, el trabajo escribió fuera del
+    árbol (un `../..` mal calculado, un `git config`), y se bloquea con
+    el motivo. Es una red contra el descuido, no contra un trabajo
+    malicioso: el trabajo corre como el usuario, y un `tag`, un `stash`
+    o un `.gitignore` del árbol no se miran (documentado). None si no se
+    puede calcular.
     """
     cambios = Git(raiz).cambios_del_arbol()
 
@@ -2474,21 +2868,39 @@ def huella_de_la_raiz(raiz: Path) -> dict | None:
             ruta for ruta in cambios if not ruta.startswith(RASTRO_DEL_SUPERVISOR)
         ),
         "config": huella(comun / "config"),
+        "exclude": huella(comun / "info" / "exclude"),
         "hooks": listado,
     }
 
 
-def fuera_del_arbol(antes: dict | None, despues: dict | None) -> list[str]:
-    """Qué cambió en la raíz o en el repositorio común entre dos huellas."""
+def fuera_del_arbol(
+    antes: dict | None, despues: dict | None, ambito: list[str] | None = None,
+) -> list[str]:
+    """
+    Qué cambió en la raíz o en el repositorio común entre dos huellas.
+
+    De la raíz sólo cuentan las rutas NUEVAS que caen en el ámbito
+    concedido: es el `../..` mal calculado que esta red quiere cazar. Lo
+    demás que aparezca en la raíz mientras dura el trabajo es actividad
+    del usuario, que trabaja ahí (guarda un archivo, Revit deja una
+    copia), y bloquear por ello era un falso positivo frecuente
+    (auditoría R2). Sin ámbito, cuenta todo.
+    """
     if antes is None or despues is None:
         return []
 
+    conocidas = set(antes["raiz"])
+
     fuera = [
-        "raíz: " + ruta for ruta in despues["raiz"] if ruta not in antes["raiz"]
+        "raíz: " + ruta for ruta in despues["raiz"]
+        if ruta not in conocidas and (ambito is None or ruta_en_ambito(ruta, ambito))
     ]
 
     if antes["config"] != despues["config"]:
         fuera.append("configuración del repositorio (.git/config)")
+
+    if antes.get("exclude") != despues.get("exclude"):
+        fuera.append("lista de exclusión del repositorio (.git/info/exclude)")
 
     if antes["hooks"] != despues["hooks"]:
         fuera.append("hooks del repositorio (.git/hooks)")
@@ -2568,9 +2980,14 @@ def ejecutar_trabajador(
     El cuerpo del proceso trabajador. Devuelve el informe; el código de
     salida lo decide `trabajador.principal` a partir de él.
 
-        adoptar -> [latido] trabajo -> ámbito -> verificar -> cerrar entrada
+        adoptar -> [latido] trabajo (con su PID anotado en la entrada)
+        -> revalidar el árbol -> ámbito (árbol y huella de la raíz)
+        -> verificar
 
-    Cada salida deja la tarea en un estado coherente y la entrada cerrada:
+    La entrada de la cola se cierra DENTRO de la transición que la
+    acompaña (`devolver`, `bloquear`, `verificar`, por gancho), no como
+    paso aparte. Cada salida deja la tarea en un estado coherente y la
+    entrada cerrada:
 
     - trabajo en verde y sólo dentro del ámbito: `verificar` decide
       (PROPUESTO, REQUIERE_REVISION o BLOQUEADO) y la entrada queda
@@ -2585,9 +3002,15 @@ def ejecutar_trabajador(
       nada y se informa.
 
     Si el propio trabajador se avería (una excepción que no es de las
-    previstas), intenta devolver la tarea y cerrar la entrada como fallida
-    antes de salir, para no dejar una ejecución colgada con su PID vivo
-    hasta que la recuperación la juzgue.
+    previstas), intenta devolver la tarea con la entrada cerrada en la
+    misma transacción, reintentando ante un candado de la base. Si no
+    puede devolverla por PROPIEDAD o ESTADO (ya no es suya), cierra sola
+    la entrada si aún es suya; si no puede por un error TRANSITORIO, no
+    toca nada: «tarea EN_EJECUCION + entrada despachada» lo recuperan
+    `reanudar` y la reconciliación, «tarea EN_EJECUCION + entrada
+    cerrada» no lo recupera nadie (auditoría R2). Un fallo del espejo
+    JSON tras el COMMIT (`ErrorEspejo`) es éxito con aviso, nunca un
+    rechazo.
     """
     raiz = Path(raiz).resolve()
 
@@ -2604,6 +3027,8 @@ def ejecutar_trabajador(
         "resultado": None,
         "entrada_cerrada": None,
         "detalle": None,
+        "pid_trabajo": None,
+        "avisos": [],
     }
 
     if pid_despacho is None:
@@ -2630,6 +3055,7 @@ def ejecutar_trabajador(
 
     ficha = None
     ultimo_transitorio = None
+    adoptada_sin_espejo = False
 
     for intento in range(INTENTOS_ADOPCION):
         try:
@@ -2638,11 +3064,18 @@ def ejecutar_trabajador(
                 pid_anterior=pid_despacho, al_confirmar=anotar_pid_en_cola,
             )
             break
-        except (nucleo.ErrorPropiedad, ErrorSupervisor) as rechazo:
+        except nucleo.ErrorEspejo as aviso:
+            # La adopción SE CONFIRMÓ; sólo falló el espejo JSON. Salir
+            # con «no es mía» dejaba la fila con NUESTRO PID y sin nadie
+            # detrás (auditoría R2). La ficha se carga después.
+            informe["avisos"].append(str(aviso))
+            adoptada_sin_espejo = True
+            break
+        except (nucleo.ErrorPropiedad, ErrorSupervisor, ErrorFicha) as rechazo:
             # La tarea ya no está en ejecución (el primer proceso terminó),
-            # ya lleva el PID de otro trabajador (doble lanzamiento) o
-            # cambió de manos: no hay nada que adoptar y no se toca el
-            # árbol.
+            # ya lleva el PID de otro trabajador (doble lanzamiento),
+            # cambió de manos, o su ficha no se puede leer: no hay nada
+            # que adoptar y no se toca el árbol.
             informe["resultado"] = "no_adoptada"
             informe["detalle"] = (
                 "La ejecución ya no es de este trabajador: " + str(rechazo)
@@ -2655,7 +3088,7 @@ def ejecutar_trabajador(
             ultimo_transitorio = transitorio
             time.sleep(ESPERA_ADOPCION_S * (intento + 1))
 
-    if ficha is None:
+    if ficha is None and not adoptada_sin_espejo:
         informe["resultado"] = RESULTADO_TRABAJADOR_AVERIADO
         informe["detalle"] = (
             "No se pudo adoptar la ejecución tras " + str(INTENTOS_ADOPCION)
@@ -2675,7 +3108,63 @@ def ejecutar_trabajador(
             informe,
         )
 
+    def confirmada(llamada):
+        # Una transición cuyo espejo JSON falló tras el COMMIT está hecha:
+        # se anota el aviso y quien llama lee el estado de la base.
+        try:
+            return llamada()
+        except nucleo.ErrorEspejo as aviso:
+            informe["avisos"].append(str(aviso))
+            return None
+
+    def estado_final_de(ficha_final):
+        if ficha_final is not None:
+            return str(ficha_final.estado)
+
+        return _estado_en_base(raiz, identificador)
+
+    def anotar_pid_del_trabajo(pid):
+        # El PID del trabajo, en la entrada, para que la recuperación lo
+        # tenga en cuenta si este proceso muere en seco (SIGKILL, cierre
+        # forzoso): el trabajo, en su propia sesión, le sobrevive.
+        ultimo = None
+
+        for intento in range(INTENTOS_ADOPCION):
+            try:
+                with global_.conexion(raiz) as con:
+                    with global_.transaccion(con):
+                        cursor = con.execute(
+                            "UPDATE cola SET pid_trabajo = ?, actualizado_en = ? "
+                            "WHERE secuencia = ? AND estado_cola = ? "
+                            "AND trabajador_id = ? AND generacion = ?",
+                            (
+                                int(pid), ahora_utc(), int(secuencia),
+                                global_.COLA_DESPACHADA, trabajador_id,
+                                int(generacion),
+                            ),
+                        )
+
+                        if cursor.rowcount != 1:
+                            raise ErrorCola(
+                                "la entrada " + str(int(secuencia)) + " ya no "
+                                "está despachada a este trabajador"
+                            )
+
+                informe["pid_trabajo"] = int(pid)
+                return
+            except global_.ErrorEstadoGlobal as transitorio:
+                ultimo = transitorio
+                time.sleep(ESPERA_ADOPCION_S * (intento + 1))
+
+        raise ErrorCola(
+            "la base no respondió en " + str(INTENTOS_ADOPCION) + " intentos: "
+            + str(ultimo)
+        )
+
     try:
+        if ficha is None:
+            ficha = nucleo.cargar(raiz, identificador)
+
         arbol = resolver_worktree(raiz, worktree)
 
         acompanante = nucleo.LatidoAutomatico(
@@ -2692,6 +3181,7 @@ def ejecutar_trabajador(
                     salida=ruta_de_registro(
                         raiz, identificador, secuencia, int(generacion)
                     ).with_suffix(".trabajo.log"),
+                    al_lanzar=anotar_pid_del_trabajo,
                 )
             else:
                 informe["trabajo"] = {
@@ -2728,7 +3218,7 @@ def ejecutar_trabajador(
                 "El trabajo encolado falló: "
                 + str(informe["trabajo"]["detalle"])
             )
-            ficha = nucleo.devolver(
+            devuelta = confirmada(lambda: nucleo.devolver(
                 raiz, identificador, motivo,
                 trabajador_id=trabajador_id, generacion=int(generacion),
                 al_confirmar=cierre(
@@ -2740,8 +3230,8 @@ def ejecutar_trabajador(
                         "motivo": motivo,
                     },
                 ),
-            )
-            informe["estado_final"] = str(ficha.estado)
+            ))
+            informe["estado_final"] = estado_final_de(devuelta)
             informe["resultado"] = RESULTADO_TRABAJO_FALLIDO
             informe["detalle"] = motivo
             return informe
@@ -2763,7 +3253,7 @@ def ejecutar_trabajador(
         ambito = list(ficha.ambito_vigente or ficha.ambito_archivos)
         informe["fuera_de_ambito"] = fuera_de_ambito(cambios, ambito)
         informe["fuera_de_ambito"] += fuera_del_arbol(
-            huella_antes, huella_de_la_raiz(raiz)
+            huella_antes, huella_de_la_raiz(raiz), ambito
         )
 
         if actual != rama:
@@ -2785,7 +3275,7 @@ def ejecutar_trabajador(
                 + ("..." if len(informe["fuera_de_ambito"]) > 10 else "")
                 + ". Ámbito concedido: " + ", ".join(ambito) + "."
             )
-            ficha = nucleo.bloquear(
+            bloqueada = confirmada(lambda: nucleo.bloquear(
                 raiz, identificador, motivo, origen=nucleo.ORIGEN_AUTOMATICO,
                 trabajador_id=trabajador_id, generacion=int(generacion),
                 al_confirmar=cierre(
@@ -2798,8 +3288,8 @@ def ejecutar_trabajador(
                         "motivo": motivo,
                     },
                 ),
-            )
-            informe["estado_final"] = str(ficha.estado)
+            ))
+            informe["estado_final"] = estado_final_de(bloqueada)
             informe["resultado"] = RESULTADO_FUERA_DE_AMBITO
             informe["detalle"] = motivo
             return informe
@@ -2809,7 +3299,7 @@ def ejecutar_trabajador(
         # entrada se cierra con el veredicto en la misma transacción.
         resumen_verificacion = {"tipo": RESULTADO_VERIFICADA}
 
-        verificacion = nucleo.verificar(
+        verificacion = confirmada(lambda: nucleo.verificar(
             raiz,
             identificador,
             tiempo_limite_s=tiempo_limite_pruebas_s,
@@ -2822,7 +3312,19 @@ def ejecutar_trabajador(
                 raiz, identificador, secuencia, trabajador_id, int(generacion),
                 resumen_verificacion, informe,
             ),
-        )
+        ))
+
+        if verificacion is None:
+            # Confirmada con el cierre dentro; el veredicto lo recogió el
+            # gancho de la misma transacción.
+            informe["verificacion"] = resumen_verificacion.get("verificacion")
+            informe["estado_final"] = (
+                resumen_verificacion.get("estado") or _estado_en_base(raiz, identificador)
+            )
+            informe["resultado"] = RESULTADO_VERIFICADA
+            informe["detalle"] = "Verificada (espejo JSON pendiente de regenerar)."
+
+            return informe
 
         informe["verificacion"] = {
             "estado": verificacion["estado"],
@@ -2867,19 +3369,13 @@ def ejecutar_trabajador(
         informe["resultado"] = "arbol_no_valido"
         informe["detalle"] = motivo
 
-        try:
-            ficha = nucleo.devolver(
-                raiz, identificador, motivo,
-                trabajador_id=trabajador_id, generacion=int(generacion),
-                al_confirmar=cierre(
-                    global_.COLA_FALLIDA,
-                    {"tipo": "arbol_no_valido", "estado": str(Estado.REABIERTO),
-                     "motivo": motivo},
-                ),
-            )
-            informe["estado_final"] = str(ficha.estado)
-        except Exception as segundo:
-            informe["detalle"] += " Y no se pudo devolver: " + str(segundo)
+        _devolver_tras_averia(
+            raiz, identificador, secuencia, trabajador_id, int(generacion),
+            motivo,
+            {"tipo": "arbol_no_valido", "estado": str(Estado.REABIERTO),
+             "motivo": motivo},
+            informe, cierre,
+        )
 
         return informe
 
@@ -2914,24 +3410,75 @@ def ejecutar_trabajador(
 
             return informe
 
+        resultado["estado"] = str(Estado.REABIERTO)
+        _devolver_tras_averia(
+            raiz, identificador, secuencia, trabajador_id, int(generacion),
+            motivo, resultado, informe, cierre,
+        )
+
+        return informe
+
+
+def _estado_en_base(raiz: Path, identificador: str) -> str | None:
+    with global_.conexion(raiz) as con:
+        fila = global_.obtener_tarea(con, identificador)
+
+    return None if fila is None else str(fila["estado"])
+
+
+def _devolver_tras_averia(
+    raiz, identificador, secuencia, trabajador_id, generacion, motivo,
+    resultado, informe, cierre,
+) -> None:
+    """
+    Devuelve la tarea con la entrada cerrada en la misma transacción,
+    reintentando ante un candado de la base (`database is locked` tras
+    `busy_timeout` no dice nada sobre la propiedad). Deja el resultado en
+    `informe`; nunca lanza.
+
+    - devuelta (o confirmada con el espejo pendiente): REABIERTO;
+    - rechazada por PROPIEDAD o ESTADO: ya no es nuestra; la entrada, si
+      aún lo es, se cierra sola para que nadie la reencole a ciegas;
+    - imposible por un error TRANSITORIO o una interrupción: NO se toca
+      nada. «Tarea EN_EJECUCION + entrada despachada» lo recuperan
+      `reanudar` y la reconciliación; «EN_EJECUCION + entrada cerrada»
+      no lo recuperaba nadie y perdía la corrida (auditoría R2).
+    """
+    rechazo = None
+
+    for intento in range(INTENTOS_ADOPCION):
         try:
-            resultado["estado"] = str(Estado.REABIERTO)
             ficha = nucleo.devolver(
                 raiz, identificador, motivo,
                 trabajador_id=trabajador_id, generacion=int(generacion),
                 al_confirmar=cierre(global_.COLA_FALLIDA, resultado),
             )
             informe["estado_final"] = str(ficha.estado)
-        except Exception as segundo:
-            informe["detalle"] += " Y no se pudo devolver: " + str(segundo)
+            return
+        except nucleo.ErrorEspejo as aviso:
+            informe["avisos"].append(str(aviso))
+            informe["estado_final"] = _estado_en_base(raiz, identificador)
+            return
+        except global_.ErrorEstadoGlobal as transitorio:
+            rechazo = transitorio
+            time.sleep(ESPERA_ADOPCION_S * (intento + 1))
+        except Exception as otro:
+            rechazo = otro
+            break
 
-            try:
-                resultado["estado"] = None
-                informe["entrada_cerrada"] = cerrar_entrada(
-                    raiz, secuencia, trabajador_id, int(generacion),
-                    global_.COLA_FALLIDA, resultado,
-                )
-            except Exception as tercero:
-                informe["detalle"] += " Y no se pudo cerrar la entrada: " + str(tercero)
+    informe["detalle"] += " Y no se pudo devolver: " + str(rechazo)
 
-        return informe
+    if isinstance(rechazo, ErrorSupervisor) and not isinstance(
+        rechazo, global_.ErrorEstadoGlobal
+    ):
+        resultado = dict(resultado)
+        resultado["estado"] = None
+        _cerrar_si_sigue_siendo_mia(
+            raiz, secuencia, trabajador_id, int(generacion), informe, resultado,
+        )
+        return
+
+    informe["detalle"] += (
+        " La tarea sigue EN_EJECUCION con la entrada despachada: la "
+        "recuperación la juzgará; no se cierra la entrada a ciegas."
+    )

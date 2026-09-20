@@ -261,6 +261,11 @@ MIGRACIONES = {
         # cadena: el trabajador la entrega a `subprocess` tal cual, sin
         # intérprete de órdenes por medio.
         #
+        # `pid` es el del proceso trabajador desde que adopta (antes, el
+        # del despacho) y `pid_trabajo` el del trabajo que ese trabajador
+        # lanzó: la recuperación no reencola ni cierra una entrada mientras
+        # cualquiera de los dos siga vivo en esta máquina (auditoría R2).
+        #
         # Una tarea puede tener varias entradas a lo largo del tiempo
         # (cada una es el registro de un lanzamiento), pero sólo UNA viva
         # —pendiente o despachada— a la vez: lo garantiza el índice único
@@ -282,6 +287,7 @@ MIGRACIONES = {
             trabajador_id   TEXT,
             generacion      INTEGER,
             pid             INTEGER,
+            pid_trabajo     INTEGER,
             worktree        TEXT,
             registro        TEXT,
             adoptado_en     TEXT,
@@ -396,6 +402,11 @@ def _entorno_git_limpio() -> dict:
     for nombre in _VARIABLES_GIT_HEREDADAS:
         entorno.pop(nombre, None)
 
+    # Mensajes de git SIN traducir: el código los interpreta (`locked
+    # initializing`, `prunable`), y con git en español no casaban (R2).
+    entorno["LC_ALL"] = "C"
+    entorno["LANGUAGE"] = "C"
+
     return entorno
 
 
@@ -458,8 +469,9 @@ def git_common_dir(raiz: Path) -> Path:
             # `git` ignore `cwd` y responda por otro repositorio. La base
             # global se ubicaría entonces en el sitio equivocado.
             env=_entorno_git_limpio(),
+            timeout=60,
         )
-    except OSError as error:
+    except (OSError, subprocess.TimeoutExpired) as error:
         raise ErrorEstadoGlobal(
             "Git no está disponible; sin Git no se puede ubicar la base "
             "global del Supervisor: " + str(error)

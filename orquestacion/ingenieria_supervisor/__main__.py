@@ -16,6 +16,7 @@ Uso desde la raíz del repositorio:
     python -m orquestacion.ingenieria_supervisor encolar T-0003 --prioridad 5 --trabajo python herramienta.py
     python -m orquestacion.ingenieria_supervisor cola
     python -m orquestacion.ingenieria_supervisor despachar
+    python -m orquestacion.ingenieria_supervisor desencolar T-0003
     python -m orquestacion.ingenieria_supervisor limpiar-arboles
 
 Desde A2 las órdenes de consulta leen la base SQLite global del
@@ -950,8 +951,9 @@ def orden_reanudar(raiz: Path, argumentos) -> int:
         ("sin_tocar", "DESPACHADAS QUE SIGUEN VIVAS (no se tocan)"),
         (
             "vivas_sin_tarea",
-            "CON EL PROCESO TRABAJADOR VIVO Y LA TAREA YA EN OTRAS MANOS (no se "
-            "reencolan: decide una persona; `desencolar` o matar el proceso)",
+            "CON DUDA: PROCESO VIVO O TRABAJADOR DE OTRO EQUIPO, Y LA TAREA YA EN "
+            "OTRAS MANOS (no se reencolan ni se cierran: decide una persona; "
+            "`desencolar` la retira, o mata el proceso y vuelve a `reanudar`)",
         ),
     ):
         if cola[grupo]:
@@ -962,6 +964,7 @@ def orden_reanudar(raiz: Path, argumentos) -> int:
                     "      · entrada " + str(elemento["secuencia"]) + " de "
                     + elemento["tarea"] + " (tarea en '"
                     + str(elemento["estado_tarea"]) + "')"
+                    + ((": " + str(elemento["motivo"])) if elemento.get("motivo") else "")
                 )
 
     print("")
@@ -1024,6 +1027,7 @@ def orden_encolar(raiz: Path, argumentos) -> int:
         prioridad=argumentos.prioridad,
         trabajo=trabajo,
         tiempo_limite_s=argumentos.tiempo_limite,
+        base=argumentos.base,
     )
 
     print("Encolada: " + entrada["tarea_id"] + " (entrada "
@@ -1044,6 +1048,18 @@ def orden_desencolar(raiz: Path, argumentos) -> int:
 
     print("Retirada de la cola: " + entrada["tarea_id"] + " (entrada "
           + str(entrada["secuencia"]) + ")")
+
+    resultado = entrada.get("resultado") or {}
+
+    if resultado.get("estaba") == global_.COLA_DESPACHADA:
+        print(
+            "AVISO: la entrada estaba despachada (trabajador "
+            + str(entrada.get("trabajador_id")) + ", PID "
+            + str(entrada.get("pid")) + ", trabajo "
+            + str(entrada.get("pid_trabajo")) + "). Comprueba que ningún "
+            "proceso siga escribiendo en " + str(entrada.get("worktree"))
+            + " antes de limpiar el árbol."
+        )
 
     return 0
 
@@ -1436,6 +1452,12 @@ def construir_analizador() -> argparse.ArgumentParser:
         default=trabajadores.TIEMPO_LIMITE_TRABAJO_S,
         help="Segundos que puede durar el trabajo encolado.",
     )
+    encolar.add_argument(
+        "--base",
+        help="Referencia desde la que nace la rama de la tarea si no "
+             "existe (por omisión `main` si existe; si no, el HEAD de la "
+             "raíz).",
+    )
     # Opción con REMAINDER, y no un posicional: con un subanalizador,
     # `argparse` entrega lo que sigue a `--` al analizador PADRE como
     # «argumentos no reconocidos», y un posicional REMAINDER se traga las
@@ -1449,7 +1471,9 @@ def construir_analizador() -> argparse.ArgumentParser:
     encolar.set_defaults(funcion=orden_encolar)
 
     desencolar = ordenes.add_parser(
-        "desencolar", help="Retirar de la cola una entrada pendiente."
+        "desencolar",
+        help="Retirar de la cola una entrada pendiente, o una despachada "
+             "cuya ejecución ya no existe (decisión de una persona).",
     )
     desencolar.add_argument("tarea")
     desencolar.add_argument("--motivo")

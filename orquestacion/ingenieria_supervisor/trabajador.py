@@ -4,9 +4,13 @@ Proceso trabajador V1 (T-0003).
 Lo lanza `trabajadores.despachar` con un argv ESTRUCTURADO:
 
     python -m orquestacion.ingenieria_supervisor.trabajador
-        --raiz <raíz> --tarea T-0003 --trabajador <id> --generacion <n>
-        --secuencia <entrada> --worktree <árbol> --tiempo-limite <s>
-        --pid-despacho <pid> -- <ejecutable del trabajo> <argumento> ...
+        --raiz=<raíz> --tarea=T-0003 --trabajador=<id> --generacion=<n>
+        --secuencia=<entrada> --worktree=<árbol> --tiempo-limite=<s>
+        --pid-despacho=<pid> -- <ejecutable del trabajo> <argumento> ...
+
+Cada opción viaja como `--clave=valor` en un solo elemento, para que un
+valor que empiece por `-` (una identidad `-x`) no parezca otra opción;
+a mano, `--clave valor` también vale.
 
 Todo lo que hay detrás de `--` es el trabajo encolado, argumento por
 argumento, y se entrega a `subprocess` como lista: este proceso no
@@ -106,6 +110,10 @@ class Interrumpido(Exception):
     """El sistema pidió terminar (SIGTERM, Ctrl-C, cierre de sesión)."""
 
 
+# Las señales de terminación recibidas por este proceso, en orden.
+SENALES_RECIBIDAS: list[int] = []
+
+
 def _instalar_senales() -> None:
     """
     Una señal de terminación no mata al trabajador en seco: se convierte
@@ -115,8 +123,15 @@ def _instalar_senales() -> None:
     muerto (auditoría R1).
     """
     def manejador(numero, _marco):
+        SENALES_RECIBIDAS.append(int(numero))
         trabajadores.interrumpir_trabajo_en_curso()
-        raise Interrumpido("señal " + str(numero))
+
+        # Sólo la PRIMERA señal interrumpe: la segunda llegaba mientras
+        # se devolvía la tarea, cortaba el `devolver` y dejaba la tarea
+        # EN_EJECUCION con la entrada ya cerrada (auditoría R2). A
+        # partir de la primera, el camino de devolución no se corta.
+        if len(SENALES_RECIBIDAS) == 1:
+            raise Interrumpido("señal " + str(numero))
 
     for nombre in ("SIGTERM", "SIGINT", "SIGBREAK", "SIGHUP"):
         senal = getattr(signal, nombre, None)
