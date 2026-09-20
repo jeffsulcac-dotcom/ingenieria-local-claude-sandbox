@@ -1593,6 +1593,308 @@ def prueba_p_tras_recuperar_b_toma_y_la_orden_tardia_de_a_cae():
 
 
 # ----------------------------------------------------------------------
+# GRUPO 6 — Seguridad de rutas
+# ----------------------------------------------------------------------
+
+def prueba_q_rutas_raras_pero_legitimas_se_aceptan():
+    """
+    Una ruta legítima no se rechaza por tener una forma incómoda.
+
+    El otro lado de la moneda: si la validación fuera demasiado estricta,
+    un worktree perfectamente válido dejaría de poder usarse por vivir en
+    una carpeta con espacios o por llegar escrito con `..` en medio. Los
+    dos errores cuestan; éste se nota menos y por eso conviene probarlo.
+    """
+    print(" 17. una ruta legítima con forma rara se acepta:", end=" ")
+
+    base = Path(tempfile.mkdtemp(prefix="rutas con espacios "))
+
+    try:
+        principal = base / "repo del proyecto"
+        principal.mkdir()
+
+        inicio = _git(principal, "init", "-q", "-b", "main")
+        assert inicio.returncode == 0, inicio.stderr
+
+        _git(principal, "config", "user.name", "Prueba A3.3")
+        _git(principal, "config", "user.email", "prueba@ingenieria.local")
+
+        (principal / "semilla.txt").write_text("x", encoding="utf-8")
+        _git(principal, "add", "-A")
+        hecho = _git(principal, "commit", "-q", "-m", "semilla")
+        assert hecho.returncode == 0, hecho.stderr
+
+        enlazado = base / "arbol con espacios"
+        creado = _git(
+            principal, "worktree", "add", "-q", str(enlazado), "-b", "rama-x"
+        )
+        assert creado.returncode == 0, creado.stderr
+
+        esperado = enlazado.resolve()
+
+        formas = {
+            "absoluta con espacios": str(enlazado),
+            "relativa con espacios": "../arbol con espacios",
+            "con puntos en medio": str(
+                principal / ".." / "arbol con espacios"
+            ),
+            "con barra final": str(enlazado) + os.sep,
+        }
+
+        # En Windows la letra de unidad y el caso no distinguen rutas; en
+        # Linux sí, así que esa variante sólo se prueba donde aplica.
+        if os.name == "nt":
+            formas["caso distinto"] = str(enlazado).upper()
+
+        for caso, forma in formas.items():
+            METRICAS["OPERACIONES"] += 1
+
+            resuelta = nucleo.resolver_worktree(principal, forma)
+
+            METRICAS["ACEPTADAS"] += 1
+
+            assert resuelta == esperado, (
+                "La forma '" + caso + "' no resolvió al mismo directorio: "
+                + str(resuelta) + " en vez de " + str(esperado)
+            )
+
+        # Un enlace simbólico al worktree resuelve al mismo sitio, no a otro.
+        if os.name != "nt":
+            enlace = base / "atajo"
+
+            try:
+                enlace.symlink_to(enlazado, target_is_directory=True)
+            except OSError:
+                enlace = None
+
+            if enlace is not None:
+                METRICAS["OPERACIONES"] += 1
+
+                assert nucleo.resolver_worktree(principal, str(enlace)) == (
+                    esperado
+                ), "Un enlace simbólico no resolvió al worktree real."
+
+                METRICAS["ACEPTADAS"] += 1
+    finally:
+        _git(base / "repo del proyecto", "worktree", "prune")
+        borrar(base)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
+# GRUPO 7 — Estrés
+# ----------------------------------------------------------------------
+
+def _escritor_concurrente(ruta_raiz: str, identificador: str, papel: str,
+                          credencial: dict, vueltas: int, barrera) -> dict:
+    """
+    Un proceso que emite su orden una y otra vez sobre campos propios.
+
+    Cada papel escribe una columna distinta. Si las escrituras se pisaran,
+    el valor de un papel aparecería revertido por el de otro.
+    """
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    for sufijo in ("orquestacion", "nucleo"):
+        destino = str(_Path(__file__).resolve().parents[2] / sufijo)
+        if destino not in _sys.path:
+            _sys.path.insert(0, destino)
+
+    from ingenieria_supervisor import estado_global as _global
+    from ingenieria_supervisor import supervisor as _nucleo
+
+    raiz = _Path(ruta_raiz)
+
+    recuento = {
+        "papel": papel,
+        "emitidas": 0,
+        "aceptadas": 0,
+        "rechazadas": 0,
+        "errores_sqlite": 0,
+        "inesperadas": 0,
+        "ultimo": None,
+        "detalles": [],
+    }
+
+    try:
+        barrera.wait(timeout=ESPERA_BARRERA_S)
+    except Exception as error:
+        recuento["inesperadas"] += 1
+        recuento["detalles"].append("barrera: " + str(error))
+        return recuento
+
+    for vuelta in range(vueltas):
+        marca = papel + "-" + str(vuelta)
+        recuento["emitidas"] += 1
+
+        try:
+            if papel.startswith("latido"):
+                acompanante = _nucleo.LatidoAutomatico(
+                    raiz,
+                    identificador,
+                    credencial["trabajador_id"],
+                    credencial["generacion"],
+                    reloj=lambda: "2030-01-01T00:00:00+00:00",
+                )
+                aceptada = acompanante.emitir_uno()
+            else:
+                con = _global.abrir(_global.ruta_base(raiz))
+
+                try:
+                    with _global.transaccion(con):
+                        informe = _global.actualizar_si_propietario(
+                            con,
+                            identificador,
+                            {"ultima_falla": _global._a_json({"marca": marca})},
+                            generacion=credencial["generacion"],
+                            momento="2030-01-01T00:00:00+00:00",
+                            trabajador_id=credencial["trabajador_id"],
+                        )
+                finally:
+                    con.close()
+
+                aceptada = (
+                    informe["resultado"] == _global.ESCRITURA_ACEPTADA
+                )
+
+            if aceptada:
+                recuento["aceptadas"] += 1
+                recuento["ultimo"] = marca
+            else:
+                recuento["rechazadas"] += 1
+        except sqlite3.Error as error:
+            recuento["errores_sqlite"] += 1
+            recuento["detalles"].append("sqlite: " + str(error))
+        except Exception as error:
+            recuento["inesperadas"] += 1
+            recuento["detalles"].append(
+                type(error).__name__ + ": " + str(error)
+            )
+
+    return recuento
+
+
+def prueba_r_estres_de_escrituras_concurrentes(escritores: int, vueltas: int):
+    """
+    Muchos escritores válidos a la vez sobre campos distintos: nada se pierde.
+
+    Es la versión concurrente de la comprobación 1. Allí se demostraba con
+    dos órdenes secuenciales que el lost update existía; aquí se somete a
+    procesos reales escribiendo sin parar, que es donde una condición mal
+    puesta acaba apareciendo.
+    """
+    print(
+        " 18. estrés: " + str(escritores) + " escritores x " + str(vueltas)
+        + " vueltas:",
+        end=" ",
+    )
+
+    contexto = multiprocessing.get_context("spawn")
+    raiz = crear_repositorio("estres_")
+
+    try:
+        ficha_minima(raiz, "T-0901")
+        tomada = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+
+        credencial = {
+            "trabajador_id": "worker-A",
+            "generacion": tomada.generacion,
+        }
+
+        papeles = [
+            "latido" if numero % 2 == 0 else "falla"
+            for numero in range(escritores)
+        ]
+
+        with contexto.Manager() as gestor:
+            barrera = gestor.Barrier(escritores)
+            reserva = gestor.Pool(processes=escritores)
+
+            try:
+                pendientes = [
+                    reserva.apply_async(
+                        _escritor_concurrente,
+                        (
+                            str(raiz),
+                            "T-0901",
+                            papel + str(numero),
+                            credencial,
+                            vueltas,
+                            barrera,
+                        ),
+                    )
+                    for numero, papel in enumerate(papeles)
+                ]
+
+                recuentos = [
+                    uno.get(timeout=ESPERA_PROCESO_S) for uno in pendientes
+                ]
+            finally:
+                reserva.close()
+                reserva.join()
+
+        emitidas = sum(uno["emitidas"] for uno in recuentos)
+        aceptadas = sum(uno["aceptadas"] for uno in recuentos)
+        rechazadas = sum(uno["rechazadas"] for uno in recuentos)
+        errores = sum(uno["errores_sqlite"] for uno in recuentos)
+        raras = sum(uno["inesperadas"] for uno in recuentos)
+
+        METRICAS["OPERACIONES"] += emitidas
+        METRICAS["ACEPTADAS"] += aceptadas
+        METRICAS["RECHAZADAS"] += rechazadas
+        METRICAS["ERRORES_SQLITE"] += errores
+        METRICAS["EXCEPCIONES"] += raras
+
+        detalles = [t for uno in recuentos for t in uno["detalles"]][:5]
+
+        assert not errores, "Errores de SQLite: " + "; ".join(detalles)
+        assert not raras, "Excepciones: " + "; ".join(detalles)
+        assert aceptadas == emitidas, (
+            "Se rechazaron órdenes válidas: " + str(rechazadas) + " de "
+            + str(emitidas)
+        )
+
+        fila = fila_de(raiz, "T-0901")
+
+        # Lo que de verdad se mide: la ejecución sigue entera. Ninguna
+        # escritura de un papel borró lo de otro ni tocó la propiedad.
+        if fila["trabajador_id"] != "worker-A":
+            METRICAS["ROBOS_INDEBIDOS"] += 1
+
+        assert fila["trabajador_id"] == "worker-A"
+        assert fila["generacion"] == tomada.generacion
+        assert fila["estado"] == str(Estado.EN_EJECUCION)
+        assert fila["intentos"] == 0, (
+            "Alguna escritura tocó los intentos: " + str(fila["intentos"])
+        )
+
+        # El latido y la falla conviven: ninguno dejó al otro en su valor
+        # inicial, que es justo lo que pasaría si se pisaran.
+        assert fila["ultimo_latido"] == "2030-01-01T00:00:00+00:00", (
+            "El latido quedó revertido: " + repr(fila["ultimo_latido"])
+        )
+
+        if not fila["ultima_falla"] or "marca" not in (fila["ultima_falla"] or {}):
+            METRICAS["ACTUALIZACIONES_PERDIDAS"] += 1
+
+        assert fila["ultima_falla"] and "marca" in fila["ultima_falla"], (
+            "La escritura de `ultima_falla` se perdió entera: "
+            + repr(fila["ultima_falla"])
+        )
+
+        comprobar_integridad(raiz)
+
+        print(
+            "OK (" + str(emitidas) + " órdenes, " + str(aceptadas)
+            + " aceptadas, 0 perdidas)"
+        )
+    finally:
+        borrar(raiz)
+
+
+# ----------------------------------------------------------------------
 # Corredor de este archivo
 # ----------------------------------------------------------------------
 
@@ -1612,6 +1914,7 @@ COMPROBACIONES = (
     prueba_n_la_vitalidad_distingue_los_cinco_estados,
     prueba_o_reanudar_es_idempotente,
     prueba_p_tras_recuperar_b_toma_y_la_orden_tardia_de_a_cae,
+    prueba_q_rutas_raras_pero_legitimas_se_aceptan,
 )
 
 
@@ -1649,6 +1952,9 @@ def prueba_ejecucion_segura(rondas: int = RONDAS_POR_OMISION) -> None:
         comprobacion()
 
     prueba_g_crear_concurrente_tiene_un_solo_ganador(CREADORES_POR_OMISION)
+    prueba_r_estres_de_escrituras_concurrentes(
+        ESCRITORES_POR_OMISION, rondas
+    )
 
     duracion = time.monotonic() - inicio
 
