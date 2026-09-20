@@ -673,3 +673,94 @@ T-0001 y T-0002 siguen sin ejecutar, en estado NUEVA.
 
 Estado:
 A3.2 = IMPLEMENTADO_PENDIENTE_DE_VERIFICACION_EN_WINDOWS
+     (cerrada: ver la sección A3.3, que la integra y la amplía)
+
+## Supervisor — A3.3: ejecución segura, recuperación y worktrees
+
+Base: 419d15e (A3.2 integrada).
+
+Qué cierra A3.3, que es lo último que faltaba antes de poder poner a
+trabajar a varios escritores a la vez:
+
+1. **Cada orden escribe sólo sus campos.** A3.2 impedía que entrara una
+   orden AJENA, pero dos órdenes legítimas del mismo propietario seguían
+   pisándose: `persistir` reescribía las quince columnas operativas con la
+   foto que tenía en memoria. Ahora declarar las columnas es obligatorio.
+   Los contadores los incrementa el motor en SQL, no Python.
+
+2. **Latido automático** durante las operaciones largas del Supervisor.
+   Escribe sólo `ultimo_latido`, con identidad, generación, estado y una
+   guarda de no regresión; se para solo al terminar; aguanta un
+   `database is locked` sin apagarse; no resucita nada.
+
+3. **Vitalidad en cinco estados** (ACTIVA, LATIDO_VENCIDO, HUÉRFANA,
+   REANUDABLE, FINALIZADA) que NUNCA declara abandono con una sola señal.
+   Un proceso vivo y comprobable lo impide, dure lo que dure el silencio.
+   Un trabajador de otra máquina no se libera solo: lo decide una persona.
+
+4. **Recuperación idempotente** que no le quita la tarea a quien sigue
+   vivo, ni siquiera si da señal justo entre la clasificación y la
+   escritura.
+
+5. **`verificar()` ejecuta en el worktree REGISTRADO de la tarea** —el que
+   `git worktree list` conoce— y graba dónde corrió: árbol, rama, commit,
+   generación y trabajador. Si el árbol se movió a mitad, la corrida no se
+   graba: no se sabe qué se ejecutó.
+
+6. **`crear` atómico**, con el archivo escrito después del COMMIT.
+
+7. **El tablero y la consola dicen la verdad**: vitalidad, edad del
+   latido, dónde se verificó, y si ese verde es de otra ejecución. El
+   tablero ya no escribe nada.
+
+Cómo se comprobó, porque «PASS» no es evidencia:
+
+- 36 comprobaciones en `pruebas/orquestacion/prueba_ejecucion_segura.py`,
+  con carreras reales entre procesos (`spawn` + barrera compartida) y
+  métricas medidas: 0 actualizaciones perdidas, 0 robos indebidos, 0
+  verificaciones en árbol incorrecto, 0 errores SQLite, 0 excepciones, 0
+  fallos de integridad en 32 `PRAGMA integrity_check`. Las métricas
+  positivas llevan cota mínima: sin ella, una corrida que no hiciera nada
+  habría salido igual de verde.
+- 22 mutaciones del código reintroducidas sobre copias temporales, 22
+  detectadas por la batería.
+- Dos rondas de auditoría adversarial con seis y tres revisores de sólo
+  lectura, sobre un montaje inmutable del repositorio. Sesenta hallazgos
+  confirmados en la primera ronda; todos los críticos y altos, cerrados.
+
+Lo más grave que encontró la auditoría, y que ya está cerrado:
+
+- Se podía ejecutar y grabar un VERDE FALSO: bastaba copiar un worktree a
+  otro sitio, o declarar un subdirectorio cualquiera, o tener `GIT_DIR` en
+  el entorno (lo está siempre dentro de un hook de Git).
+- La rama y el commit se leían DESPUÉS de correr: quedaba grabado «commit
+  X, todo en verde» cuando X nunca se ejecutó y estaba rojo.
+- El umbral de abandono declaraba huérfana una ejecución sin mirar
+  siquiera si el proceso seguía vivo.
+- Un latido del dueño llegado a mitad de la recuperación no la frenaba.
+- Dos `decidir` a la vez se pisaban: 24 de 25 carreras perdían una
+  resolución humana, sin error y sin rastro.
+- El espejo JSON borraba lo que una persona escribía durante la corrida,
+  incluida una decisión que quería frenar la propuesta.
+- El tablero «de sólo lectura» creaba tareas desde un GET de la API web.
+
+Deuda conocida, marcada para revisión humana y anotada en
+`orquestacion/README.md`: la reutilización de PID no se descarta
+comparando la hora de arranque del proceso (es específico de cada sistema
+y no se escribe a ciegas); el efecto está acotado en la dirección segura
+—la tarea espera a una persona en vez de quitársele a nadie— y la salida
+manual es `reabrir`.
+
+Pendiente de ejecución en Windows: es el entorno final real y esta corrida
+fue en Linux. Los comandos y el criterio de aprobación están en
+`orquestacion/README.md`.
+
+NO implementado en A3.3, reservado a C: lanzamiento de trabajadores,
+trabajadores paralelos, worktrees automáticos, cola y priorización,
+expiración automática de trabajadores y acciones desde el tablero.
+
+T-0001 y T-0002 siguen sin ejecutar, en estado NUEVA.
+
+Estado:
+A3.2 = CERRADA
+A3.3 = IMPLEMENTADO_PENDIENTE_DE_VERIFICACION_EN_WINDOWS
