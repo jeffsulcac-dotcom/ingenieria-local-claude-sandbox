@@ -895,6 +895,51 @@ def credencial_de(
     return (ficha.trabajador_id, int(ficha.generacion or 0))
 
 
+CAMPOS_DECLARATIVOS = (
+    "objetivo",
+    "criterios_aceptacion",
+    "pruebas_requeridas",
+    "ambito_archivos",
+    "max_intentos",
+)
+
+
+def _refrescar_declarativo(raiz: Path, ficha: Ficha) -> None:
+    """
+    Relee del disco lo que la ficha declara, justo antes de escribirla.
+
+    El espejo sólo debe reescribir los campos OPERATIVOS, que salen de
+    SQLite. Lo declarativo —objetivo, criterios, pruebas requeridas,
+    ámbito, presupuesto de intentos, decisiones declaradas— lo escribe una
+    persona en el archivo, y se quedaba en memoria tal como se leyó AL
+    EMPEZAR la orden. Con `verificar` esa ventana no son milisegundos: es
+    toda la batería de pruebas, minutos enteros. Lo que el ingeniero
+    escribiera mientras tanto desaparecía al terminar, sin aviso; incluida
+    una decisión humana recién declarada, con lo que la tarea se iba a
+    PROPUESTO saltándose justo la decisión que esa persona quería forzar.
+
+    Si el archivo no se puede leer, se escribe lo que hay en memoria: es lo
+    que se hacía siempre y no empeora nada.
+    """
+    try:
+        en_disco = leer(raiz, ficha.id)
+    except (ErrorFicha, OSError):
+        return
+
+    for campo in CAMPOS_DECLARATIVOS:
+        valor = getattr(en_disco, campo)
+        setattr(
+            ficha, campo, list(valor) if isinstance(valor, list) else valor
+        )
+
+    # Las decisiones son mixtas: la clave y la descripción son del archivo,
+    # la resolución es de la base. Se fusionan en vez de elegir una.
+    ficha.requiere_decision_humana = global_.fusionar_decisiones(
+        en_disco.requiere_decision_humana,
+        global_.decisiones_operativas(ficha.requiere_decision_humana),
+    )
+
+
 def _regenerar_espejo(raiz: Path, ficha: Ficha) -> None:
     """
     Reescribe el JSON como espejo de lo que SQLite ya confirmó.
@@ -903,6 +948,8 @@ def _regenerar_espejo(raiz: Path, ficha: Ficha) -> None:
     confirmado y la siguiente persistencia lo regenera: nunca hay dos
     escrituras contradictorias, porque el JSON siempre sale de SQLite.
     """
+    _refrescar_declarativo(raiz, ficha)
+
     try:
         guardar(raiz, ficha, marcar_actualizacion=False)
     except (ErrorFicha, OSError) as error:
@@ -1987,6 +2034,34 @@ def verificar(
             "puede proponerse sin prueba propia."
         )
 
+    # Las decisiones se releen DESPUÉS de la corrida, no antes.
+    #
+    # `decidir` no mueve ni el estado ni la generación, así que una
+    # resolución llegada mientras corrían las pruebas no invalida la
+    # escritura: el veredicto se dictaba con la foto de hace minutos. El
+    # resultado era una fila que se contradecía a sí misma —todas las
+    # decisiones resueltas y un `ultima_falla` diciendo que faltaban— y una
+    # batería completa tirada a la basura.
+    # También se relee lo DECLARADO en el archivo: una decisión humana
+    # recién escrita por una persona mientras corrían las pruebas es un
+    # freno, y con la foto vieja la tarea se iba a PROPUESTO saltándose
+    # justo la decisión que esa persona quería forzar.
+    declaradas = list(ficha.requiere_decision_humana)
+
+    try:
+        declaradas = leer(raiz, ficha.id).requiere_decision_humana
+    except (ErrorFicha, OSError):
+        pass
+
+    with global_.conexion(raiz) as con:
+        actual = global_.obtener_tarea(con, ficha.id)
+
+    ficha.requiere_decision_humana = global_.fusionar_decisiones(
+        declaradas,
+        global_.decisiones_operativas(ficha.requiere_decision_humana)
+        + list((actual or {}).get("decisiones") or []),
+    )
+
     pendientes = ficha.decisiones_pendientes()
 
     corrida["problemas"] = list(problemas)
@@ -2125,42 +2200,71 @@ def decidir(
     La definición de la decisión (clave, descripción) vive en el JSON; su
     resolución (resuelta, resolución, fecha, origen) queda en SQLite.
 
+    La resolución la hace el MOTOR, dentro de la transacción (A3.3). Antes
+    se leía la lista de decisiones, se cambiaba un elemento en Python y se
+    reescribía la columna entera: dos `decidir` sobre claves distintas se
+    pisaban y una resolución humana volvía a «pendiente» sin error y sin
+    rastro. Medido: 24 de 25 carreras entre dos procesos perdían una.
+
     No genera commit automático: no es una transición de estado.
     """
     ficha = cargar(raiz, identificador)
 
-    encontrada = None
+    momento = ahora_utc()
 
-    for decision in ficha.requiere_decision_humana:
-        if str(decision.get("clave")) == str(clave):
-            encontrada = decision
-            break
+    with global_.conexion(raiz) as con:
+        with global_.transaccion(con):
+            informe = global_.resolver_decision(
+                con,
+                ficha.id,
+                clave,
+                resolucion,
+                momento,
+                ORIGEN_HUMANO,
+                declaradas=ficha.requiere_decision_humana,
+            )
 
-    if encontrada is None:
-        raise ErrorSupervisor(
-            "La tarea no tiene ninguna decisión con clave '"
-            + str(clave)
-            + "'."
-        )
+            if not informe["resuelta"]:
+                if informe["motivo"] == "inexistente":
+                    raise ErrorSupervisor(
+                        "La tarea no tiene ninguna decisión con clave '"
+                        + str(clave)
+                        + "'."
+                    )
 
-    if encontrada.get("resuelta"):
-        raise ErrorSupervisor(
-            "La decisión '" + str(clave) + "' ya estaba resuelta."
-        )
+                raise ErrorSupervisor(
+                    "La decisión '" + str(clave) + "' ya estaba resuelta."
+                )
 
-    encontrada["resuelta"] = True
-    encontrada["resolucion"] = resolucion
-    encontrada["resuelta_en"] = ahora_utc()
-    encontrada["origen"] = ORIGEN_HUMANO
+            global_.insertar_evento(
+                con,
+                ficha.id,
+                {
+                    "fecha": momento,
+                    "tipo": global_.EVENTO_DECISION,
+                    "estado_anterior": str(ficha.estado),
+                    "estado_nuevo": str(ficha.estado),
+                    "motivo": "Decisión humana '" + str(clave)
+                    + "' resuelta.",
+                    "origen": ORIGEN_HUMANO,
+                    "datos": {
+                        "clave": str(clave),
+                        "resolucion": resolucion,
+                    },
+                },
+            )
 
-    # Resolver una decisión no es una transición de estado, y el commit
-    # automático está reservado a las transiciones. La resolución queda en
-    # SQLite; el espejo JSON queda escrito en disco y su versionado
-    # corresponde al humano que decidió.
+            confirmada = global_.obtener_tarea(con, ficha.id)
+
+    historial = list(ficha.historial)
+    global_.aplicar_fila(ficha, confirmada)
+    ficha.historial = historial
+
+    ficha.requiere_decision_humana = informe["decisiones"]
 
     ficha.registrar_evento(
         {
-            "fecha": ahora_utc(),
+            "fecha": momento,
             "tipo": global_.EVENTO_DECISION,
             "estado_anterior": str(ficha.estado),
             "estado_nuevo": str(ficha.estado),
@@ -2169,8 +2273,12 @@ def decidir(
             "datos": {"clave": str(clave), "resolucion": resolucion},
         }
     )
+    ficha.eventos_pendientes.clear()
 
-    persistir(raiz, ficha, campos_propios=CAMPOS_DECIDIR)
+    # Resolver una decisión no es una transición de estado, y el commit
+    # automático está reservado a las transiciones. El espejo sí se
+    # regenera: es lo que hace visible la resolución en el archivo.
+    _regenerar_espejo(raiz, ficha)
 
     return ficha
 

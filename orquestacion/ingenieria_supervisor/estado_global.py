@@ -852,6 +852,11 @@ def hash_definicion(ficha: Ficha) -> str:
         "criterios_aceptacion": list(ficha.criterios_aceptacion),
         "ambito_archivos": list(ficha.ambito_archivos),
         "pruebas_requeridas": list(ficha.pruebas_requeridas),
+        # El presupuesto de intentos es declarativo: decide cuándo una
+        # tarea acaba BLOQUEADA. Estaba fuera de la huella y ninguna orden
+        # lo escribía, así que una persona podía editarlo en la ficha y no
+        # pasaba nada; encima el espejo le deshacía la edición sin avisar.
+        "max_intentos": int(ficha.max_intentos),
         "decisiones": [
             {
                 "clave": str(decision.get("clave")),
@@ -884,13 +889,31 @@ def decisiones_operativas(decisiones: list[dict]) -> list[dict]:
     return resultado
 
 
+# Descripción que se da a una decisión registrada en la base cuya clave la
+# definición de ESTE árbol de trabajo no declara.
+DESCRIPCION_NO_DECLARADA = (
+    "(no declarada en la definición de este árbol de trabajo)"
+)
+
+
 def fusionar_decisiones(declaradas: list[dict], operativas: list[dict]) -> list[dict]:
     """
     Une la definición (JSON: clave, descripción) con el estado (SQLite).
 
-    El orden y el conjunto de claves los manda la definición. Una clave
-    declarada sin estado registrado es una decisión pendiente. El estado
-    registrado para una clave que la definición ya no declara se ignora.
+    El orden lo manda la definición. Una clave declarada sin estado
+    registrado es una decisión pendiente.
+
+    Una clave REGISTRADA que esta definición no declara se conserva al
+    final (A3.3). Antes se descartaba, y el efecto era grave: el conjunto
+    de claves lo mandaba el JSON de ESTE árbol de trabajo, así que abrir la
+    tarea desde otra rama que la declarase con menos decisiones borraba de
+    la base —que es la autoridad— la resolución de las que faltaban.
+    Restituir la clave en el JSON no la devolvía: volvía como pendiente. Y
+    para borrarla bastaba una orden de SÓLO LECTURA, porque `cargar` pasa
+    por la sincronización.
+
+    Una resolución humana no se tira porque un archivo de otra rama no la
+    mencione. Se conserva y se dice que no está declarada aquí.
     """
     por_clave = {}
 
@@ -900,9 +923,15 @@ def fusionar_decisiones(declaradas: list[dict], operativas: list[dict]) -> list[
             por_clave[clave] = operativa
 
     fusionadas = []
+    vistas = set()
 
     for declarada in declaradas:
         clave = str(declarada.get("clave"))
+
+        if clave in vistas:
+            continue
+
+        vistas.add(clave)
         estado = por_clave.get(clave, {})
 
         fusionadas.append(
@@ -916,7 +945,115 @@ def fusionar_decisiones(declaradas: list[dict], operativas: list[dict]) -> list[
             }
         )
 
+    for clave, estado in por_clave.items():
+        if clave in vistas:
+            continue
+
+        fusionadas.append(
+            {
+                "clave": clave,
+                "descripcion": DESCRIPCION_NO_DECLARADA,
+                "resuelta": bool(estado.get("resuelta", False)),
+                "resolucion": estado.get("resolucion"),
+                "resuelta_en": estado.get("resuelta_en"),
+                "origen": estado.get("origen"),
+            }
+        )
+
     return fusionadas
+
+
+def resolver_decision(
+    con: sqlite3.Connection,
+    identificador: str,
+    clave: str,
+    resolucion: str,
+    momento: str,
+    origen: str,
+    declaradas: list[dict] | None = None,
+) -> dict:
+    """
+    Marca UNA decisión como resuelta, fusionando con lo que la fila tiene.
+
+    DEBE ejecutarse dentro de `transaccion(con)`.
+
+    Por qué esto vive en el motor y no en Python
+    --------------------------------------------
+    `decisiones` es UNA columna con el JSON de todas las decisiones dentro.
+    Resolver una leyendo la lista, cambiando un elemento y reescribiendo la
+    columna entera es el lost update de manual, y aquí no lo frenaba nada:
+    dos `decidir` sobre claves DISTINTAS son dos órdenes perfectamente
+    válidas —misma generación, mismo estado, sin propietario que exigir—,
+    así que las dos pasan el WHERE y la segunda devuelve a «pendiente» lo
+    que la primera acababa de resolver. Sin error y sin rastro: al humano
+    que decidió se le devolvía su decisión como resuelta.
+
+    Medido antes de arreglarlo: 24 de 25 carreras entre dos procesos
+    perdían una resolución.
+
+    Leyendo la fila DENTRO de la misma transacción, la segunda orden ve lo
+    que la primera confirmó y las dos resoluciones sobreviven.
+    """
+    if not con.in_transaction:
+        raise ErrorEstadoGlobal(
+            "resolver_decision debe ejecutarse dentro de una transacción."
+        )
+
+    fila = obtener_tarea(con, identificador)
+
+    if fila is None:
+        raise ErrorEstadoGlobal(
+            "La tarea '" + str(identificador) + "' no existe en el estado "
+            "global."
+        )
+
+    registradas = list(fila.get("decisiones") or [])
+    fusionadas = fusionar_decisiones(declaradas or [], registradas)
+
+    objetivo = None
+
+    for decision in fusionadas:
+        if decision["clave"] == str(clave):
+            objetivo = decision
+            break
+
+    if objetivo is None:
+        return {
+            "resuelta": False,
+            "motivo": "inexistente",
+            "decisiones": fusionadas,
+        }
+
+    if objetivo["resuelta"]:
+        return {
+            "resuelta": False,
+            "motivo": "ya_resuelta",
+            "decisiones": fusionadas,
+        }
+
+    objetivo["resuelta"] = True
+    objetivo["resolucion"] = resolucion
+    objetivo["resuelta_en"] = momento
+    objetivo["origen"] = origen
+
+    pendientes = [una for una in fusionadas if not una["resuelta"]]
+
+    actualizar_tarea(
+        con,
+        identificador,
+        {
+            "decisiones": _a_json(decisiones_operativas(fusionadas)),
+            "requiere_decision_humana": 1 if pendientes else 0,
+            "actualizado_en": momento,
+        },
+    )
+
+    return {
+        "resuelta": True,
+        "motivo": None,
+        "decisiones": fusionadas,
+        "pendientes": pendientes,
+    }
 
 
 def resumen_de_corrida(corrida: dict | None) -> dict | None:
@@ -1970,6 +2107,7 @@ def sincronizar_ficha(con: sqlite3.Connection, ficha: Ficha, ahora: str | None =
         {
             "titulo": ficha.titulo,
             "ambito_archivos": _a_json(list(ficha.ambito_archivos)),
+            "max_intentos": int(ficha.max_intentos),
             "decisiones": _a_json(decisiones_operativas(fusionadas)),
             "requiere_decision_humana": 1 if pendientes else 0,
             "definicion_hash": huella,
