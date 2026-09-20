@@ -23,7 +23,9 @@ Códigos de salida:
   1   terminó, pero la tarea no quedó propuesta (trabajo fallido, escritura
       fuera del ámbito, pruebas en rojo, decisión humana pendiente).
   2   el trabajador se averió; la tarea se devolvió si se pudo.
-  4   la ejecución ya no era de este trabajador: no se modificó nada.
+  4   la ejecución ya no era de este trabajador: al adoptar, no se
+      modificó nada; si se perdió DESPUÉS de adoptar, el trabajo ya
+      corrió en el árbol y la entrada se cierra como fallida.
   6   el árbol registrado no sirve.
 """
 
@@ -31,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import sys
 from pathlib import Path
 
@@ -83,8 +86,9 @@ def construir_analizador() -> argparse.ArgumentParser:
         help="Segundos entre latidos (por omisión, el del Supervisor).",
     )
     analizador.add_argument(
-        "--pid-despacho", dest="pid_despacho", type=int, default=None,
-        help="PID con el que el despacho reclamó la fila; la adopción lo exige.",
+        "--pid-despacho", dest="pid_despacho", type=int, required=True,
+        help="PID con el que el despacho reclamó la fila; la adopción lo exige "
+             "para ser exclusiva.",
     )
     analizador.add_argument(
         "--ejecutable", default=None,
@@ -98,8 +102,37 @@ def construir_analizador() -> argparse.ArgumentParser:
     return analizador
 
 
+class Interrumpido(Exception):
+    """El sistema pidió terminar (SIGTERM, Ctrl-C, cierre de sesión)."""
+
+
+def _instalar_senales() -> None:
+    """
+    Una señal de terminación no mata al trabajador en seco: se convierte
+    en una excepción que `ejecutar_trabajador` atiende como avería, así
+    que el grupo del trabajo se mata, la tarea se devuelve y la entrada
+    se cierra como fallida en vez de quedar EN_EJECUCION con un PID
+    muerto (auditoría R1).
+    """
+    def manejador(numero, _marco):
+        trabajadores.interrumpir_trabajo_en_curso()
+        raise Interrumpido("señal " + str(numero))
+
+    for nombre in ("SIGTERM", "SIGINT", "SIGBREAK", "SIGHUP"):
+        senal = getattr(signal, nombre, None)
+
+        if senal is None:
+            continue
+
+        try:
+            signal.signal(senal, manejador)
+        except (OSError, ValueError):
+            pass
+
+
 def principal(argumentos_crudos: list[str] | None = None) -> int:
     _preparar_salida()
+    _instalar_senales()
 
     argumentos = construir_analizador().parse_args(argumentos_crudos)
 
@@ -129,11 +162,17 @@ def principal(argumentos_crudos: list[str] | None = None) -> int:
     print("  Entrada cerrada: " + str(informe["entrada_cerrada"]))
     print("INFORME_JSON=" + json.dumps(informe, ensure_ascii=False, sort_keys=True))
 
-    if not informe["adoptada"] or informe["resultado"] == "propiedad_perdida":
+    if not informe["adoptada"] and informe["resultado"] == "no_adoptada":
+        return CODIGO_NO_ES_MIA
+
+    if informe["resultado"] == trabajadores.RESULTADO_PROPIEDAD_PERDIDA:
         return CODIGO_NO_ES_MIA
 
     if informe["resultado"] == trabajadores.RESULTADO_TRABAJADOR_AVERIADO:
         return CODIGO_AVERIA
+
+    if informe["resultado"] == "arbol_no_valido":
+        return CODIGO_ARBOL
 
     if informe["estado_final"] == str(Estado.PROPUESTO):
         return 0

@@ -5,7 +5,9 @@ A partir de A2:
 
     SQLite  = autoridad del ESTADO OPERATIVO de cada tarea
               (estado, rama, worktree, intentos, trabajador, latido, fallas,
-              resolución de decisiones humanas, última verificación, eventos).
+              resolución de decisiones humanas, última verificación, eventos)
+              y, desde T-0003, de la COLA de trabajadores (tabla `cola`,
+              migración 3).
 
     JSON    = DEFINICIÓN versionada de cada tarea
               (id, título, objetivo, criterios, ámbito, pruebas requeridas y
@@ -46,9 +48,10 @@ no la usa ninguna orden del ciclo: `supervisor.persistir` pasa por la
 versión condicionada. Queda para la sincronización de definiciones, y
 tiene vetadas las columnas `id` y `generacion`.
 
-Sigue sin implementar: latidos automáticos, expiración temporal de
-trabajadores, detección de trabajadores muertos y recuperación automática
-de tareas abandonadas. Eso queda para A3.3/B.
+Los latidos automáticos, la vitalidad con dos señales y la recuperación
+manual son de A3.3; la cola, el despacho y los trabajadores, de T-0003
+(`trabajadores.py`). Sigue sin implementar la expiración automática de
+trabajadores: ante la duda, decide una persona.
 """
 
 from __future__ import annotations
@@ -271,6 +274,7 @@ MIGRACIONES = {
             estado_cola     TEXT NOT NULL,
             trabajo         TEXT NOT NULL DEFAULT '[]',
             tiempo_limite_s INTEGER NOT NULL DEFAULT 3600,
+            base            TEXT,
             encolado_en     TEXT NOT NULL,
             actualizado_en  TEXT NOT NULL,
             despachado_en   TEXT,
@@ -280,6 +284,7 @@ MIGRACIONES = {
             pid             INTEGER,
             worktree        TEXT,
             registro        TEXT,
+            adoptado_en     TEXT,
             ultimo_rechazo  TEXT,
             resultado       TEXT
         )
@@ -2601,6 +2606,21 @@ def diagnostico(raiz: Path) -> dict:
             informe["detalle"] = (
                 "El archivo existe pero no tiene esquema. "
                 "Ejecute 'inicializar-estado'."
+            )
+            return informe
+
+        if informe["version_esquema"] > VERSION_ESQUEMA:
+            # Otra build más nueva (otro worktree, otra rama) ya migró la
+            # base común. `inicializar-estado` no puede bajarla: lo que
+            # toca es usar un Supervisor que la entienda.
+            informe["estado"] = "ESQUEMA_MAS_NUEVO"
+            informe["detalle"] = (
+                "Versión de esquema "
+                + str(informe["version_esquema"])
+                + ", más nueva que la que entiende este Supervisor ("
+                + str(VERSION_ESQUEMA)
+                + "). Use la build que la migró; 'inicializar-estado' no "
+                "puede retrocederla."
             )
             return informe
 

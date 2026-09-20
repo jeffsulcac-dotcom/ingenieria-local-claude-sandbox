@@ -273,7 +273,7 @@ def mostrar_tablero(raiz: Path) -> int:
                 + "]  "
                 + anterior
                 + " -> "
-                + str(evento.get("estado_nuevo"))
+                + (evento.get("estado_nuevo") or "—")
             )
             print("      " + str(evento.get("motivo")))
 
@@ -924,7 +924,16 @@ def orden_reanudar(raiz: Path, argumentos) -> int:
     # a pendiente con su misma secuencia; la de una tarea que ya terminó
     # se cierra; la de una ejecución con duda (latido vencido, otra
     # máquina, fila incompleta) NO se toca, igual que la tarea.
-    cola = trabajadores.reconciliar_cola(raiz)
+    try:
+        cola = trabajadores.reconciliar_cola(raiz)
+    except (trabajadores.ErrorCola, global_.ErrorEstadoGlobal) as problema:
+        # Las tareas ya quedaron recuperadas: se dice y se sale con 1,
+        # no con una avería que escondiera el informe de arriba.
+        print("")
+        print("  LA COLA NO SE PUDO RECONCILIAR: " + str(problema))
+        print("  Repite `reanudar` o `despachar`, que vuelven a intentarlo.")
+        print("")
+        return 1
 
     print("")
     _linea("Entradas de la cola revisadas", cola["revisadas"])
@@ -932,12 +941,18 @@ def orden_reanudar(raiz: Path, argumentos) -> int:
     _linea("Cerradas por terminadas", len(cola["cerradas"]))
     _linea("Retiradas", len(cola["retiradas"]))
     _linea("Despachadas que siguen vivas", len(cola["sin_tocar"]))
+    _linea("Con proceso vivo sin tarea", len(cola["vivas_sin_tarea"]))
 
     for grupo, etiqueta in (
         ("reencoladas", "DEVUELTAS A LA COLA (misma secuencia)"),
         ("cerradas", "ENTRADAS CERRADAS (la tarea ya terminó)"),
         ("retiradas", "ENTRADAS RETIRADAS (la tarea está aprobada)"),
         ("sin_tocar", "DESPACHADAS QUE SIGUEN VIVAS (no se tocan)"),
+        (
+            "vivas_sin_tarea",
+            "CON EL PROCESO TRABAJADOR VIVO Y LA TAREA YA EN OTRAS MANOS (no se "
+            "reencolan: decide una persona; `desencolar` o matar el proceso)",
+        ),
     ):
         if cola[grupo]:
             print("")
@@ -965,7 +980,7 @@ def orden_reanudar(raiz: Path, argumentos) -> int:
             "sin_definicion",
             "fichas_ilegibles",
         )
-    )
+    ) or bool(cola["vivas_sin_tarea"])
 
     return 1 if pendientes_de_persona else 0
 
@@ -1076,7 +1091,7 @@ def orden_cola(raiz: Path, argumentos) -> int:
         if entrada["estado_cola"] == global_.COLA_PENDIENTE and entrada.get(
             "ultimo_rechazo"
         ):
-            rechazo = global_._de_json(entrada["ultimo_rechazo"], {})
+            rechazo = entrada["ultimo_rechazo"] or {}
             print("            último rechazo: " + str(rechazo.get("detalle")))
 
     if cerradas:
@@ -1087,8 +1102,11 @@ def orden_cola(raiz: Path, argumentos) -> int:
             print(
                 "      " + str(entrada["secuencia"]).rjust(4) + "  "
                 + entrada["tarea_id"] + "  " + entrada["estado_cola"].upper()
-                + "  " + str(resultado.get("tipo")) + " -> "
-                + str(resultado.get("estado")).upper()
+                + "  " + str(resultado.get("tipo"))
+                + (
+                    "  -> tarea en " + str(resultado.get("estado")).upper()
+                    if resultado.get("estado") else ""
+                )
             )
 
     print("")
@@ -1174,8 +1192,9 @@ CODIGOS_DE_SALIDA = """\
 Códigos de salida:
   0   la orden se completó.
   1   la orden se completó pero el resultado no es el deseado (por ejemplo,
-      una verificación que no deja la tarea en PROPUESTO, o una
-      reanudación que deja tareas que una persona debe mirar).
+      una verificación que no deja la tarea en PROPUESTO, una
+      reanudación que deja tareas que una persona debe mirar, o una
+      limpieza que deja árboles sin retirar).
   2   error de uso o avería del Supervisor.
   3   toma rechazada: la tarea ya la tiene otro, o su estado no la admite.
   4   orden rechazada por propiedad: identidad, generación o estado no
@@ -1382,7 +1401,9 @@ def construir_analizador() -> argparse.ArgumentParser:
     bloquear.set_defaults(funcion=orden_bloquear)
 
     reanudar = ordenes.add_parser(
-        "reanudar", help="Recuperar tareas tras un cierre o apagón."
+        "reanudar",
+        help="Recuperar tareas tras un cierre o apagón y poner la cola de "
+             "acuerdo con lo recuperado.",
     )
     reanudar.set_defaults(funcion=orden_reanudar)
 

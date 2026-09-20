@@ -20,7 +20,13 @@ Lo que se demuestra, con procesos y árboles reales:
 11. apagón y reinicio simulados -> cola y propiedad recuperables;
 12. los argumentos del trabajador viajan como lista, nunca `shell=True`;
 13. la consola expone las órdenes con códigos de salida propios;
-14. estrés: varios procesos despachando a la vez, varias rondas.
+14. estrés: varios procesos despachando a la vez, varias rondas;
+15-27. lo que dejó la auditoría R1: transición y cierre en una sola
+    transacción, adopción exclusiva con reintento, lanzamiento fallido,
+    ficha ilegible que no para la cola, reconciliación con otro dueño o
+    con el proceso vivo, árbol que desaparece, enlaces en la zona, lo que
+    Git podría esconder, nietos y señales, entorno y argv, árbol roto,
+    orden entre vivas y restos, base de la rama y commit inicial.
 
 Todo es hermético: repositorios Git temporales con su propia base SQLite.
 Jamás se toca el repositorio real ni su base. Los trabajadores son
@@ -36,11 +42,14 @@ import argparse
 import json
 import multiprocessing
 import os
+import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -65,15 +74,28 @@ PRUEBA_VERDE = "print('PRUEBA_VERDE=OK')\n"
 # El trabajo de demostración: escribe el archivo de la tarea dentro de su
 # ámbito, opcionalmente uno FUERA, opcionalmente falla o duerme, y confirma.
 TRABAJO_DEMO = '''\
-import argparse, json, pathlib, subprocess, sys, time
+import argparse, json, os, pathlib, subprocess, sys, time
 p = argparse.ArgumentParser()
 p.add_argument("tarea")
 p.add_argument("--fuera")
 p.add_argument("--fallar", type=int, default=0)
 p.add_argument("--dormir", type=float, default=0.0)
 p.add_argument("--sin-commit", action="store_true")
+p.add_argument("--esperar", help="archivo cuya aparicion se espera (tope 60 s)")
+p.add_argument("--nieto", action="store_true", help="lanza un nieto que duerme 60 s")
+p.add_argument("--senales", help="carpeta FUERA del arbol donde dejar los PID")
 p.add_argument("extras", nargs="*")
 a = p.parse_intermixed_args()
+if a.nieto:
+    nieto = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    if a.senales:
+        pathlib.Path(a.senales, "nieto.pid").write_text(str(nieto.pid), encoding="utf-8")
+if a.senales:
+    pathlib.Path(a.senales, "trabajo.pid").write_text(str(os.getpid()), encoding="utf-8")
+if a.esperar:
+    limite = time.monotonic() + 60
+    while not pathlib.Path(a.esperar).exists() and time.monotonic() < limite:
+        time.sleep(0.05)
 if a.dormir:
     time.sleep(a.dormir)
 d = pathlib.Path("modulos/demostracion")
@@ -190,8 +212,6 @@ def _quitar_solo_lectura(funcion, ruta, _excepcion):
 
 def borrar(raiz: Path) -> None:
     """Borra el temporal sin lanzar NUNCA (se llama desde `finally`)."""
-    import shutil
-
     clave = "onexc" if sys.version_info >= (3, 12) else "onerror"
 
     for intento in range(3):
@@ -217,7 +237,10 @@ def ficha_minima(raiz: Path, identificador, ambito=None, **extras):
         "titulo": "Tarea " + identificador,
         "objetivo": "Comprobar los trabajadores.",
         "criterios_aceptacion": ["La prueba verde pasa."],
-        "ambito_archivos": ambito or ["modulos/demostracion/" + identificador + ".py"],
+        "ambito_archivos": (
+            ambito if ambito is not None
+            else ["modulos/demostracion/" + identificador + ".py"]
+        ),
         "pruebas_requeridas": ["pruebas/demostracion/prueba_verde.py"],
     }
     parametros.update(extras)
@@ -664,6 +687,7 @@ def prueba_02_dos_procesos_despachan_la_misma_tarea(contendientes: int, rondas: 
                         trabajadores.RECHAZO_NO_PENDIENTE,
                         trabajadores.RECHAZO_TOMA,
                         trabajadores.RECHAZO_ESTADO,
+                        trabajadores.RECHAZO_ARBOL,
                     ), perdedora
 
             # El ganador suelta la tarea; la entrada vuelve a la cola con la
@@ -673,7 +697,7 @@ def prueba_02_dos_procesos_despachan_la_misma_tarea(contendientes: int, rondas: 
                 trabajador_id=ganadora["marca"], generacion=ganadora["generacion"],
             )
 
-            reconciliado = trabajadores.reconciliar_cola(raiz)
+            reconciliado = trabajadores.reconciliar_cola(raiz, comprobar_proceso=lambda pid: False)
             assert [u["secuencia"] for u in reconciliado["reencoladas"]] == [secuencia]
             assert entrada_de(raiz, "T-0911")["estado_cola"] == estado_global.COLA_PENDIENTE
             METRICAS["RECUPERACIONES"] += 1
@@ -739,7 +763,7 @@ def prueba_03_ambitos_solapados_solo_una_con_escritor(contendientes: int):
         # c) La guarda que decide es la de la TRANSACCIÓN, no la lectura
         #    previa: con la lectura previa cegada, la toma sigue negando.
         original = trabajadores._por_que_no_se_despacha
-        trabajadores._por_que_no_se_despacha = lambda fila, tareas: None
+        trabajadores._por_que_no_se_despacha = lambda *a, **k: None
 
         try:
             trabajadores.despachar(raiz, otra, lanzar=False)
@@ -791,6 +815,7 @@ def prueba_04_sin_solapamiento_ambas_progresan():
     print("  4. dos tareas sin solapamiento -> ambas progresan, cada una en su ámbito:", end=" ")
 
     raiz = crear_repositorio("paralelas_")
+    senales = Path(tempfile.mkdtemp(prefix="senales_"))
     procesos = []
 
     try:
@@ -801,7 +826,10 @@ def prueba_04_sin_solapamiento_ambas_progresan():
             ficha_minima(raiz, identificador)
             trabajadores.encolar(
                 raiz, identificador,
-                trabajo=trabajo_demo(identificador, "--dormir", "3", "extra " + identificador),
+                trabajo=trabajo_demo(
+                    identificador, "--esperar", str(senales / (identificador + ".continuar")),
+                    "extra " + identificador,
+                ),
             )
             METRICAS["TAREAS_ENCOLADAS"] += 1
 
@@ -830,6 +858,19 @@ def prueba_04_sin_solapamiento_ambas_progresan():
         assert len(vivas) == 3, [f["estado"] for f in vivas]
         assert all(nucleo.proceso_vivo(f["pid"]) for f in vivas)
 
+        # La cola lleva el PID del trabajador que adoptó, no el del
+        # despacho, y dice cuándo adoptó.
+        for informe in informes:
+            entrada = entrada_de(raiz, informe["tarea"])
+            assert entrada["pid"] == informe["pid_trabajador"], entrada
+            assert entrada["adoptada"] is True and entrada["adoptado_en"]
+
+        # Con los tres esperando, hay tiempo de sobra para varios latidos.
+        time.sleep(0.6)
+
+        for informe in informes:
+            (senales / (informe["tarea"] + ".continuar")).write_text("", encoding="utf-8")
+
         for informe in informes:
             codigo = informe["proceso"].wait(timeout=ESPERA_TRABAJADOR_S)
             registro = Path(informe["registro"]).read_text(encoding="utf-8")
@@ -838,7 +879,7 @@ def prueba_04_sin_solapamiento_ambas_progresan():
             detalle = informe_del_registro(registro)
             assert detalle["resultado"] == trabajadores.RESULTADO_VERIFICADA
             assert detalle["estado_final"] == str(Estado.PROPUESTO)
-            assert detalle["latidos"] >= 1
+            assert detalle["latidos"] >= 2, detalle["latidos"]
             assert detalle["fuera_de_ambito"] == []
 
             fila = fila_de(raiz, informe["tarea"])
@@ -857,6 +898,8 @@ def prueba_04_sin_solapamiento_ambas_progresan():
                 raiz, "diff", "--name-only", base, "tarea/" + informe["tarea"]
             ).stdout.split()
             assert cambios == ["modulos/demostracion/" + informe["tarea"] + ".py"], cambios
+            # El trabajo corrió con el entorno del ÁRBOL, no del Supervisor.
+            assert informe["rama_creada_desde"] == "main", informe["rama_creada_desde"]
 
             contenido = (Path(informe["worktree"]) / cambios[0]).read_text(encoding="utf-8")
             assert "extra " + informe["tarea"] in contenido
@@ -892,6 +935,7 @@ def prueba_04_sin_solapamiento_ambas_progresan():
         for proceso in procesos:
             matar(proceso)
         borrar(raiz)
+        borrar(senales)
 
     print("OK")
 
@@ -904,11 +948,15 @@ def prueba_05_doble_lanzamiento_rechazado():
     print("  5. un doble lanzamiento accidental -> rechazado:", end=" ")
 
     raiz = crear_repositorio("doble_")
+    senales = Path(tempfile.mkdtemp(prefix="senales_"))
     procesos = []
 
     try:
         ficha_minima(raiz, "T-0941")
-        trabajadores.encolar(raiz, "T-0941", trabajo=trabajo_demo("T-0941", "--dormir", "3"))
+        trabajadores.encolar(
+            raiz, "T-0941",
+            trabajo=trabajo_demo("T-0941", "--esperar", str(senales / "continuar")),
+        )
         METRICAS["TAREAS_ENCOLADAS"] += 1
 
         informe = trabajadores.despachar(raiz, intervalo_latido_s=INTERVALO_LATIDO_S)
@@ -974,6 +1022,7 @@ def prueba_05_doble_lanzamiento_rechazado():
         assert fila["pid"] == informe["pid_trabajador"]
         assert fila["trabajador_id"] == informe["trabajador_id"]
 
+        (senales / "continuar").write_text("", encoding="utf-8")
         codigo = informe["proceso"].wait(timeout=ESPERA_TRABAJADOR_S)
         assert codigo == 0, Path(informe["registro"]).read_text(encoding="utf-8")[-800:]
         assert fila_de(raiz, "T-0941")["estado"] == str(Estado.PROPUESTO)
@@ -996,6 +1045,7 @@ def prueba_05_doble_lanzamiento_rechazado():
         for proceso in procesos:
             matar(proceso)
         borrar(raiz)
+        borrar(senales)
 
     print("OK")
 
@@ -1054,16 +1104,18 @@ def prueba_06_trabajador_termina_bien_estado_consistente():
         assert entrada["trabajador_id"] == informe["trabajador_id"]
 
         # El historial cuenta la historia entera, en orden.
-        tipos = [e["tipo"] for e in reversed(eventos_de(raiz, "T-0951"))]
+        eventos = list(reversed(eventos_de(raiz, "T-0951")))
+        tipos = [e["tipo"] for e in eventos]
         assert tipos == [
             estado_global.EVENTO_CREACION,
             estado_global.EVENTO_COLA,         # encolada
-            estado_global.EVENTO_COLA,         # despachada (mismo COMMIT que la toma)
             estado_global.EVENTO_TRANSICION,   # tomada
+            estado_global.EVENTO_COLA,         # despachada (mismo COMMIT que la toma)
             estado_global.EVENTO_VERIFICACION,
             estado_global.EVENTO_TRANSICION,   # propuesta
-            estado_global.EVENTO_COLA,         # cerrada
+            estado_global.EVENTO_COLA,         # cerrada (mismo COMMIT que la propuesta)
         ], tipos
+        assert all(e["estado_nuevo"] for e in eventos if e["tipo"] == estado_global.EVENTO_COLA), eventos
 
         # El espejo JSON refleja lo mismo que la base.
         espejo = json.loads(fichas.ruta_ficha(raiz, "T-0951").read_text(encoding="utf-8"))
@@ -1221,7 +1273,7 @@ def prueba_07_trabajador_falla_recuperacion_consistente():
             assert fila["estado"] != str(Estado.EN_EJECUCION), identificador
             assert fila["pid"] is None and fila["trabajador_id"] is None, identificador
 
-        assert trabajadores.reconciliar_cola(raiz)["revisadas"] == 0
+        assert trabajadores.reconciliar_cola(raiz, comprobar_proceso=lambda pid: False)["revisadas"] == 0
 
         comprobar_integridad(raiz)
     finally:
@@ -1261,7 +1313,7 @@ def prueba_08_duda_no_se_libera():
             fila = fila_de(raiz, "T-0971")
             assert fila["estado"] == str(Estado.EN_EJECUCION)
             assert fila["trabajador_id"] == informe["trabajador_id"]
-            cola = trabajadores.reconciliar_cola(raiz)
+            cola = trabajadores.reconciliar_cola(raiz, comprobar_proceso=lambda pid: False)
             assert [u["secuencia"] for u in cola["sin_tocar"]] == [secuencia], cola
             assert cola["reencoladas"] == []
             assert entrada_de(raiz, "T-0971")["estado_cola"] == estado_global.COLA_DESPACHADA
@@ -1308,7 +1360,6 @@ def prueba_08_duda_no_se_libera():
             (informe["trabajador_id"].replace("otra-maquina", "vm-local"), secuencia),
         )
         # `equipo_de` compara con el nombre de esta máquina: se pone el real.
-        import socket
         propio = socket.gethostname() + "/1/abc"
         escribir_sql(raiz, "UPDATE tareas SET trabajador_id = ? WHERE id = 'T-0971'", (propio,))
         escribir_sql(raiz, "UPDATE cola SET trabajador_id = ? WHERE secuencia = ?", (propio, secuencia))
@@ -1317,7 +1368,7 @@ def prueba_08_duda_no_se_libera():
         assert [u["id"] for u in recuperacion["huerfanas"]] == ["T-0971"], recuperacion
         assert fila_de(raiz, "T-0971")["estado"] == str(Estado.REABIERTO)
 
-        cola = trabajadores.reconciliar_cola(raiz)
+        cola = trabajadores.reconciliar_cola(raiz, comprobar_proceso=lambda pid: False)
         assert [u["secuencia"] for u in cola["reencoladas"]] == [secuencia]
         entrada = entrada_de(raiz, "T-0971")
         assert entrada["estado_cola"] == estado_global.COLA_PENDIENTE
@@ -1326,7 +1377,7 @@ def prueba_08_duda_no_se_libera():
         METRICAS["RECUPERACIONES"] += 1
 
         # Idempotente: una segunda pasada no cambia nada.
-        assert trabajadores.reconciliar_cola(raiz)["reencoladas"] == []
+        assert trabajadores.reconciliar_cola(raiz, comprobar_proceso=lambda pid: False)["reencoladas"] == []
         assert nucleo.reanudar(raiz)["revisadas"] == 0
 
         comprobar_integridad(raiz)
@@ -1369,7 +1420,6 @@ def prueba_09_worktree_fuera_de_zona_rechazado():
 
             if intento == "en ejecución":
                 # También con la ruta en una entrada despachada de la cola.
-                trabajadores.encolar(raiz, "T-0982") if False else None
                 nucleo.devolver(raiz, "T-0981", "hecho", trabajador_id="manual", generacion=tomada.generacion)
                 # La fila ya no lleva árbol; se simula una entrada despachada
                 # que sí lo lleve (un despacho manipulado).
@@ -1409,7 +1459,7 @@ def prueba_09_worktree_fuera_de_zona_rechazado():
             METRICAS["WORKTREES_RECHAZADOS"] += 1
             assert "despachada" in str(rechazo), str(rechazo)
 
-        assert [u["tarea"] for u in trabajadores.reconciliar_cola(raiz)["reencoladas"]] == ["T-0983"]
+        assert [u["tarea"] for u in trabajadores.reconciliar_cola(raiz, comprobar_proceso=lambda pid: False)["reencoladas"]] == ["T-0983"]
         METRICAS["RECUPERACIONES"] += 1
         trabajadores.desencolar(raiz, "T-0983")
 
@@ -1508,9 +1558,8 @@ def prueba_10_borrar_worktree_con_cambios_ajenos_rechazado():
         se_rechaza("con un archivo de nombre raro", "informe con espacios y ñ.txt")
         raro.unlink()
 
-        # e) Una ejecución viva sobre el árbol.
-        retomada = nucleo.tomar(raiz, "T-0991", trabajador_id="humano", worktree=str(arbol)) if False else None
-        # (PROPUESTO no es tomable: se simula con la fila.)
+        # e) Una ejecución viva sobre el árbol (PROPUESTO no es tomable:
+        #    se simula con la fila).
         escribir_sql(
             raiz,
             "UPDATE tareas SET estado = 'en_ejecucion', trabajador_id = 'humano', "
@@ -1617,6 +1666,7 @@ def prueba_11_apagon_y_reinicio_cola_y_propiedad_recuperables():
         assert fila_de(raiz, "T-0902")["estado"] == str(Estado.REABIERTO)
         METRICAS["RECUPERACIONES"] += 1
 
+        # Con la comprobación REAL: el trabajador está muerto de verdad.
         cola = trabajadores.reconciliar_cola(raiz)
         assert [u["tarea"] for u in cola["reencoladas"]] == ["T-0902"]
         entrada = entrada_de(raiz, "T-0902")
@@ -1639,6 +1689,7 @@ def prueba_11_apagon_y_reinicio_cola_y_propiedad_recuperables():
         assert informe2["secuencia"] == informe["secuencia"]
         assert informe2["generacion"] == 2
         assert informe2["arbol_creado"] is False
+        assert informe2["registro"] != informe["registro"], "Dos lanzamientos comparten registro."
         assert codigo2 == 0, registro2[-800:]
         assert fila_de(raiz, "T-0902")["estado"] == str(Estado.PROPUESTO)
         assert entrada_de(raiz, "T-0902")["estado_cola"] == estado_global.COLA_TERMINADA
@@ -1654,7 +1705,7 @@ def prueba_11_apagon_y_reinicio_cola_y_propiedad_recuperables():
         recuperacion = nucleo.reanudar(raiz, ahora=despues, comprobar_proceso=lambda pid: False)
         assert [u["id"] for u in recuperacion["huerfanas"]] == ["T-0901"]
         METRICAS["RECUPERACIONES"] += 1
-        assert [u["tarea"] for u in trabajadores.reconciliar_cola(raiz)["reencoladas"]] == ["T-0901"]
+        assert [u["tarea"] for u in trabajadores.reconciliar_cola(raiz, comprobar_proceso=lambda pid: False)["reencoladas"]] == ["T-0901"]
 
         # f) Lo que quedó despachado a una ejecución que ya terminó por otra
         #    vía (una persona la aprobó, por ejemplo) se cierra.
@@ -1662,7 +1713,7 @@ def prueba_11_apagon_y_reinicio_cola_y_propiedad_recuperables():
             raiz, "UPDATE cola SET estado_cola = 'despachada', trabajador_id = 'z', "
             "generacion = 7 WHERE tarea_id = 'T-0903'",
         )
-        cola = trabajadores.reconciliar_cola(raiz)
+        cola = trabajadores.reconciliar_cola(raiz, comprobar_proceso=lambda pid: False)
         assert [u["tarea"] for u in cola["reencoladas"]] == ["T-0903"]
 
         comprobar_integridad(raiz)
@@ -1738,6 +1789,7 @@ def prueba_12_argv_estructurado_nunca_shell():
         assert isinstance(argv, list) and all(isinstance(uno, str) for uno in argv)
         assert argv[argv.index("--") + 1:] == [sys.executable, "herramientas/eco.py", *peligrosos]
         assert "-m" in argv and "orquestacion.ingenieria_supervisor.trabajador" in argv
+        assert all("=" in uno for uno in argv[3:argv.index("--")]), argv
 
         # d) De punta a punta, con el trabajador real: el eco es exacto.
         informe, codigo, registro = despachar_y_esperar(raiz)
@@ -1794,6 +1846,7 @@ def prueba_13_la_consola_expone_las_ordenes():
     print(" 13. la consola expone las órdenes con códigos propios:", end=" ")
 
     raiz = crear_repositorio("consola_")
+    senales = Path(tempfile.mkdtemp(prefix="senales_"))
 
     try:
         esperados = []
@@ -1811,8 +1864,8 @@ def prueba_13_la_consola_expone_las_ordenes():
 
         encolada = cli(
             raiz, "encolar", "T-0901", "--prioridad", "3", "--trabajo",
-            sys.executable, "herramientas/trabajo.py", "T-0901", "--dormir", "4",
-            "con espacio; y punto y coma",
+            sys.executable, "herramientas/trabajo.py", "T-0901",
+            "--esperar", str(senales / "continuar"), "con espacio; y punto y coma",
         )
         esperados.append(("encolar con trabajo tras --trabajo", encolada, 0))
         assert "Encolada: T-0901 (entrada 1, prioridad 3)" in encolada.stdout, encolada.stdout
@@ -1836,7 +1889,7 @@ def prueba_13_la_consola_expone_las_ordenes():
 
         pid = int(despachada.stdout.split("Proceso trabajador: ")[1].splitlines()[0])
 
-        # Con el trabajador todavía trabajando (el trabajo duerme 4 s):
+        # Con el trabajador todavía trabajando (el trabajo espera el semáforo):
         assert nucleo.proceso_vivo(pid), "El trabajador terminó antes de tiempo."
         esperados.append(("despachar de nuevo", cli(raiz, "despachar", "T-0901"), 7))
         METRICAS["DESPACHOS_RECHAZADOS"] += 1
@@ -1846,6 +1899,7 @@ def prueba_13_la_consola_expone_las_ordenes():
         assert "EN EJECUCIÓN" in viva.stdout or "despachada" in viva.stdout, viva.stdout
         METRICAS["WORKTREES_RECHAZADOS"] += 1
         assert nucleo.proceso_vivo(pid), "El trabajador terminó antes de las tres órdenes."
+        (senales / "continuar").write_text("", encoding="utf-8")
 
         esperar_a(
             lambda: not nucleo.proceso_vivo(pid)
@@ -1894,6 +1948,7 @@ def prueba_13_la_consola_expone_las_ordenes():
         comprobar_integridad(raiz)
     finally:
         borrar(raiz)
+        borrar(senales)
 
     print("OK")
 
@@ -1954,7 +2009,7 @@ def prueba_14_estres_entre_procesos(despachadores: int, rondas: int):
                     trabajador_id=lista[0]["marca"], generacion=lista[0]["generacion"],
                 )
 
-            reencoladas = trabajadores.reconciliar_cola(raiz)["reencoladas"]
+            reencoladas = trabajadores.reconciliar_cola(raiz, comprobar_proceso=lambda pid: False)["reencoladas"]
             assert sorted(u["tarea"] for u in reencoladas) == sorted(por_tarea)
             METRICAS["RECUPERACIONES"] += len(reencoladas)
 
@@ -1964,6 +2019,1131 @@ def prueba_14_estres_entre_procesos(despachadores: int, rondas: int):
         limpieza = trabajadores.limpiar_arboles(raiz)
         assert len(limpieza["limpiados"]) == 3 and not limpieza["rechazados"], limpieza
         METRICAS["WORKTREES_LIMPIADOS"] += 3
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
+# 15. Transición y cierre de la entrada en UNA transacción (R1)
+# ----------------------------------------------------------------------
+
+def _con_rastro_sql(funcion):
+    """Ejecuta `funcion()` registrando cada sentencia SQL de este proceso."""
+    sentencias = []
+    conectar = sqlite3.connect
+
+    def vigilado(*argumentos, **claves):
+        con = conectar(*argumentos, **claves)
+        con.set_trace_callback(lambda s: sentencias.append(str(s)))
+        return con
+
+    sqlite3.connect = vigilado
+
+    try:
+        resultado = funcion()
+    finally:
+        sqlite3.connect = conectar
+
+    return resultado, sentencias
+
+
+def _misma_transaccion(sentencias, primera, segunda) -> bool:
+    """Si la primera sentencia que contiene `segunda` cae entre el mismo
+    BEGIN y COMMIT que alguna que contiene `primera`."""
+    indice = next(
+        (i for i, s in enumerate(sentencias) if segunda in s.upper()), None
+    )
+    assert indice is not None, "No se ejecutó: " + segunda
+
+    inicio = max(i for i, s in enumerate(sentencias[:indice]) if s.strip().upper().startswith("BEGIN"))
+    fin = next(
+        i for i, s in enumerate(sentencias) if i > indice and s.strip().upper() in ("COMMIT", "ROLLBACK")
+    )
+
+    return any(primera in s.upper() for s in sentencias[inicio:fin])
+
+
+def prueba_15_la_transicion_y_el_cierre_van_juntos():
+    print(" 15. la transición de la tarea y el cierre de su entrada van en una transacción:", end=" ")
+
+    raiz = crear_repositorio("atomico_")
+    procesos = []
+
+    try:
+        # a) Determinista, en este proceso: el UPDATE de `tareas` (devolver)
+        #    y el de `cola` (cierre) comparten BEGIN y COMMIT.
+        ficha_minima(raiz, "T-0901")
+        trabajadores.encolar(raiz, "T-0901", trabajo=trabajo_demo("T-0901", "--fallar", "3"))
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+
+        despacho = trabajadores.despachar(raiz, lanzar=False)
+        METRICAS["DESPACHOS_ACEPTADOS"] += 1
+        METRICAS["WORKTREES_CREADOS"] += int(despacho["arbol_creado"])
+
+        def correr():
+            return trabajadores.ejecutar_trabajador(
+                raiz, "T-0901", despacho["trabajador_id"], despacho["generacion"],
+                despacho["secuencia"], despacho["worktree"],
+                trabajo_demo("T-0901", "--fallar", "3"), tiempo_limite_s=30,
+                intervalo_latido_s=INTERVALO_LATIDO_S, pid_despacho=os.getpid(),
+            )
+
+        informe, sentencias = _con_rastro_sql(correr)
+
+        assert informe["resultado"] == trabajadores.RESULTADO_TRABAJO_FALLIDO, informe
+        assert informe["entrada_cerrada"] is True
+        assert _misma_transaccion(sentencias, "UPDATE TAREAS SET", "TERMINADO_EN ="), (
+            "El cierre de la entrada no va en la transacción de la transición."
+        )
+        assert fila_de(raiz, "T-0901")["estado"] == str(Estado.REABIERTO)
+        assert entrada_de(raiz, "T-0901")["estado_cola"] == estado_global.COLA_FALLIDA
+
+        # También al verificar: el UPDATE de la propuesta y el cierre juntos.
+        ficha_minima(raiz, "T-0902")
+        trabajadores.encolar(raiz, "T-0902", trabajo=trabajo_demo("T-0902"))
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+        despacho2 = trabajadores.despachar(raiz, lanzar=False)
+        METRICAS["DESPACHOS_ACEPTADOS"] += 1
+        METRICAS["WORKTREES_CREADOS"] += int(despacho2["arbol_creado"])
+
+        informe2, sentencias2 = _con_rastro_sql(lambda: trabajadores.ejecutar_trabajador(
+            raiz, "T-0902", despacho2["trabajador_id"], despacho2["generacion"],
+            despacho2["secuencia"], despacho2["worktree"], trabajo_demo("T-0902"),
+            tiempo_limite_s=30, intervalo_latido_s=INTERVALO_LATIDO_S, pid_despacho=os.getpid(),
+        ))
+        assert informe2["resultado"] == trabajadores.RESULTADO_VERIFICADA, informe2
+        assert informe2["entrada_cerrada"] is True
+        assert _misma_transaccion(sentencias2, "UPDATE TAREAS SET", "TERMINADO_EN =")
+        entrada2 = entrada_de(raiz, "T-0902")
+        assert entrada2["estado_cola"] == estado_global.COLA_TERMINADA
+        assert entrada2["resultado"]["estado"] == str(Estado.PROPUESTO)
+        assert entrada2["resultado"]["verificacion"]["resultado"] == "APROBADO", entrada2["resultado"]
+
+        # b) Con procesos reales y una reconciliación martilleando: NINGÚN
+        #    trabajo fallido vuelve a la cola ni pierde su resultado.
+        tareas = ["T-0911", "T-0912", "T-0913", "T-0914"]
+
+        for identificador in tareas:
+            ficha_minima(raiz, identificador)
+            trabajadores.encolar(raiz, identificador, trabajo=trabajo_demo(identificador, "--fallar", "3"))
+            METRICAS["TAREAS_ENCOLADAS"] += 1
+
+        parar = threading.Event()
+        vueltas = [0]
+
+        def martillo():
+            while not parar.is_set():
+                try:
+                    trabajadores.reconciliar_cola(raiz)
+                    vueltas[0] += 1
+                except (trabajadores.ErrorCola, estado_global.ErrorEstadoGlobal):
+                    pass
+
+        hilo = threading.Thread(target=martillo, daemon=True)
+        hilo.start()
+
+        try:
+            informes = []
+
+            for _ in tareas:
+                informe = trabajadores.despachar(raiz, intervalo_latido_s=INTERVALO_LATIDO_S)
+                METRICAS["DESPACHOS_ACEPTADOS"] += 1
+                METRICAS["WORKTREES_CREADOS"] += int(informe["arbol_creado"])
+                informes.append(informe)
+                procesos.append(informe["proceso"])
+
+            for informe in informes:
+                assert informe["proceso"].wait(timeout=ESPERA_TRABAJADOR_S) == 1
+        finally:
+            parar.set()
+            hilo.join(timeout=10)
+
+        assert vueltas[0] >= 5, "La reconciliación apenas corrió: " + str(vueltas[0])
+
+        for identificador in tareas:
+            entrada = entrada_de(raiz, identificador)
+            assert entrada["estado_cola"] == estado_global.COLA_FALLIDA, (identificador, entrada["estado_cola"])
+            assert entrada["resultado"]["tipo"] == trabajadores.RESULTADO_TRABAJO_FALLIDO
+            assert entrada["resultado"]["trabajo"]["codigo"] == 3
+            assert fila_de(raiz, identificador)["estado"] == str(Estado.REABIERTO)
+            assert len(entradas_de(raiz, identificador)) == 1, "Se relanzó un trabajo fallido."
+
+        comprobar_integridad(raiz)
+    finally:
+        for proceso in procesos:
+            matar(proceso)
+        borrar(raiz)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
+# 16. Adopción: exclusiva, con reintento ante la base bloqueada
+# ----------------------------------------------------------------------
+
+def prueba_16_la_adopcion_es_exclusiva_y_aguanta_un_candado():
+    print(" 16. la adopción es exclusiva y aguanta la base bloqueada:", end=" ")
+
+    raiz = crear_repositorio("adopcion_")
+
+    try:
+        ficha_minima(raiz, "T-0901")
+        trabajadores.encolar(raiz, "T-0901")
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+        despacho = trabajadores.despachar(raiz, lanzar=False)
+        METRICAS["DESPACHOS_ACEPTADOS"] += 1
+        METRICAS["WORKTREES_CREADOS"] += int(despacho["arbol_creado"])
+
+        credencial = (despacho["trabajador_id"], despacho["generacion"])
+
+        # a) Sin el PID del despacho no se adopta (ni por la API ni por el
+        #    cuerpo del trabajador): la exclusividad no es opcional.
+        for malo in (None, 0, -1, True):
+            try:
+                nucleo.adoptar(raiz, "T-0901", *credencial, pid_anterior=malo)
+                raise AssertionError("Se adoptó sin PID del despacho: " + repr(malo))
+            except nucleo.ErrorSupervisor:
+                pass
+
+        try:
+            nucleo.adoptar(raiz, "T-0901", None, None, pid_anterior=os.getpid())
+            raise AssertionError("Se adoptó con credencial implícita.")
+        except nucleo.ErrorSupervisor:
+            pass
+
+        informe = trabajadores.ejecutar_trabajador(
+            raiz, "T-0901", *credencial, despacho["secuencia"], despacho["worktree"], [],
+            tiempo_limite_s=5, intervalo_latido_s=INTERVALO_LATIDO_S, pid_despacho=None,
+        )
+        assert informe["adoptada"] is False and "pid-despacho" in informe["detalle"], informe
+        assert fila_de(raiz, "T-0901")["pid"] == os.getpid()
+
+        # b) Con un PID del despacho que no es el de la fila: rechazada.
+        try:
+            nucleo.adoptar(raiz, "T-0901", *credencial, pid_anterior=os.getpid() + 100000)
+            raise AssertionError("Se adoptó con otro PID de despacho.")
+        except nucleo.ErrorPropiedad as rechazo:
+            assert rechazo.motivo == estado_global.MOTIVO_PRECONDICION_CAMBIADA, rechazo.motivo
+
+        # c) La base bloqueada más tiempo que `busy_timeout`: la adopción
+        #    reintenta y entra; no dice «no es mía».
+        # El candado se toma y se suelta desde el MISMO hilo (SQLite lo
+        # exige), y se avisa cuando ya está tomado.
+        tomado = threading.Event()
+
+        def retener():
+            candado = estado_global.abrir(estado_global.ruta_base(raiz))
+            try:
+                candado.execute("BEGIN IMMEDIATE")
+                tomado.set()
+                time.sleep(estado_global.BUSY_TIMEOUT_MS / 1000 + 1.5)
+                candado.execute("ROLLBACK")
+            finally:
+                candado.close()
+
+        hilo = threading.Thread(target=retener, daemon=True)
+        hilo.start()
+        assert tomado.wait(timeout=10), "El candado no se llegó a tomar."
+
+        inicio = time.monotonic()
+        try:
+            informe = trabajadores.ejecutar_trabajador(
+                raiz, "T-0901", *credencial, despacho["secuencia"], despacho["worktree"], [],
+                tiempo_limite_s=30, intervalo_latido_s=INTERVALO_LATIDO_S,
+                pid_despacho=os.getpid(),
+            )
+        finally:
+            hilo.join(timeout=20)
+
+        assert time.monotonic() - inicio >= estado_global.BUSY_TIMEOUT_MS / 1000, "No hubo espera."
+        assert informe["adoptada"] is True, informe
+        assert informe["resultado"] == trabajadores.RESULTADO_VERIFICADA
+        assert fila_de(raiz, "T-0901")["estado"] == str(Estado.PROPUESTO)
+        assert entrada_de(raiz, "T-0901")["estado_cola"] == estado_global.COLA_TERMINADA
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
+# 17. Lo que falla después de la toma no deja una ejecución sin nadie
+# ----------------------------------------------------------------------
+
+def prueba_17_un_lanzamiento_fallido_devuelve_la_tarea():
+    print(" 17. un lanzamiento fallido tras la toma devuelve la tarea y cierra la entrada:", end=" ")
+
+    raiz = crear_repositorio("lanzamiento_")
+
+    try:
+        ficha_minima(raiz, "T-0901")
+        trabajadores.encolar(raiz, "T-0901")
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+
+        try:
+            trabajadores.despachar(raiz, ejecutable="/no/existe/este/python")
+            raise AssertionError("Se despachó con un intérprete inexistente.")
+        except trabajadores.ErrorDespacho as rechazo:
+            contar_rechazo(rechazo)
+            assert rechazo.motivo == trabajadores.RECHAZO_LANZAMIENTO, rechazo.motivo
+            assert [u["motivo"] for u in rechazo.rechazos] == [trabajadores.RECHAZO_LANZAMIENTO]
+
+        METRICAS["WORKTREES_CREADOS"] += 1
+
+        fila = fila_de(raiz, "T-0901")
+        assert fila["estado"] == str(Estado.REABIERTO), fila["estado"]
+        assert fila["trabajador_id"] is None and fila["pid"] is None
+        entrada = entrada_de(raiz, "T-0901")
+        assert entrada["estado_cola"] == estado_global.COLA_FALLIDA
+        assert entrada["resultado"]["tipo"] == trabajadores.RESULTADO_NO_LANZADO
+        assert "no se pudo lanzar" in entrada["resultado"]["motivo"].lower()
+        assert nucleo.reanudar(raiz)["revisadas"] == 0
+
+        # Y con el intérprete de verdad, la misma tarea sale.
+        trabajadores.encolar(raiz, "T-0901")
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+        informe, codigo, registro = despachar_y_esperar(raiz)
+        assert codigo == 0, registro[-600:]
+        assert informe["arbol_creado"] is False
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
+# 18. Una cabeza envenenada no para la cola
+# ----------------------------------------------------------------------
+
+def prueba_18_una_ficha_invalida_no_para_la_cola():
+    print(" 18. una entrada con ficha ilegible o sin ámbito no para la cola:", end=" ")
+
+    raiz = crear_repositorio("envenenada_")
+
+    try:
+        ficha_minima(raiz, "T-0901")
+        ficha_minima(raiz, "T-0902")
+        trabajadores.encolar(raiz, "T-0901", prioridad=9)
+        trabajadores.encolar(raiz, "T-0902")
+        METRICAS["TAREAS_ENCOLADAS"] += 2
+
+        # a) La ficha de la cabeza se corrompe después de encolarla.
+        fichas.ruta_ficha(raiz, "T-0901").write_text("{{ esto no es json", encoding="utf-8")
+
+        listado = {u["tarea_id"]: u for u in trabajadores.listar_cola(raiz)}
+        assert listado["T-0901"]["despachable"] is False
+        assert "no se puede leer" in listado["T-0901"]["por_que_no"], listado["T-0901"]
+
+        informe = trabajadores.despachar(raiz, lanzar=False)
+        METRICAS["DESPACHOS_ACEPTADOS"] += 1
+        METRICAS["WORKTREES_CREADOS"] += int(informe["arbol_creado"])
+        assert informe["tarea"] == "T-0902", informe["tarea"]
+        assert [u["motivo"] for u in informe["rechazos"]] == [trabajadores.RECHAZO_FICHA], informe["rechazos"]
+        METRICAS["DESPACHOS_RECHAZADOS"] += 1
+
+        cabeza = entrada_de(raiz, "T-0901")
+        assert cabeza["estado_cola"] == estado_global.COLA_PENDIENTE
+        assert cabeza["ultimo_rechazo"]["motivo"] == trabajadores.RECHAZO_FICHA, cabeza["ultimo_rechazo"]
+        assert arboles_en_zona(raiz) == ["T-0902"], "Se creó un árbol para una ficha ilegible."
+
+        salida = cli(raiz, "despachar")
+        assert salida.returncode == 7 and "ficha" in salida.stdout.lower(), salida.stdout
+        METRICAS["DESPACHOS_RECHAZADOS"] += 1
+
+        nucleo.devolver(raiz, "T-0902", "hecho", trabajador_id=informe["trabajador_id"], generacion=informe["generacion"])
+
+        # b) Sin ámbito, aprobada o con prioridad imposible: no se encola.
+        ficha_minima(raiz, "T-0903", ambito=[])
+        try:
+            trabajadores.encolar(raiz, "T-0903")
+            raise AssertionError("Se encoló una ficha sin ámbito.")
+        except trabajadores.ErrorCola as choque:
+            assert "ámbito" in str(choque)
+
+        try:
+            trabajadores.encolar(raiz, "T-0902", prioridad=2 ** 63)
+            raise AssertionError("Se encoló con una prioridad de más de 64 bits.")
+        except trabajadores.ErrorCola:
+            pass
+
+        ficha_minima(raiz, "T-0905")
+        escribir_sql(raiz, "UPDATE tareas SET estado = 'aprobado' WHERE id = 'T-0905'")
+        try:
+            trabajadores.encolar(raiz, "T-0905")
+            raise AssertionError("Se encoló una tarea aprobada.")
+        except trabajadores.ErrorCola as choque:
+            assert "aprobada" in str(choque), str(choque)
+
+        # c) Un ámbito no relativo declarado después de encolar: rechazo
+        #    propio, sin árbol y sin parar la cola.
+        ficha_minima(raiz, "T-0904")
+        trabajadores.encolar(raiz, "T-0904")
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+        datos = json.loads(fichas.ruta_ficha(raiz, "T-0904").read_text(encoding="utf-8"))
+        datos["ambito_archivos"] = ["/etc/absoluto.py"]
+        fichas.ruta_ficha(raiz, "T-0904").write_text(json.dumps(datos, ensure_ascii=False), encoding="utf-8")
+
+        try:
+            trabajadores.despachar(raiz, "T-0904", lanzar=False)
+            raise AssertionError("Se despachó una ficha con ámbito absoluto.")
+        except trabajadores.ErrorDespacho as rechazo:
+            contar_rechazo(rechazo)
+            assert rechazo.motivo == trabajadores.RECHAZO_FICHA, rechazo.motivo
+            assert "relativos" in str(rechazo), str(rechazo)
+
+        assert "T-0904" not in arboles_en_zona(raiz)
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
+# 19. Reconciliación: otro propietario reencola; un proceso vivo frena
+# ----------------------------------------------------------------------
+
+def prueba_19_la_reconciliacion_no_pierde_trabajos_ni_reencola_con_el_proceso_vivo():
+    print(" 19. la reconciliación reencola si otro tomó la tarea y NO si el proceso sigue vivo:", end=" ")
+
+    raiz = crear_repositorio("reconciliar_")
+
+    try:
+        ficha_minima(raiz, "T-0901")
+        trabajadores.encolar(raiz, "T-0901")
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+        despacho = trabajadores.despachar(raiz, lanzar=False)
+        METRICAS["DESPACHOS_ACEPTADOS"] += 1
+        METRICAS["WORKTREES_CREADOS"] += int(despacho["arbol_creado"])
+        secuencia = despacho["secuencia"]
+
+        # a) La recuperación libera la ejecución (despacho muerto) y una
+        #    persona toma la tarea a mano ANTES de reconciliar: la entrada
+        #    vuelve a la cola (el trabajo encolado no se hizo), no se cierra.
+        despues = nucleo.ahora_datetime() + timedelta(seconds=200)
+        recuperacion = nucleo.reanudar(raiz, ahora=despues, comprobar_proceso=lambda pid: False)
+        assert [u["id"] for u in recuperacion["huerfanas"]] == ["T-0901"]
+        METRICAS["RECUPERACIONES"] += 1
+
+        manual = nucleo.tomar(raiz, "T-0901", trabajador_id="humano-manual")
+        assert manual.generacion == 2
+
+        cola = trabajadores.reconciliar_cola(raiz, comprobar_proceso=lambda pid: False)
+        assert [u["secuencia"] for u in cola["reencoladas"]] == [secuencia], cola
+        assert cola["cerradas"] == []
+        entrada = entrada_de(raiz, "T-0901")
+        assert entrada["estado_cola"] == estado_global.COLA_PENDIENTE
+        assert entrada["trabajador_id"] is None
+
+        # Y se saltará mientras dure la ejecución manual.
+        listado = {u["tarea_id"]: u for u in trabajadores.listar_cola(raiz)}
+        assert listado["T-0901"]["despachable"] is False
+        assert "en_ejecucion" in listado["T-0901"]["por_que_no"]
+
+        nucleo.devolver(raiz, "T-0901", "hecho", trabajador_id="humano-manual", generacion=2)
+
+        # b) Entrada despachada cuya tarea ya no es suya, pero cuyo proceso
+        #    trabajador (el PID de la entrada) sigue vivo AQUÍ: no se
+        #    reencola, se escala.
+        escribir_sql(
+            raiz,
+            "UPDATE cola SET estado_cola = 'despachada', trabajador_id = ?, generacion = 7, "
+            "pid = ?, adoptado_en = 'x' WHERE secuencia = ?",
+            (socket.gethostname() + "/1/vivo", os.getpid(), secuencia),
+        )
+
+        # Con la comprobación REAL: el PID es el de este proceso, vivo.
+        cola = trabajadores.reconciliar_cola(raiz)
+        assert [u["secuencia"] for u in cola["vivas_sin_tarea"]] == [secuencia], cola
+        assert cola["reencoladas"] == []
+        assert entrada_de(raiz, "T-0901")["estado_cola"] == estado_global.COLA_DESPACHADA
+        METRICAS["CASOS_DUDOSOS_ESCALADOS"] += 1
+
+        salida = cli(raiz, "reanudar")
+        assert salida.returncode == 1, salida.stdout
+        assert "PROCESO TRABAJADOR VIVO" in salida.stdout, salida.stdout
+
+        # Con el proceso demostrado muerto, sí vuelve a la cola.
+        cola = trabajadores.reconciliar_cola(raiz, comprobar_proceso=lambda pid: False)
+        assert [u["secuencia"] for u in cola["reencoladas"]] == [secuencia]
+        METRICAS["RECUPERACIONES"] += 1
+
+        # c) Un despacho que muere después del COMMIT deja la entrada sin
+        #    adoptar, y `cola` lo dice.
+        despacho = trabajadores.despachar(raiz, lanzar=False)
+        METRICAS["DESPACHOS_ACEPTADOS"] += 1
+        listado = {u["tarea_id"]: u for u in trabajadores.listar_cola(raiz)}
+        assert listado["T-0901"]["adoptada"] is False
+        nucleo.devolver(raiz, "T-0901", "fin", trabajador_id=despacho["trabajador_id"], generacion=despacho["generacion"])
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
+# 20. El árbol que desaparece entre validar y tomar; limpieza con candado
+# ----------------------------------------------------------------------
+
+def prueba_20_la_toma_no_se_concede_sobre_un_arbol_que_desaparecio():
+    print(" 20. un árbol que desaparece antes de la toma se rechaza, y la limpieza decide con el candado:", end=" ")
+
+    raiz = crear_repositorio("desaparece_")
+
+    try:
+        ficha_minima(raiz, "T-0901")
+        trabajadores.encolar(raiz, "T-0901")
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+
+        # `tomar` valida el árbol ANTES de pedir el candado; entre esa
+        # validación y la transacción una limpieza lo retira. Se simula
+        # retirándolo justo después de la validación de `tomar`.
+        original = nucleo.resolver_worktree
+        estado = {"borrado": False}
+
+        def validar_y_borrar(raiz_, declarado):
+            arbol = original(raiz_, declarado)
+            if not estado["borrado"] and trabajadores.dentro_de_zona(raiz_, arbol):
+                estado["borrado"] = True
+                _git(raiz_, "worktree", "remove", str(arbol))
+            return arbol
+
+        nucleo.resolver_worktree = validar_y_borrar
+
+        try:
+            trabajadores.despachar(raiz, "T-0901", lanzar=False)
+            raise AssertionError("Se tomó la tarea sobre un árbol borrado.")
+        except trabajadores.ErrorDespacho as rechazo:
+            contar_rechazo(rechazo)
+            assert rechazo.motivo == trabajadores.RECHAZO_ARBOL, rechazo.motivo
+            assert "desapareció" in str(rechazo), str(rechazo)
+        finally:
+            nucleo.resolver_worktree = original
+
+        assert estado["borrado"], "La simulación no llegó a la validación de la toma."
+
+        METRICAS["WORKTREES_CREADOS"] += 1
+        METRICAS["WORKTREES_RECHAZADOS"] += 1
+
+        fila = fila_de(raiz, "T-0901")
+        assert fila["estado"] == str(Estado.NUEVO) and int(fila["generacion"]) == 0
+        assert entrada_de(raiz, "T-0901")["estado_cola"] == estado_global.COLA_PENDIENTE
+
+        # Sin la manipulación, el siguiente despacho recrea el árbol.
+        despacho = trabajadores.despachar(raiz, "T-0901", lanzar=False)
+        METRICAS["DESPACHOS_ACEPTADOS"] += 1
+        assert despacho["arbol_creado"] is True
+        METRICAS["WORKTREES_CREADOS"] += 1
+        nucleo.devolver(raiz, "T-0901", "fin", trabajador_id=despacho["trabajador_id"], generacion=despacho["generacion"])
+        trabajadores.reconciliar_cola(raiz, comprobar_proceso=lambda pid: False)
+        trabajadores.desencolar(raiz, "T-0901")
+
+        # La limpieza decide y borra con el candado de escritura tomado:
+        # `git worktree remove` corre entre BEGIN IMMEDIATE y COMMIT.
+        git_original = trabajadores._git
+        marcas = []
+
+        def git_vigilado(raiz_, *argumentos):
+            if argumentos[:2] == ("worktree", "remove"):
+                marcas.append("<<remove>>")
+            return git_original(raiz_, *argumentos)
+
+        trabajadores._git = git_vigilado
+        sentencias = []
+        conectar = sqlite3.connect
+
+        def vigilado(*a, **k):
+            con = conectar(*a, **k)
+            con.set_trace_callback(lambda s: (sentencias.append(str(s)), marcas.append(str(s))))
+            return con
+
+        sqlite3.connect = vigilado
+
+        try:
+            resultado = trabajadores.limpiar_arbol(raiz, "T-0901")
+        finally:
+            sqlite3.connect = conectar
+            trabajadores._git = git_original
+
+        assert resultado["limpiado"] is True
+        METRICAS["WORKTREES_LIMPIADOS"] += 1
+        posicion = marcas.index("<<remove>>")
+        abiertas = [m for m in marcas[:posicion] if m.strip().upper().startswith("BEGIN")]
+        cerradas = [m for m in marcas[:posicion] if m.strip().upper() in ("COMMIT", "ROLLBACK")]
+        assert len(abiertas) > len(cerradas), "La limpieza borró sin el candado tomado."
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
+# 21. Enlaces simbólicos en la zona
+# ----------------------------------------------------------------------
+
+def prueba_21_un_enlace_en_la_zona_no_se_sigue():
+    print(" 21. un enlace simbólico en la zona no se sigue ni se borra:", end=" ")
+
+    raiz = crear_repositorio("enlaces_")
+
+    try:
+        ficha_minima(raiz, "T-0901")
+        ficha_minima(raiz, "T-0902")
+        trabajadores.encolar(raiz, "T-0901", trabajo=trabajo_demo("T-0901"))
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+        informe, codigo, registro = despachar_y_esperar(raiz)
+        assert codigo == 0, registro[-400:]
+
+        enlace = zona(raiz) / "T-0902"
+
+        try:
+            os.symlink(zona(raiz) / "T-0901", enlace)
+        except (OSError, NotImplementedError):
+            OMITIDAS.append("21: el sistema no permite enlaces simbólicos.")
+            print("OMITIDA")
+            return
+
+        # La fila de T-0902 está NUEVA: por la fila, el árbol se borraría.
+        for nombre in ("T-0902",):
+            try:
+                trabajadores.limpiar_arbol(raiz, nombre)
+                raise AssertionError("Se limpió a través de un enlace.")
+            except trabajadores.ErrorLimpieza as rechazo:
+                METRICAS["WORKTREES_RECHAZADOS"] += 1
+                assert "enlace" in str(rechazo), str(rechazo)
+
+        assert (zona(raiz) / "T-0901" / ".git").exists(), "El árbol enlazado desapareció."
+
+        limpieza = trabajadores.limpiar_arboles(raiz)
+        assert [u["tarea"] for u in limpieza["limpiados"]] == ["T-0901"]
+        METRICAS["WORKTREES_LIMPIADOS"] += 1
+        assert any(u["tarea"] == "T-0902" and "enlace" in u["motivo"] for u in limpieza["rechazados"]), limpieza
+        METRICAS["WORKTREES_RECHAZADOS"] += 1
+        assert enlace.is_symlink(), "Se borró el enlace."
+
+        # Y el despacho tampoco entra por un enlace.
+        trabajadores.encolar(raiz, "T-0902")
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+        try:
+            trabajadores.despachar(raiz, "T-0902", lanzar=False)
+            raise AssertionError("Se despachó sobre un enlace.")
+        except trabajadores.ErrorDespacho as rechazo:
+            contar_rechazo(rechazo)
+            assert rechazo.motivo == trabajadores.RECHAZO_ARBOL and "enlace" in str(rechazo), str(rechazo)
+
+        assert fila_de(raiz, "T-0902")["estado"] == str(Estado.NUEVO)
+
+        enlace.unlink()
+
+        # La zona entera como enlace: nada se crea a través de ella.
+        zona_real = raiz / "zona_real"
+        zona_real.mkdir()
+        shutil.rmtree(zona(raiz))
+        os.symlink(zona_real, zona(raiz))
+        try:
+            trabajadores.despachar(raiz, "T-0902", lanzar=False)
+            raise AssertionError("Se despachó con la zona enlazada.")
+        except trabajadores.ErrorDespacho as rechazo:
+            contar_rechazo(rechazo)
+            assert "enlace" in str(rechazo)
+        assert not any(zona_real.iterdir()), "Se creó algo a través de la zona enlazada."
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
+# 22. Lo que Git podría esconder: rama movida, renombrados, ocultos, ignorados
+# ----------------------------------------------------------------------
+
+def prueba_22_git_no_esconde_escrituras_fuera_del_ambito():
+    print(" 22. ni un checkout, ni un renombrado, ni skip-worktree esconden una escritura fuera del ámbito:", end=" ")
+
+    raiz = crear_repositorio("esconder_")
+
+    try:
+        # a) Confirmar fuera del ámbito y volver con `checkout --detach` al
+        #    commit inicial: la rama queda contaminada -> BLOQUEADA.
+        (raiz / "herramientas" / "esconde.py").write_text(
+            "import subprocess, pathlib\n"
+            "pathlib.Path('fuera').mkdir(exist_ok=True)\n"
+            "pathlib.Path('fuera/x.txt').write_text('fuera\\n')\n"
+            "subprocess.run(['git', 'add', '-A'], check=True)\n"
+            "subprocess.run(['git', '-c', 'user.name=W', '-c', 'user.email=w@x', 'commit', '-q', '-m', 'fuera'], check=True)\n"
+            "subprocess.run(['git', 'checkout', '-q', '--detach', 'HEAD~1'], check=True)\n",
+            encoding="utf-8",
+        )
+        (raiz / "herramientas" / "renombra.py").write_text(
+            "import subprocess, pathlib\n"
+            "pathlib.Path('modulos/demostracion').mkdir(parents=True, exist_ok=True)\n"
+            "subprocess.run(['git', 'mv', 'herramientas/eco.py', 'modulos/demostracion/T-0902.py'], check=True)\n",
+            encoding="utf-8",
+        )
+        (raiz / "herramientas" / "oculta.py").write_text(
+            "import subprocess, pathlib\n"
+            "p = pathlib.Path('pruebas/demostracion/prueba_verde.py')\n"
+            "p.write_text(p.read_text() + '# tocado\\n')\n"
+            "subprocess.run(['git', 'update-index', '--skip-worktree', str(p)], check=True)\n"
+            "pathlib.Path('modulos/demostracion').mkdir(parents=True, exist_ok=True)\n"
+            "pathlib.Path('modulos/demostracion/T-0903.py').write_text('# ok\\n')\n",
+            encoding="utf-8",
+        )
+        _git(raiz, "add", "-A")
+        _git(raiz, "commit", "-q", "-m", "guiones")
+
+        casos = (
+            ("T-0901", "esconde.py", ["fuera/x.txt", "(el árbol quedó en 'HEAD'"]),
+            ("T-0902", "renombra.py", ["herramientas/eco.py"]),
+            ("T-0903", "oculta.py", ["pruebas/demostracion/prueba_verde.py"]),
+        )
+
+        for identificador, guion, esperadas in casos:
+            ficha_minima(raiz, identificador)
+            trabajadores.encolar(raiz, identificador, trabajo=[sys.executable, "herramientas/" + guion])
+            METRICAS["TAREAS_ENCOLADAS"] += 1
+            informe, codigo, registro = despachar_y_esperar(raiz)
+            detalle = informe_del_registro(registro)
+            assert codigo == 1, (identificador, registro[-600:])
+            assert detalle["resultado"] == trabajadores.RESULTADO_FUERA_DE_AMBITO, (identificador, detalle)
+            for esperada in esperadas:
+                assert any(esperada in ruta for ruta in detalle["fuera_de_ambito"]), (identificador, esperada, detalle["fuera_de_ambito"])
+            assert fila_de(raiz, identificador)["estado"] == str(Estado.BLOQUEADO)
+
+        # b) Los comodines respetan los directorios (y `**` los cruza).
+        assert trabajadores.ruta_en_ambito("x.py", ["**/*.py"])
+        assert trabajadores.ruta_en_ambito("a/c.py", ["a/**/c.py"])
+        assert trabajadores.ruta_en_ambito("a/b/c/d.py", ["a/**"])
+        assert not trabajadores.ruta_en_ambito("a/b/x.py", ["a/*.py"])
+        assert not trabajadores.ruta_en_ambito("modulos/x.py", ["modulos\\demostracion\\x.py"]) or os.name == "nt"
+
+        # c) La limpieza no borra lo IGNORADO ni un árbol con HEAD separada.
+        ficha_minima(raiz, "T-0904")
+        trabajadores.encolar(raiz, "T-0904", trabajo=trabajo_demo("T-0904"))
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+        informe, codigo, registro = despachar_y_esperar(raiz)
+        assert codigo == 0, registro[-400:]
+        arbol = Path(informe["worktree"])
+
+        exclusion = raiz / ".git" / "info" / "exclude"
+        exclusion.write_text(
+            exclusion.read_text(encoding="utf-8") + "salidas/\n__pycache__/\n*.pyc\n",
+            encoding="utf-8",
+        )
+        (arbol / "salidas").mkdir()
+        (arbol / "salidas" / "modelo.etabs").write_text("modelo", encoding="utf-8")
+        (arbol / "__pycache__").mkdir()
+        (arbol / "__pycache__" / "x.cpython-311.pyc").write_bytes(b"\x00")
+
+        try:
+            trabajadores.limpiar_arbol(raiz, "T-0904")
+            raise AssertionError("Se borró un árbol con archivos ignorados.")
+        except trabajadores.ErrorLimpieza as rechazo:
+            METRICAS["WORKTREES_RECHAZADOS"] += 1
+            assert "ignorados" in str(rechazo) and "salidas/" in str(rechazo), str(rechazo)
+            assert "__pycache__" not in str(rechazo)
+
+        assert (arbol / "salidas" / "modelo.etabs").is_file()
+        shutil.rmtree(arbol / "salidas")
+
+        _git(arbol, "checkout", "-q", "--detach")
+        try:
+            trabajadores.limpiar_arbol(raiz, "T-0904")
+            raise AssertionError("Se borró un árbol con HEAD separada.")
+        except trabajadores.ErrorLimpieza as rechazo:
+            METRICAS["WORKTREES_RECHAZADOS"] += 1
+            assert "rama de la tarea" in str(rechazo), str(rechazo)
+
+        _git(arbol, "checkout", "-q", "tarea/T-0904")
+        assert trabajadores.limpiar_arbol(raiz, "T-0904")["limpiado"] is True
+        METRICAS["WORKTREES_LIMPIADOS"] += 1
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
+# 23. El trabajo no sobrevive a su trabajador
+# ----------------------------------------------------------------------
+
+def prueba_23_el_trabajo_y_sus_nietos_mueren_con_el_trabajador():
+    print(" 23. el tiempo límite y una señal matan al trabajo y a sus nietos:", end=" ")
+
+    if os.name == "nt":
+        OMITIDAS.append("23: en Windows sólo se mata al hijo directo (sin Job Object, V2).")
+        print("OMITIDA")
+        return
+
+    raiz = crear_repositorio("nietos_")
+    senales = Path(tempfile.mkdtemp(prefix="senales_"))
+    procesos = []
+
+    try:
+        # a) Tiempo agotado: el trabajo lanzó un nieto; los dos mueren.
+        ficha_minima(raiz, "T-0901")
+        trabajadores.encolar(
+            raiz, "T-0901",
+            trabajo=trabajo_demo("T-0901", "--nieto", "--dormir", "30", "--senales", str(senales)),
+            tiempo_limite_s=1,
+        )
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+        informe, codigo, registro = despachar_y_esperar(raiz)
+        assert codigo == 1, registro[-400:]
+        detalle = informe_del_registro(registro)
+        assert detalle["trabajo"]["agotado"] is True
+
+        nieto = int((senales / "nieto.pid").read_text())
+        trabajo = int((senales / "trabajo.pid").read_text())
+        esperar_a(lambda: not nucleo.proceso_vivo(nieto), espera_s=5, descripcion="muerte del nieto")
+        assert not nucleo.proceso_vivo(trabajo)
+        assert fila_de(raiz, "T-0901")["estado"] == str(Estado.REABIERTO)
+
+        # b) SIGTERM al trabajador: devuelve la tarea, cierra la entrada y
+        #    mata al trabajo y al nieto.
+        ficha_minima(raiz, "T-0902")
+        (senales / "nieto.pid").unlink()
+        (senales / "trabajo.pid").unlink()
+        trabajadores.encolar(
+            raiz, "T-0902",
+            trabajo=trabajo_demo(
+                "T-0902", "--nieto", "--esperar", str(senales / "nunca"), "--senales", str(senales),
+            ),
+        )
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+        informe = trabajadores.despachar(raiz, intervalo_latido_s=INTERVALO_LATIDO_S)
+        METRICAS["DESPACHOS_ACEPTADOS"] += 1
+        METRICAS["WORKTREES_CREADOS"] += int(informe["arbol_creado"])
+        procesos.append(informe["proceso"])
+        esperar_a(lambda: (senales / "trabajo.pid").exists(), descripcion="arranque del trabajo")
+        time.sleep(0.3)
+        nieto = int((senales / "nieto.pid").read_text())
+        trabajo = int((senales / "trabajo.pid").read_text())
+
+        informe["proceso"].terminate()
+        codigo = informe["proceso"].wait(timeout=ESPERA_TRABAJADOR_S)
+        registro = Path(informe["registro"]).read_text(encoding="utf-8")
+        assert codigo == 2, (codigo, registro[-600:])
+        detalle = informe_del_registro(registro)
+        assert detalle["resultado"] == trabajadores.RESULTADO_TRABAJADOR_AVERIADO
+        assert "señal" in detalle["detalle"], detalle["detalle"]
+        esperar_a(lambda: not nucleo.proceso_vivo(nieto) and not nucleo.proceso_vivo(trabajo), espera_s=5, descripcion="muerte del trabajo y su nieto")
+
+        fila = fila_de(raiz, "T-0902")
+        assert fila["estado"] == str(Estado.REABIERTO) and fila["pid"] is None, fila
+        entrada = entrada_de(raiz, "T-0902")
+        assert entrada["estado_cola"] == estado_global.COLA_FALLIDA
+        assert entrada["resultado"]["tipo"] == trabajadores.RESULTADO_TRABAJADOR_AVERIADO
+        assert nucleo.reanudar(raiz)["revisadas"] == 0
+
+        comprobar_integridad(raiz)
+    finally:
+        for proceso in procesos:
+            matar(proceso)
+        borrar(raiz)
+        borrar(senales)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
+# 24. Entorno del trabajo, ejecutables y argumentos
+# ----------------------------------------------------------------------
+
+def prueba_24_el_trabajo_ve_su_arbol_y_los_argumentos_no_se_confunden():
+    print(" 24. el trabajo corre con el entorno de su árbol y ninguna identidad rompe el argv:", end=" ")
+
+    raiz = crear_repositorio("entorno_")
+
+    try:
+        (raiz / "herramientas" / "entorno.py").write_text(
+            "import os, pathlib, json, sys\n"
+            "pathlib.Path('modulos/demostracion').mkdir(parents=True, exist_ok=True)\n"
+            "pathlib.Path('modulos/demostracion/T-0901.py').write_text(json.dumps({\n"
+            "    'PYTHONPATH': os.environ.get('PYTHONPATH'), 'cwd': os.getcwd(),\n"
+            "    'sys_path': sys.path[:4]}))\n",
+            encoding="utf-8",
+        )
+        _git(raiz, "add", "-A")
+        _git(raiz, "commit", "-q", "-m", "entorno")
+
+        ficha_minima(raiz, "T-0901")
+        trabajadores.encolar(raiz, "T-0901", trabajo=[sys.executable, "herramientas/entorno.py"])
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+        informe, codigo, registro = despachar_y_esperar(raiz)
+        assert codigo == 0, registro[-400:]
+        visto = json.loads((Path(informe["worktree"]) / "modulos" / "demostracion" / "T-0901.py").read_text())
+        arbol = str(Path(informe["worktree"]))
+        assert visto["cwd"] == arbol, visto
+        assert visto["PYTHONPATH"].split(os.pathsep)[0] == arbol, visto
+        assert str(RAIZ) not in visto["PYTHONPATH"], "El trabajo hereda el PYTHONPATH del Supervisor."
+
+        # Ejecutables que un intérprete de órdenes reinterpretaría: no.
+        for malo in (["tarea.bat"], ["C:\\x\\tarea.CMD", "a"]):
+            try:
+                trabajadores.encolar(raiz, "T-0901", trabajo=malo)
+                raise AssertionError("Se encoló un guion de cmd.exe: " + repr(malo))
+            except trabajadores.ErrorCola as choque:
+                assert "cmd.exe" in str(choque)
+
+        # Un ejecutable sin ruta se resuelve por PATH, no por el cwd del padre.
+        resultado = trabajadores.correr_trabajo(["programa-que-no-existe-xyz"], raiz, 5)
+        assert resultado["codigo"] is None and "PATH" in resultado["detalle"], resultado
+
+        # Una identidad que empieza por `-` no puede romper el argv del
+        # trabajador: se rechaza al despachar, y las opciones viajan como
+        # `--clave=valor`.
+        ficha_minima(raiz, "T-0902")
+        trabajadores.encolar(raiz, "T-0902")
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+        for mala in ("-x", "--intruso", "", "con espacio"):
+            try:
+                trabajadores.despachar(raiz, "T-0902", lanzar=False, trabajador_id=mala)
+                raise AssertionError("Se aceptó la identidad " + repr(mala))
+            except trabajadores.ErrorCola:
+                pass
+        assert fila_de(raiz, "T-0902")["estado"] == str(Estado.NUEVO)
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
+# 25. El trabajador averiado y el árbol que deja de serlo
+# ----------------------------------------------------------------------
+
+def prueba_25_un_arbol_roto_tras_el_trabajo_no_se_juzga_contra_la_raiz():
+    print(" 25. un árbol roto tras el trabajo no se juzga contra la raíz, y lo no verificable no se borra:", end=" ")
+
+    raiz = crear_repositorio("roto_")
+
+    try:
+        (raiz / "herramientas" / "rompe.py").write_text(
+            "import pathlib\npathlib.Path('.git').unlink()\n", encoding="utf-8",
+        )
+        _git(raiz, "add", "-A")
+        _git(raiz, "commit", "-q", "-m", "rompe")
+
+        ficha_minima(raiz, "T-0901")
+        trabajadores.encolar(raiz, "T-0901", trabajo=[sys.executable, "herramientas/rompe.py"])
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+        informe, codigo, registro = despachar_y_esperar(raiz)
+        detalle = informe_del_registro(registro)
+        assert codigo == 6, (codigo, registro[-600:])
+        assert detalle["resultado"] == "arbol_no_valido", detalle
+        assert detalle["fuera_de_ambito"] == [], detalle["fuera_de_ambito"]
+        fila = fila_de(raiz, "T-0901")
+        assert fila["estado"] == str(Estado.REABIERTO) and fila["pid"] is None
+        entrada = entrada_de(raiz, "T-0901")
+        assert entrada["estado_cola"] == estado_global.COLA_FALLIDA
+        assert entrada["resultado"]["tipo"] == "arbol_no_valido"
+        assert nucleo.reanudar(raiz)["revisadas"] == 0
+
+        # El árbol sin `.git` no es verificable: no se borra.
+        try:
+            trabajadores.limpiar_arbol(raiz, "T-0901")
+            raise AssertionError("Se borró un árbol que Git no reconoce.")
+        except nucleo.ErrorWorktree:
+            METRICAS["WORKTREES_RECHAZADOS"] += 1
+        assert Path(informe["worktree"]).is_dir()
+
+        # Reparado a mano, y con Git incapaz de responder por sus cambios,
+        # tampoco se borra: no se borra lo que no se puede verificar.
+        _git(raiz, "worktree", "repair", informe["worktree"])
+        _git(Path(informe["worktree"]), "checkout", "-q", "--", ".")
+        original = nucleo.Git.cambios_del_arbol
+        nucleo.Git.cambios_del_arbol = lambda self: None
+        try:
+            trabajadores.limpiar_arbol(raiz, "T-0901")
+            raise AssertionError("Se borró sin poder verificar los cambios.")
+        except trabajadores.ErrorLimpieza as rechazo:
+            METRICAS["WORKTREES_RECHAZADOS"] += 1
+            assert "no se puede verificar" in str(rechazo), str(rechazo)
+        finally:
+            nucleo.Git.cambios_del_arbol = original
+        assert Path(informe["worktree"]).is_dir()
+
+        assert trabajadores.limpiar_arbol(raiz, "T-0901")["limpiado"] is True
+        METRICAS["WORKTREES_LIMPIADOS"] += 1
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
+# 26. Orden determinista también entre vivas mezcladas; restos reparables
+# ----------------------------------------------------------------------
+
+def prueba_26_el_orden_es_el_mismo_en_toda_lectura_y_los_restos_se_reparan():
+    print(" 26. el orden es el mismo en toda lectura, y los restos de un árbol interrumpido se reparan:", end=" ")
+
+    raiz = crear_repositorio("orden_")
+
+    try:
+        assert " ".join(trabajadores.ORDEN_DE_COLA.split()).lower() == "order by prioridad desc, secuencia asc"
+
+        for numero in range(1, 9):
+            identificador = "T-09%02d" % numero
+            ficha_minima(raiz, identificador)
+            trabajadores.encolar(raiz, identificador)
+            METRICAS["TAREAS_ENCOLADAS"] += 1
+
+        escribir_sql(raiz, "UPDATE cola SET estado_cola = 'despachada', trabajador_id = 'x', generacion = 1 WHERE secuencia IN (2, 4, 6, 8)")
+
+        con = estado_global.abrir(estado_global.ruta_base(raiz))
+        try:
+            vivas = [u["secuencia"] for u in trabajadores._listar_entradas(con, estado_global.COLA_ESTADOS_VIVOS)]
+            pendientes = [u["secuencia"] for u in trabajadores._listar_entradas(con, (estado_global.COLA_PENDIENTE,))]
+        finally:
+            con.close()
+        assert vivas == list(range(1, 9)), vivas
+        assert pendientes == [1, 3, 5, 7], pendientes
+        salida = cli(raiz, "cola", "--json")
+        assert [u["secuencia"] for u in json.loads(salida.stdout) if u["estado_cola"] in ("pendiente", "despachada")] == list(range(1, 9))
+        escribir_sql(raiz, "UPDATE cola SET estado_cola = 'pendiente', trabajador_id = NULL, generacion = NULL WHERE secuencia IN (2, 4, 6, 8)")
+
+        # Restos: una carpeta vacía en la ranura (murió nada más crearla) y
+        # metadatos sin directorio (murió a mitad del `remove` o `rm -rf`).
+        vacia = zona(raiz) / "T-0901"
+        vacia.mkdir(parents=True)
+        despacho = trabajadores.despachar(raiz, "T-0901", lanzar=False)
+        METRICAS["DESPACHOS_ACEPTADOS"] += 1
+        assert despacho["arbol_creado"] is True
+        METRICAS["WORKTREES_CREADOS"] += 1
+        nucleo.devolver(raiz, "T-0901", "fin", trabajador_id=despacho["trabajador_id"], generacion=despacho["generacion"])
+        trabajadores.reconciliar_cola(raiz, comprobar_proceso=lambda pid: False)
+
+        shutil.rmtree(zona(raiz) / "T-0901")
+        assert "prunable" in _git(raiz, "worktree", "list", "--porcelain").stdout
+        despacho = trabajadores.despachar(raiz, "T-0901", lanzar=False)
+        METRICAS["DESPACHOS_ACEPTADOS"] += 1
+        assert despacho["arbol_creado"] is True
+        METRICAS["WORKTREES_CREADOS"] += 1
+        assert "prunable" not in _git(raiz, "worktree", "list", "--porcelain").stdout
+        nucleo.devolver(raiz, "T-0901", "fin", trabajador_id=despacho["trabajador_id"], generacion=despacho["generacion"])
+        trabajadores.reconciliar_cola(raiz, comprobar_proceso=lambda pid: False)
+        trabajadores.desencolar(raiz, "T-0901")
+
+        shutil.rmtree(zona(raiz) / "T-0901")
+        resultado = trabajadores.limpiar_arbol(raiz, "T-0901")
+        assert resultado["limpiado"] is True and "restos" in resultado["motivo"], resultado
+        METRICAS["WORKTREES_LIMPIADOS"] += 1
+        assert "prunable" not in _git(raiz, "worktree", "list", "--porcelain").stdout
+
+        # Una carpeta con contenido y sin `.git` NO se toca (puede ser de
+        # alguien).
+        (zona(raiz) / "T-0902").mkdir()
+        (zona(raiz) / "T-0902" / "algo.txt").write_text("x", encoding="utf-8")
+        try:
+            trabajadores.despachar(raiz, "T-0902", lanzar=False)
+            raise AssertionError("Se despachó sobre una carpeta ajena.")
+        except trabajadores.ErrorDespacho as rechazo:
+            contar_rechazo(rechazo)
+            assert rechazo.motivo == trabajadores.RECHAZO_ARBOL
+        assert (zona(raiz) / "T-0902" / "algo.txt").is_file()
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+# ----------------------------------------------------------------------
+# 27. Base de la rama y commit inicial de cada ejecución
+# ----------------------------------------------------------------------
+
+def prueba_27_la_rama_nace_de_una_base_explicita_y_el_commit_inicial_es_de_cada_toma():
+    print(" 27. la rama nace de una base explícita y el commit inicial es el de cada toma:", end=" ")
+
+    raiz = crear_repositorio("base_")
+
+    try:
+        principal = _git(raiz, "rev-parse", "--short", "main").stdout.strip()
+        _git(raiz, "checkout", "-q", "-b", "otra")
+        (raiz / "extra.txt").write_text("extra\n", encoding="utf-8")
+        _git(raiz, "add", "-A")
+        _git(raiz, "commit", "-q", "-m", "extra en otra")
+        otra = _git(raiz, "rev-parse", "--short", "HEAD").stdout.strip()
+
+        ficha_minima(raiz, "T-0901")
+        ficha_minima(raiz, "T-0902")
+        trabajadores.encolar(raiz, "T-0901")
+        trabajadores.encolar(raiz, "T-0902", base="otra")
+        METRICAS["TAREAS_ENCOLADAS"] += 2
+
+        uno = trabajadores.despachar(raiz, "T-0901", lanzar=False)
+        dos = trabajadores.despachar(raiz, "T-0902", lanzar=False)
+        METRICAS["DESPACHOS_ACEPTADOS"] += 2
+        METRICAS["WORKTREES_CREADOS"] += 2
+        assert uno["rama_creada_desde"] == "main" and uno["commit_inicial"] == principal, uno
+        assert dos["rama_creada_desde"] == "otra" and dos["commit_inicial"] == otra, dos
+        assert not (Path(uno["worktree"]) / "extra.txt").exists()
+        assert (Path(dos["worktree"]) / "extra.txt").exists()
+
+        evento = next(e for e in eventos_de(raiz, "T-0901") if e["tipo"] == estado_global.EVENTO_COLA and "Despachada" in e["motivo"])
+        assert evento["datos"]["rama_creada_desde"] == "main"
+
+        ficha_minima(raiz, "T-0903")
+        trabajadores.encolar(raiz, "T-0903", base="no-existe")
+        METRICAS["TAREAS_ENCOLADAS"] += 1
+        try:
+            trabajadores.despachar(raiz, "T-0903", lanzar=False)
+            raise AssertionError("Se creó una rama desde una base inexistente.")
+        except trabajadores.ErrorDespacho as rechazo:
+            contar_rechazo(rechazo)
+            assert rechazo.motivo == trabajadores.RECHAZO_ARBOL and "base" in str(rechazo)
+
+        for informe in (uno, dos):
+            nucleo.devolver(raiz, informe["tarea"], "fin", trabajador_id=informe["trabajador_id"], generacion=informe["generacion"])
+
+        # Segunda ejecución de T-0901 tras un commit en su rama: el commit
+        # inicial es el nuevo HEAD del árbol, y el anterior queda anotado.
+        arbol = Path(uno["worktree"])
+        (arbol / "modulos" / "demostracion").mkdir(parents=True, exist_ok=True)
+        (arbol / "modulos" / "demostracion" / "T-0901.py").write_text("# v1\n", encoding="utf-8")
+        _git(arbol, "add", "-A")
+        _git(arbol, "-c", "user.name=W", "-c", "user.email=w@x", "commit", "-q", "-m", "v1")
+        nuevo = _git(arbol, "rev-parse", "--short", "HEAD").stdout.strip()
+
+        trabajadores.reconciliar_cola(raiz, comprobar_proceso=lambda pid: False)
+        segunda = trabajadores.despachar(raiz, "T-0901", lanzar=False)
+        METRICAS["DESPACHOS_ACEPTADOS"] += 1
+        assert segunda["generacion"] == 2 and segunda["commit_inicial"] == nuevo, segunda
+        toma = next(e for e in eventos_de(raiz, "T-0901") if e["tipo"] == estado_global.EVENTO_TRANSICION and "tomada" in e["motivo"])
+        assert toma["datos"]["commit_inicial_anterior"] == principal, toma["datos"]
+
+        # Y con ese commit inicial, el trabajo de la segunda vuelta que sólo
+        # toca su ámbito no se bloquea por lo confirmado en la primera.
+        informe = trabajadores.ejecutar_trabajador(
+            raiz, "T-0901", segunda["trabajador_id"], 2, segunda["secuencia"], segunda["worktree"],
+            [], tiempo_limite_s=30, intervalo_latido_s=INTERVALO_LATIDO_S, pid_despacho=os.getpid(),
+        )
+        assert informe["resultado"] == trabajadores.RESULTADO_VERIFICADA, informe
+        assert informe["fuera_de_ambito"] == []
+
+        comprobar_integridad(raiz)
     finally:
         borrar(raiz)
 
@@ -2021,6 +3201,19 @@ def prueba_workers_v1(despachadores: int, rondas: int) -> None:
     prueba_12_argv_estructurado_nunca_shell()
     prueba_13_la_consola_expone_las_ordenes()
     prueba_14_estres_entre_procesos(despachadores, rondas)
+    prueba_15_la_transicion_y_el_cierre_van_juntos()
+    prueba_16_la_adopcion_es_exclusiva_y_aguanta_un_candado()
+    prueba_17_un_lanzamiento_fallido_devuelve_la_tarea()
+    prueba_18_una_ficha_invalida_no_para_la_cola()
+    prueba_19_la_reconciliacion_no_pierde_trabajos_ni_reencola_con_el_proceso_vivo()
+    prueba_20_la_toma_no_se_concede_sobre_un_arbol_que_desaparecio()
+    prueba_21_un_enlace_en_la_zona_no_se_sigue()
+    prueba_22_git_no_esconde_escrituras_fuera_del_ambito()
+    prueba_23_el_trabajo_y_sus_nietos_mueren_con_el_trabajador()
+    prueba_24_el_trabajo_ve_su_arbol_y_los_argumentos_no_se_confunden()
+    prueba_25_un_arbol_roto_tras_el_trabajo_no_se_juzga_contra_la_raiz()
+    prueba_26_el_orden_es_el_mismo_en_toda_lectura_y_los_restos_se_reparan()
+    prueba_27_la_rama_nace_de_una_base_explicita_y_el_commit_inicial_es_de_cada_toma()
 
     duracion = time.monotonic() - inicio
 
@@ -2035,16 +3228,16 @@ def prueba_workers_v1(despachadores: int, rondas: int) -> None:
 
     # Cotas mínimas: una corrida que no hiciera nada no puede salir verde.
     minimos = {
-        "TAREAS_ENCOLADAS": 25,
-        "DESPACHOS_ACEPTADOS": 20,
-        "DESPACHOS_RECHAZADOS": 15,
+        "TAREAS_ENCOLADAS": 55,
+        "DESPACHOS_ACEPTADOS": 40,
+        "DESPACHOS_RECHAZADOS": 25,
         "CONFLICTOS_DE_AMBITO_DETECTADOS": 2,
-        "WORKTREES_CREADOS": 12,
-        "WORKTREES_LIMPIADOS": 8,
-        "WORKTREES_RECHAZADOS": 8,
-        "RECUPERACIONES": 5,
-        "CASOS_DUDOSOS_ESCALADOS": 3,
-        "COMPROBACIONES_INTEGRIDAD": 12,
+        "WORKTREES_CREADOS": 30,
+        "WORKTREES_LIMPIADOS": 14,
+        "WORKTREES_RECHAZADOS": 16,
+        "RECUPERACIONES": 8,
+        "CASOS_DUDOSOS_ESCALADOS": 4,
+        "COMPROBACIONES_INTEGRIDAD": 25,
     }
 
     for clave, minimo in minimos.items():
