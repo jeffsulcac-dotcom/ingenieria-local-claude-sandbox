@@ -200,6 +200,40 @@ const ETIQUETAS_ESTADO = {
     "rechazado": "RECHAZADO"
 };
 
+/*
+ * A3.3 — el estado dice en qué punto del ciclo está la tarea; la vitalidad
+ * dice si alguien la está ejecutando ahora mismo. Son cosas distintas y el
+ * tablero no las mezcla. Estas etiquetas sólo traducen lo que el motor ya
+ * decidió: el criterio vive en el supervisor, no aquí.
+ */
+const ETIQUETAS_VITALIDAD = {
+    "ACTIVA": "ACTIVA",
+    "LATIDO_VENCIDO": "LATIDO VENCIDO",
+    "HUERFANA": "HUÉRFANA",
+    "REANUDABLE": "REANUDABLE",
+    "FINALIZADA": "FINALIZADA"
+};
+
+const VITALIDAD_EN_ALERTA = ["LATIDO_VENCIDO", "HUERFANA", "REANUDABLE"];
+
+function duracion(segundos) {
+    if (segundos === null || segundos === undefined) {
+        return "—";
+    }
+
+    const total = Math.max(0, Math.round(segundos));
+
+    if (total < 60) {
+        return total + " s";
+    }
+
+    if (total < 3600) {
+        return Math.floor(total / 60) + " min " + (total % 60) + " s";
+    }
+
+    return Math.floor(total / 3600) + " h " + Math.floor((total % 3600) / 60) + " min";
+}
+
 function escapar(valor) {
     if (valor === null || valor === undefined || valor === "") {
         return "—";
@@ -261,8 +295,22 @@ function dibujarTarea(tarea) {
     );
     bloque += fila("Última actualización", fecha(tarea.actualizado_en));
     bloque += fila("Trabajador", escapar(tarea.trabajador_id));
+    bloque += fila("Generación", escapar(tarea.generacion));
     bloque += fila("PID", escapar(tarea.pid));
+
+    const vitalidad = tarea.vitalidad;
+    const etiquetaVitalidad = ETIQUETAS_VITALIDAD[vitalidad] || escapar(vitalidad);
+    const motivo = tarea.vitalidad_motivo ? " · " + escapar(tarea.vitalidad_motivo) : "";
+
+    bloque += fila(
+        "Vitalidad",
+        VITALIDAD_EN_ALERTA.indexOf(vitalidad) >= 0
+            ? '<span class="pendiente">' + etiquetaVitalidad + motivo + '</span>'
+            : etiquetaVitalidad + motivo
+    );
+
     bloque += fila("Último latido", fecha(tarea.ultimo_latido));
+    bloque += fila("Edad del latido", duracion(tarea.edad_latido_s));
 
     const verificacion = tarea.ultima_verificacion;
 
@@ -270,7 +318,25 @@ function dibujarTarea(tarea) {
         "Última verificación",
         verificacion
             ? escapar(verificacion.resultado) + " · " + escapar(verificacion.ok)
-              + " de " + escapar(verificacion.total) + " · " + fecha(verificacion.fecha)
+              + " de " + escapar(verificacion.total) + " · " + fecha(tarea.verificacion_fecha)
+            : "—"
+    );
+
+    /*
+     * Dónde se verificó. Sin esto, "8 de 8" no dice nada: podría haberse
+     * ejecutado en otro árbol y sobre otro commit que el de la tarea.
+     */
+    bloque += fila(
+        "Verificado en",
+        verificacion
+            ? escapar(tarea.verificacion_raiz)
+            : "—"
+    );
+
+    bloque += fila(
+        "Commit verificado",
+        verificacion
+            ? escapar(tarea.verificacion_commit) + " · " + escapar(tarea.verificacion_rama)
             : "—"
     );
 

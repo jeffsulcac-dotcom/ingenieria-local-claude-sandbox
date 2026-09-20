@@ -2631,8 +2631,32 @@ def resumen_de_tarea(fila: dict, definicion: Ficha | None) -> dict:
 
     verificacion = fila.get("ultima_verificacion")
 
+    # A3.3 — lo que hace falta para saber QUÉ LE PASA a la tarea, no sólo
+    # en qué estado está. Son cosas distintas: REABIERTO es un estado;
+    # que nadie la esté ejecutando y desde cuándo, otra cosa.
+    #
+    # Se calcula aquí y no en la plantilla porque el tablero no debe
+    # reimplementar el criterio de vitalidad: si lo hiciera, tarde o
+    # temprano diría algo distinto de lo que decide la recuperación.
+    senales = vitalidad(fila)
+
     return {
         "id": fila["id"],
+        "vitalidad": senales["vitalidad"],
+        "vitalidad_motivo": senales["motivo"],
+        "edad_latido_s": senales["edad_latido_s"],
+        "verificacion_raiz": (
+            verificacion.get("raiz") if verificacion else None
+        ),
+        "verificacion_commit": (
+            verificacion.get("commit") if verificacion else None
+        ),
+        "verificacion_rama": (
+            verificacion.get("rama") if verificacion else None
+        ),
+        "verificacion_fecha": (
+            verificacion.get("fecha") if verificacion else None
+        ),
         "titulo": fila["titulo"],
         "objetivo": definicion.objetivo if definicion else "",
         "estado": fila["estado"],
