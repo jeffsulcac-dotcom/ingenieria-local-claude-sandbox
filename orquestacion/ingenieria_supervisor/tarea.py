@@ -37,6 +37,7 @@ import json
 import os
 import re
 import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -541,11 +542,39 @@ def listar_con_errores(raiz: Path) -> tuple[list[Ficha], list[dict]]:
     return fichas, errores
 
 
-def temporales_huerfanos(raiz: Path) -> list[Path]:
-    """Temporales abandonados por un corte ocurrido durante una escritura."""
+# Un temporal recién creado NO está abandonado: es una escritura en vuelo.
+# Sin este margen, la recuperación borraba el temporal de OTRO proceso que
+# estaba guardando en ese instante, su `os.replace` fallaba con ENOENT y la
+# pasada entera se abortaba a medias.
+EDAD_TEMPORAL_HUERFANO_S = 300
+
+
+def temporales_huerfanos(
+    raiz: Path, edad_minima_s: int = EDAD_TEMPORAL_HUERFANO_S
+) -> list[Path]:
+    """
+    Temporales abandonados por un corte ocurrido durante una escritura.
+
+    Sólo cuentan los que llevan parados más de `edad_minima_s`. Un temporal
+    joven pertenece con toda probabilidad a una escritura en curso, y
+    borrarlo rompería a quien la está haciendo.
+    """
     carpeta = carpeta_tareas(raiz)
 
     if not carpeta.is_dir():
         return []
 
-    return sorted(carpeta.glob(PREFIJO_TEMPORAL + "*" + SUFIJO_TEMPORAL))
+    limite = time.time() - max(0, edad_minima_s)
+    abandonados = []
+
+    for temporal in sorted(
+        carpeta.glob(PREFIJO_TEMPORAL + "*" + SUFIJO_TEMPORAL)
+    ):
+        try:
+            if temporal.stat().st_mtime <= limite:
+                abandonados.append(temporal)
+        except OSError:
+            # Desapareció mientras mirábamos: no es asunto nuestro.
+            continue
+
+    return abandonados

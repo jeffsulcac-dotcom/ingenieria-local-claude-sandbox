@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 import time
@@ -297,6 +298,29 @@ def _comun_declarado(raiz: Path):
         return None
 
 
+_VARIABLES_GIT_HEREDADAS = (
+    "GIT_DIR",
+    "GIT_COMMON_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_PREFIX",
+)
+
+
+def _entorno_git_limpio() -> dict:
+    """Copia del entorno sin las variables que redirigen a `git`."""
+    entorno = dict(os.environ)
+
+    for nombre in _VARIABLES_GIT_HEREDADAS:
+        entorno.pop(nombre, None)
+
+    return entorno
+
+
 def git_common_dir(raiz: Path) -> Path:
     """
     Directorio común de Git del repositorio que contiene `raiz`.
@@ -351,6 +375,11 @@ def git_common_dir(raiz: Path) -> Path:
             text=True,
             encoding="utf-8",
             errors="replace",
+            # Un `GIT_DIR` heredado —siempre presente dentro de un hook, y
+            # también en `git rebase --exec` o `git bisect run`— hace que
+            # `git` ignore `cwd` y responda por otro repositorio. La base
+            # global se ubicaría entonces en el sitio equivocado.
+            env=_entorno_git_limpio(),
         )
     except OSError as error:
         raise ErrorEstadoGlobal(
@@ -1364,6 +1393,8 @@ def actualizar_si_propietario(
     trabajador_id: str | None = None,
     estados_admitidos=None,
     incrementos=None,
+    exigir_iguales=None,
+    exigir_no_retroceso=None,
 ) -> dict:
     """
     Escritura CONDICIONADA a que quien ordena siga siendo el dueño vigente.
@@ -1384,6 +1415,23 @@ def actualizar_si_propietario(
 
     3. La decisión se toma con `rowcount`, no deduciéndola de una lectura
        anterior hecha en Python.
+
+    Dos precondiciones más, ambas opcionales (A3.3)
+    -----------------------------------------------
+    `exigir_iguales` añade `columna IS ?` por cada entrada. Sirve para las
+    órdenes que deciden mirando una columna que otra orden legítima puede
+    cambiar sin mover ni el estado ni la generación. El caso real: la
+    recuperación clasifica una ejecución leyendo `ultimo_latido` y escribe
+    después; si entre medias el dueño late, ni el estado ni la generación
+    cambian, así que el UPDATE casaba y la tarea se le arrebataba a alguien
+    que acababa de demostrar que estaba vivo. Exigiendo el latido sobre el
+    que se clasificó, esa escritura cae y se informa como rechazada.
+
+    `exigir_no_retroceso` añade `(columna IS NULL OR columna <= ?)`. Sirve
+    para que una marca de tiempo no pueda RETROCEDER: el reloj de pared no es
+    monótono —NTP, cambio de zona, una máquina virtual restaurada— y un
+    latido con la hora atrasada reducía la antigüedad registrada de la
+    señal hasta hacer que la propia tarea pareciese huérfana.
 
     Un rechazo NO es una excepción aquí: se devuelve descrito, igual que en
     `reclamar`. Y no escribe nada: ni estado, ni intentos, ni marcas de
@@ -1456,6 +1504,31 @@ def actualizar_si_propietario(
             "estado IN (" + ", ".join("?" for _ in estados) + ")"
         )
         parametros.extend(estados)
+
+    for nombre, valores in (
+        ("exigir_iguales", exigir_iguales),
+        ("exigir_no_retroceso", exigir_no_retroceso),
+    ):
+        for columna in (valores or {}):
+            if columna not in COLUMNAS_TAREA:
+                raise ErrorEstadoGlobal(
+                    "Columna desconocida en " + nombre + ": '"
+                    + str(columna) + "'."
+                )
+
+    for columna, valor in (exigir_iguales or {}).items():
+        # `IS` y no `=`: con `=`, NULL nunca casa consigo mismo y una fila
+        # cuya columna esté vacía rechazaría una orden correcta.
+        condiciones.append(columna + " IS ?")
+        parametros.append(valor)
+
+    for columna, valor in (exigir_no_retroceso or {}).items():
+        # `<=` y no `<`: escribir el MISMO valor no es un retroceso. Las
+        # marcas están truncadas a segundos, así que dos latidos del mismo
+        # segundo llevan el mismo texto y rechazarlos sería rechazar un
+        # latido correcto.
+        condiciones.append("(" + columna + " IS NULL OR " + columna + " <= ?)")
+        parametros.append(valor)
 
     partes = [columna + " = ?" for columna in campos]
     partes += [columna + " = " + columna + " + 1" for columna in incrementos]

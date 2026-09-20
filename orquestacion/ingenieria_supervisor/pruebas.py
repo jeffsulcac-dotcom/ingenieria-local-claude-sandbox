@@ -87,6 +87,23 @@ def entorno_controlado(raiz: Path) -> dict:
     entorno["PYTHONIOENCODING"] = "utf-8"
     entorno["PYTHONUTF8"] = "1"
 
+    # Las variables que redirigen a `git` no se heredan. Si el Supervisor se
+    # invoca desde un hook, `GIT_DIR` está puesto y apunta al repositorio de
+    # quien llamó: una prueba que consultara Git respondería por OTRO árbol
+    # y su resultado no diría nada del que se está verificando.
+    for nombre in (
+        "GIT_DIR",
+        "GIT_COMMON_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CEILING_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_PREFIX",
+    ):
+        entorno.pop(nombre, None)
+
     return entorno
 
 

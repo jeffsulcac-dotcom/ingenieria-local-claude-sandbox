@@ -724,6 +724,325 @@ Prueba correspondiente:
 
     pruebas/orquestacion/prueba_propiedad_ciclo.py
 
+### A3.3 — Ejecución segura, recuperación y worktrees
+
+A3.1 cerró la toma. A3.2 cerró la propiedad durante todo el ciclo. A3.3
+cierra lo que faltaba para que varios trabajadores puedan ejecutar de
+verdad al mismo tiempo: que cada orden escriba sólo lo suyo, que una
+ejecución larga dé señales de vida, que se sepa distinguir una ejecución
+viva de una muerta sin equivocarse, que se pueda recuperar lo
+interrumpido sin hacer daño, y que las pruebas corran donde dicen que
+corren.
+
+**1. Cada orden escribe sólo sus campos.**
+
+Hasta A3.2, cualquier orden reescribía las quince columnas operativas con
+la foto que tenía en memoria. Con la precondición del WHERE puesta, una
+orden ajena ya no podía colarse, pero dos órdenes LEGÍTIMAS del mismo
+propietario seguían pisándose: la segunda devolvía a su valor viejo todo
+lo que la primera había cambiado y que ella no sabía.
+
+Ahora `persistir` recibe `campos_propios` y el UPDATE lleva sólo esas
+columnas. Cada orden declara las suyas:
+
+| Orden | Columnas que escribe |
+|---|---|
+| `latido` | `ultimo_latido` |
+| `devolver` | `estado` + liberación del trabajador |
+| `verificar` | `estado`, liberación, `ultima_falla`, `ultima_verificacion`, `ejecuciones` |
+| `decidir` | `decisiones`, `requiere_decision_humana` |
+| `reabrir` | `estado`, liberación, `intentos` |
+| `reanudar` | `estado`, liberación, `ejecuciones`, `ultima_falla` |
+
+`actualizado_en` se añade siempre, porque toda escritura lo es.
+
+**Los contadores los cuenta el motor.** `intentos` no se lee en Python
+para volver a escribirlo: se pasa como incremento y el UPDATE emite
+`intentos = intentos + 1`. Leer-sumar-escribir desde dos procesos pierde
+cuentas aunque las precondiciones estén bien puestas, porque los dos leen
+el mismo valor y los dos escriben el mismo resultado.
+
+**2. Latido automático (`LatidoAutomatico`).**
+
+A3.2 hizo segura la orden `latido`; alguien tenía que emitirla. Sin ella,
+una verificación de diez minutos deja la tarea sin señal todo ese rato y
+la recuperación la ve caducada: el trabajo honesto parece abandono.
+
+No es un demonio de trabajadores. Es un acompañante de UNA operación
+concreta, que empieza y termina con ella (es un gestor de contexto, así
+que `__exit__` corre también cuando el trabajo lanza). Escribe sólo
+`ultimo_latido`, con las tres precondiciones de A3.2 —identidad,
+generación y estado `EN_EJECUCION`—, de modo que un latido no puede
+resucitar nada: si la ejecución terminó o la tarea cambió de manos, la
+escritura se rechaza sola y el acompañante se para y lo deja anotado.
+
+La espera es cancelable (`Event.wait`, no `sleep`), no mantiene ninguna
+conexión SQLite abierta entre latidos, y un fallo al latir nunca tumba el
+trabajo principal: se anota y se deja de latir.
+
+La generación hace falta aquí y no es redundante con la identidad. El
+caso es el mismo trabajador que devuelve la tarea y la vuelve a tomar: el
+`trabajador_id` coincide y el estado vuelve a ser `EN_EJECUCION`, así que
+sólo la generación separa el turno viejo del nuevo. Un latido rezagado
+del turno anterior estaría certificando como viva una ejecución que nadie
+está haciendo, y el reloj de abandono no vencería nunca. Lo destapó el
+arnés de mutación: al hacer que el latido leyera la generación de la fila
+en vez de usar la suya, toda la batería seguía en verde.
+
+**3. Vitalidad: cinco estados, nunca una sola señal.**
+
+El estado dice en qué punto del ciclo está la tarea. La vitalidad dice si
+alguien la está ejecutando ahora. Son cosas distintas, y una tarea puede
+quedarse en `EN_EJECUCION` para siempre porque el proceso que la tomó
+murió.
+
+    ACTIVA          hay una ejecución y da señales
+    LATIDO_VENCIDO  hay ejecución, el latido caducó, pero NO está
+                    demostrada muerta
+    HUERFANA        hay una ejecución y está demostrada perdida
+    REANUDABLE      no hay ejecución y la tarea se puede tomar
+    FINALIZADA      no hay ejecución y la tarea no se puede tomar
+
+Nunca se juzga por el PID a secas ni por el latido a secas:
+
+- Un latido vencido (más de `LATIDO_MAXIMO_S = 900` s) **no basta**.
+  Hace falta una segunda señal: o el proceso confirmado muerto, o que la
+  antigüedad pase del umbral de abandono (`LATIDO_ABANDONO_S = 3600` s),
+  que es holgado a propósito. Si no hay segunda señal, se devuelve
+  `LATIDO_VENCIDO`, que informa sin arrebatar.
+- La desaparición del proceso sólo cuenta si además el latido dejó de ser
+  reciente, porque el proceso que reclamó la tarea puede haber sido un
+  mandato breve de línea de órdenes ya terminado. El sistema además
+  reutiliza los PID.
+- Si el trabajador declara OTRA máquina, el PID local no significa nada y
+  se juzga sólo por el latido. «Declara otra» no es lo mismo que «no
+  declara ninguna»: un identificador sin equipo es desconocido, no ajeno,
+  y para él la señal del proceso sí vale.
+
+`vitalidad()` informa y no cambia nada. `clasificar_ejecucion()` es la
+que decide si la recuperación toca o no toca una tarea. Están separadas a
+propósito, pero la primera se apoya en la segunda: el tablero y la
+consola no reimplementan el criterio, porque si lo hicieran acabarían
+diciendo algo distinto de lo que decide la recuperación.
+
+**4. Recuperación idempotente.**
+
+`reanudar` se puede ejecutar dos veces seguidas sin duplicar
+interrupciones, intentos ni eventos, y no le quita la tarea a quien la
+reclamó entre la lectura y la escritura: la escritura lleva la generación
+de la foto, así que si alguien tomó la tarea entretanto el UPDATE no casa
+y la tarea aparece en `reclamadas_mientras_tanto`. Las que tienen el
+latido caducado pero no están demostradas muertas van a `latido_vencido`
+y **no se tocan**: se informan para que una persona las mire, que es lo
+que hay que hacer con una duda.
+
+**5. `verificar()` ejecuta en el worktree de la tarea.**
+
+Antes corría el corredor sobre la raíz desde la que se invocó el
+Supervisor. Una tarea que vivía en el worktree A y se verificaba desde
+`main` ejecutaba las pruebas de `main` y grababa ese resultado como suyo:
+un verde que no dice nada del trabajo que se estaba juzgando y que además
+da por bueno un árbol que nadie miró.
+
+Ahora el árbol se resuelve desde la tarea, el corredor se ejecuta allí, y
+el resultado guarda **dónde** se ejecutó: `raiz`, `rama` y `commit`, más
+`es_worktree`. Sin eso, «8 de 8» no dice nada.
+
+Mientras corre la batería, un `LatidoAutomatico` mantiene viva la
+ejecución; si durante ese rato se pierde la propiedad, `verificar`
+termina en `ErrorPropiedad` en vez de escribir el resultado.
+
+**6. Seguridad de rutas.**
+
+`resolver_worktree` normaliza (`expanduser`, `resolve`) y exige que el
+árbol exista, sea un directorio y comparta el mismo `git_common_dir` que
+la raíz. Se rechaza otro repositorio, una ruta rota y cualquier cosa
+fuera del repositorio. Se aceptan las formas incómodas pero legítimas:
+espacios, `..` en medio, enlaces simbólicos, barra final. Los dos errores
+cuestan: dejar pasar un árbol ajeno corrompe el trabajo, y rechazar uno
+bueno deja al usuario sin poder trabajar donde tiene el proyecto.
+
+La validación ocurre **al tomar**, antes de conceder, y también cuando el
+worktree se hereda de una ejecución anterior en vez de declararse. Si el
+árbol desapareció entre medias, `reanudar` lo dice en `worktree_ausente`
+—sin borrar el dato, porque el árbol puede volver y esa decisión es de
+una persona— y la retoma se rechaza en la toma. Fallar al conceder cuesta
+un mensaje; fallar al verificar cuesta el trabajo entero.
+
+**7. `crear` es atómico.**
+
+La comprobación de existencia y la inserción viven en la misma
+transacción. Con ocho procesos creando la misma tarea a la vez, la crea
+uno y los otros siete reciben `ErrorCreacion`; no queda ficha JSON sin
+fila ni fila sin ficha.
+
+**8. Lo que se ve.**
+
+Tablero y consola muestran, cuando el dato existe: generación,
+vitalidad con su motivo, edad del latido, worktree, y el árbol, la rama y
+el commit en los que se verificó. Sin rediseñar nada: son filas dentro de
+la ficha que ya existía.
+
+**Lo que A3.3 NO hace, y es deliberado.**
+
+- No lanza trabajadores ni ejecuta nada por su cuenta. El latido
+  automático acompaña a una operación del Supervisor; no vigila tareas
+  ajenas ni resucita nada. Lanzar trabajadores es C.
+- No crea ni destruye worktrees de Git. Usa el que la tarea declara.
+- No expira trabajadores por su cuenta: `reanudar` sigue siendo una orden
+  manual. Lo que A3.3 añade es que ahora acierta al juzgar.
+- No hay cola automática ni priorización. Eso es C.
+- No hay acciones desde el tablero: sigue siendo de sólo lectura.
+- El umbral de abandono es un número fijo (3600 s), no una política
+  configurable por tarea.
+
+**Evidencia real de esta implementación.** Batería de 20 comprobaciones
+(`PRUEBA_EJECUCION_SEGURA=OK`), con métricas medidas y comprobadas, no
+declaradas:
+
+    ACTUALIZACIONES_PERDIDAS           = 0
+    ROBOS_INDEBIDOS                    = 0
+    VERIFICACIONES_EN_ARBOL_INCORRECTO = 0
+    ERRORES_SQLITE                     = 0
+    EXCEPCIONES                        = 0
+    FALLOS_INTEGRIDAD                  = 0   (18 `PRAGMA integrity_check`)
+
+Las carreras entre procesos usan `multiprocessing` con contexto `spawn` y
+una barrera compartida, de modo que los procesos arrancan a la vez de
+verdad. La atomicidad de `crear` se comprueba además de forma
+determinista, leyendo el orden real de las sentencias emitidas
+(`BEGIN` < `SELECT` < `INSERT`), porque una carrera puede pasar por
+suerte y un gate no puede depender de eso.
+
+**Pruebas de mutación.** Nueve defectos reintroducidos a propósito sobre
+copias temporales, nueve detectados por la batería:
+
+| | Defecto reintroducido |
+|---|---|
+| A | el latido escribe columnas de más |
+| B | el latido ignora la generación que se le dio |
+| C | `reanudar` roba una tarea viva |
+| D | `verificar` usa el directorio actual en vez del worktree |
+| E | se registra el commit de `main` aunque ejecutara otro árbol |
+| F | `crear` pierde la atomicidad |
+| G | se acepta una ruta de worktree ajena |
+| H | `persistir` vuelve a reescribir todas las columnas |
+| I | `tomar` no valida el worktree heredado |
+
+La B y la I no se detectaban cuando se probaron por primera vez. Las
+comprobaciones 9 y 17 son exactamente los huecos que destaparon.
+
+**Verificación en Windows (PENDIENTE DE EJECUTAR).** Lo de siempre: la
+evidencia de arriba se obtuvo en Linux y Windows es el entorno final
+real. Lo que puede comportarse distinto aquí:
+
+- `multiprocessing` sólo tiene `spawn` (las pruebas ya lo fuerzan, así
+  que ejercitan el mismo camino).
+- Un archivo abierto no se puede borrar mientras alguna conexión siga
+  viva. Es lo que decide si los temporales y los worktrees se pueden
+  limpiar.
+- Los worktrees de Git y los enlaces: en Windows la comprobación 18 usa
+  `junctions` donde en Linux usa enlaces simbólicos, y las letras de
+  unidad y las mayúsculas entran en juego al comparar rutas.
+- Arrancar procesos y `git.exe` es más lento, sobre todo con Defender
+  vigilando la carpeta.
+
+Lo que sí se pudo descartar aquí, que es justo la condición que en
+Windows decide si se puede borrar: la corrida con
+`python -X dev -W error::ResourceWarning` sale con código 0 sin un solo
+aviso, y un detector que instrumenta `sqlite3.connect` cuenta 183
+conexiones abiertas durante la tanda y **0 vivas al terminar**.
+
+Sobre el cronómetro: este archivo hace 130 invocaciones de `git` en el
+proceso padre, 34 de ellas `rev-parse`. En el peor caso medido en esa PC
+(250 ms por invocación), son unos 33 s de un límite de 120 s.
+
+Desde `C:\INGENIERIA_LOCAL\motor`, en PowerShell 7:
+
+    $env:PYTHONPATH = "$PWD;$PWD\nucleo;$PWD\orquestacion"
+    $env:PYTHONUTF8 = "1"
+    $env:PYTHONIOENCODING = "utf-8"
+    $env:PYTHONDONTWRITEBYTECODE = "1"
+
+    # 1. La batería de A3.3, sola y cronometrada.
+    Measure-Command { python .\pruebas\orquestacion\prueba_ejecucion_segura.py } |
+        Select-Object TotalSeconds
+    python .\pruebas\orquestacion\prueba_ejecucion_segura.py
+    if ($LASTEXITCODE -ne 0) { Write-Host "FALLO: codigo $LASTEXITCODE" -ForegroundColor Red }
+
+    # 2. Corrida de estrés ampliada.
+    python .\pruebas\orquestacion\prueba_ejecucion_segura.py --rondas 40
+    if ($LASTEXITCODE -ne 0) { Write-Host "FALLO: codigo $LASTEXITCODE" -ForegroundColor Red }
+
+    # 3. Recursos sin cerrar (lo que decide si Windows puede borrar).
+    python -X dev -W error::ResourceWarning .\pruebas\orquestacion\prueba_ejecucion_segura.py
+    if ($LASTEXITCODE -ne 0) { Write-Host "FALLO: codigo $LASTEXITCODE" -ForegroundColor Red }
+
+    # 4. Regresión completa por el corredor único (A3.1 y A3.2 incluidas).
+    python -m orquestacion.ingenieria_supervisor pruebas --detalle
+    if ($LASTEXITCODE -ne 0) { Write-Host "FALLO: codigo $LASTEXITCODE" -ForegroundColor Red }
+
+    # 5. Un worktree REAL de Windows, de punta a punta.
+    git worktree add ..\wt_gate_a33 -b gate/a33
+    python -m orquestacion.ingenieria_supervisor crear T-9003 `
+        --titulo "Gate A3.3" --objetivo "Comprobar el worktree en Windows" `
+        --ambito "modulos\gate\*.py" --prueba "pruebas\nucleo\prueba_nucleo.py"
+    python -m orquestacion.ingenieria_supervisor tomar T-9003 --trabajador W1 `
+        --worktree ..\wt_gate_a33
+    python -m orquestacion.ingenieria_supervisor estado
+    #    Comprobar a ojo: "Verificado en" debe nombrar wt_gate_a33, NO el motor.
+    python -m orquestacion.ingenieria_supervisor verificar T-9003 --trabajador W1 --generacion 1
+    python -m orquestacion.ingenieria_supervisor estado
+
+    # 6. Una ruta de Windows con espacios, y una unidad distinta si la hay.
+    git worktree add "..\wt con espacios" -b gate/a33-espacios
+    python -m orquestacion.ingenieria_supervisor crear T-9004 `
+        --titulo "Gate A3.3 con espacios" --objetivo "Rutas incomodas" `
+        --ambito "modulos\gate\*.py" --prueba "pruebas\nucleo\prueba_nucleo.py"
+    python -m orquestacion.ingenieria_supervisor tomar T-9004 --trabajador W1 `
+        --worktree "..\wt con espacios"
+
+    # 7. El worktree que desaparece.
+    Remove-Item -Recurse -Force "..\wt con espacios"
+    python -m orquestacion.ingenieria_supervisor reanudar
+    #    Debe aparecer "WORKTREE REGISTRADO QUE YA NO EXISTE" con T-9004.
+    python -m orquestacion.ingenieria_supervisor tomar T-9004 --trabajador W2
+    Write-Host "Codigo esperado distinto de 0, obtenido: $LASTEXITCODE"
+
+    # 8. Que no quedaron temporales ni procesos huérfanos.
+    Get-ChildItem $env:TEMP -Directory -Filter "ejecucion_segura_*"
+    Get-ChildItem $env:TEMP -Directory -Filter "arboles_wt_*"
+    Get-ChildItem $env:TEMP -Directory -Filter "estres_*"
+    Get-ChildItem $env:TEMP -Directory -Filter "rutas con espacios*"
+    Get-Process git, python -ErrorAction SilentlyContinue |
+        Where-Object { $_.StartTime -gt (Get-Date).AddMinutes(-5) }
+
+    # 9. Limpieza del gate.
+    python -m orquestacion.ingenieria_supervisor devolver T-9003 --trabajador W1 --generacion 1
+    git worktree remove ..\wt_gate_a33 --force
+    git worktree prune
+    git branch -D gate/a33 gate/a33-espacios
+
+Los pasos 5 a 7 usan tareas de usar y tirar (`T-9003`, `T-9004`); bórralas
+después. **No se deben ejecutar sobre T-0001 ni T-0002**, que tienen que
+seguir en estado NUEVA y sin ejecutar.
+
+Criterio para decidir que Windows pasó, los siete a la vez:
+
+1. La corrida (1) imprime `PRUEBA_EJECUCION_SEGURA=OK`, sale con código 0
+   y reporta las seis métricas de arriba en 0.
+2. Tarda claramente por debajo de los 120 s.
+3. La (2) reporta 0 actualizaciones perdidas y 0 errores SQLite.
+4. La (3) sale con código 0, sin avisos.
+5. La (4) da 8 de 8 archivos de prueba en OK.
+6. En la (5), `Verificado en` nombra el worktree y no la raíz del motor;
+   en la (7) aparece el aviso de worktree ausente y la retoma falla.
+7. La (8) no devuelve nada.
+
+Prueba correspondiente:
+
+    pruebas/orquestacion/prueba_ejecucion_segura.py
+
 ### Implementado y probado
 
 - Ficha de tarea con contrato completo y validación.

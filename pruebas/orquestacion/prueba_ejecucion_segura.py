@@ -616,27 +616,73 @@ def prueba_d_verificar_ejecuta_en_el_worktree_de_la_tarea():
 
 def prueba_e_una_ruta_ajena_no_se_ejecuta():
     """
-    Una ruta que existe no es, por eso, una ruta que se pueda ejecutar.
+    Sólo un worktree REGISTRADO en Git sirve como árbol de ejecución.
 
-    Un worktree registrado apuntando fuera del proyecto —por error o a
-    propósito— haría que `verificar` corriera código de otro sitio y grabara
-    su resultado como si fuera el de esta tarea.
+    Que una ruta exista, y hasta que sea un repositorio Git válido, no
+    autoriza a correr sus pruebas y grabar el resultado como si fuera el de
+    esta tarea.
+
+    La comprobación es la lista canónica de `git worktree list`, y no
+    comparar el directorio común. Ese valor no lo decide el repositorio: lo
+    decide un archivo `.git` de una línea que vive en el directorio
+    candidato. Copiar un worktree con `cp -a`, moverlo sin
+    `git worktree repair`, o escribir a mano `gitdir: …` en cualquier
+    carpeta, producía un directorio que se aceptaba y que Git no ha listado
+    nunca; y como la rama y el commit se leían de ese `.git` prestado, la
+    evidencia grabada era la del worktree legítimo. El historial afirmaba
+    haber verificado un commit que nadie ejecutó.
+
+    Un subdirectorio cualquiera tampoco vale: el corredor descubre
+    `<arbol>/pruebas/**/prueba_*.py`, así que un subdirectorio con una sola
+    prueba verde dentro bastaba para llegar a PROPUESTO saltándose la
+    batería entera.
     """
-    print("  5. una ruta ajena o rota no se verifica:", end=" ")
+    print("  5. sólo un worktree registrado sirve de árbol:", end=" ")
 
     principal = crear_repositorio("ajena_")
     ajeno = crear_repositorio("ajeno_otro_")
 
     try:
-        for caso, ruta, fragmento in (
-            ("otro repositorio", str(ajeno), "OTRO"),
+        _git(principal, "add", "-A")
+        _git(principal, "commit", "-q", "-m", "base")
+
+        # Un worktree legítimo, para tener con qué comparar.
+        legitimo = principal.parent / (principal.name + "_wt")
+        alta = _git(principal, "worktree", "add", str(legitimo), "-b", "rama-l")
+        assert alta.returncode == 0, alta.stderr
+
+        # Y una COPIA de ese worktree en otro sitio: conserva el archivo
+        # `.git`, así que declara el mismo directorio común. Git no la ha
+        # listado nunca.
+        impostor = principal.parent / (principal.name + "_impostor")
+        shutil.copytree(legitimo, impostor, symlinks=True)
+
+        casos = (
+            ("otro repositorio", str(ajeno), "no es un worktree registrado"),
             ("no existe", str(principal / "no_existe"), "no existe"),
             (
                 "no es un directorio",
                 str(principal / "pruebas" / "demostracion" / "prueba_verde.py"),
                 "no es un directorio",
             ),
-        ):
+            (
+                "copia con el .git prestado",
+                str(impostor),
+                "no es un worktree registrado",
+            ),
+            (
+                "subdirectorio cualquiera",
+                str(principal / "pruebas"),
+                "no es un worktree registrado",
+            ),
+            (
+                "la carpeta .git",
+                str(principal / ".git"),
+                "no es un worktree registrado",
+            ),
+        )
+
+        for caso, ruta, fragmento in casos:
             METRICAS["OPERACIONES"] += 1
 
             try:
@@ -654,19 +700,46 @@ def prueba_e_una_ruta_ajena_no_se_ejecuta():
                     "Se aceptó una ruta que no debía: " + caso
                 )
 
+        # El worktree legítimo sí se acepta: la validación no es un muro.
+        assert nucleo.resolver_worktree(principal, str(legitimo)) == (
+            legitimo.resolve()
+        ), "Se rechazó un worktree que Git sí tiene registrado."
+        METRICAS["ACEPTADAS"] += 1
+
         # Sin worktree declarado se usa la raíz, que es el caso normal.
-        assert nucleo.resolver_worktree(principal, None) == principal
-        assert nucleo.resolver_worktree(principal, "  ") == principal
+        assert nucleo.resolver_worktree(principal, None) == principal.resolve()
+        assert nucleo.resolver_worktree(principal, "  ") == principal.resolve()
 
-        # Una ruta RELATIVA se interpreta contra la raíz, no contra el
-        # directorio desde el que se invocó el Supervisor.
-        subdirectorio = principal / "pruebas"
+        # GIT_DIR heredado —siempre puesto dentro de un hook de Git, y
+        # también en `git rebase --exec` o `git bisect run`— no puede
+        # anular la comprobación. Antes sí lo hacía: con él, `git` ignoraba
+        # el directorio de trabajo, las dos consultas devolvían lo mismo y
+        # se llegaba a aceptar cualquier ruta del sistema.
+        previo = os.environ.get("GIT_DIR")
+        os.environ["GIT_DIR"] = str(principal / ".git")
 
-        assert nucleo.resolver_worktree(principal, "pruebas") == (
-            subdirectorio.resolve()
-        ), "Una ruta relativa no se resolvió contra la raíz de la tarea."
+        try:
+            METRICAS["OPERACIONES"] += 1
+
+            try:
+                nucleo.resolver_worktree(principal, str(ajeno))
+            except nucleo.ErrorWorktree:
+                METRICAS["RECHAZADAS"] += 1
+            else:
+                METRICAS["ACEPTADAS"] += 1
+                raise AssertionError(
+                    "Con GIT_DIR en el entorno se aceptó un repositorio "
+                    "ajeno: la comprobación de pertenencia no comprueba nada."
+                )
+        finally:
+            if previo is None:
+                os.environ.pop("GIT_DIR", None)
+            else:
+                os.environ["GIT_DIR"] = previo
     finally:
         borrar(ajeno)
+        borrar(principal.parent / (principal.name + "_impostor"))
+        borrar(principal.parent / (principal.name + "_wt"))
         borrar(principal)
 
     print("OK")

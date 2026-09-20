@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -812,13 +813,14 @@ def prueba_reanudar_detecta_latido_vencido():
 
         # El proceso sigue vivo, pero hace CINCO HORAS que no da señales.
         #
-        # Desde A3.3 un latido vencido no basta por sí solo para declarar
-        # abandono: hay que confirmarlo con el proceso. Cinco horas, en
-        # cambio, superan el umbral de abandono (una hora), que es el único
-        # que decide solo y por eso se fijó holgado: tanto tiempo sin una
-        # señal que se emite automáticamente mientras dura el trabajo ya no
-        # admite otra lectura. Por eso aquí sí sale huérfana pese al PID
-        # vivo, y el motivo lo dice con precisión.
+        # Un latido vencido no basta para declarar abandono, y el umbral de
+        # abandono TAMPOCO decide solo. Un proceso vivo y comprobable es una
+        # señal fuerte que contradice al latido: mientras exista, no hay
+        # abandono demostrado, dure lo que dure el silencio. Lo más probable
+        # aquí es que el hilo del latido haya muerto y el trabajador siga
+        # trabajando; quitarle la tarea sería tirar su trabajo.
+        #
+        # Se informa para que lo mire una persona, y no se toca nada.
         futuro = datetime.now(timezone.utc) + timedelta(hours=5)
 
         informe = nucleo.reanudar(
@@ -827,9 +829,40 @@ def prueba_reanudar_detecta_latido_vencido():
             comprobar_proceso=lambda pid: True,
         )
 
-        assert len(informe["huerfanas"]) == 1
-        assert "umbral de abandono" in informe["huerfanas"][0]["motivo"], (
-            informe["huerfanas"][0]["motivo"]
+        assert informe["huerfanas"] == [], (
+            "Se recuperó una ejecución con el proceso vivo: "
+            + repr(informe["huerfanas"])
+        )
+        assert len(informe["latido_vencido"]) == 1, (
+            "No se informó del latido vencido: " + repr(informe)
+        )
+        assert "sigue vivo" in informe["latido_vencido"][0]["motivo"], (
+            informe["latido_vencido"][0]["motivo"]
+        )
+        assert "umbral de abandono" in informe["latido_vencido"][0]["motivo"], (
+            "El aviso no menciona cuánto lleva sin latir: "
+            + informe["latido_vencido"][0]["motivo"]
+        )
+
+        # La tarea sigue siendo de su dueño.
+        viva = fichas.leer(raiz, "T-0001")
+
+        assert viva.estado == Estado.EN_EJECUCION
+        assert viva.trabajador_id is not None
+
+        # Con el proceso muerto SÍ hay dos señales, y entonces se recupera.
+        segundo = nucleo.reanudar(
+            raiz,
+            ahora=futuro,
+            comprobar_proceso=lambda pid: False,
+        )
+
+        assert len(segundo["huerfanas"]) == 1, (
+            "Con el proceso muerto y el latido vencido debía recuperarse: "
+            + repr(segundo)
+        )
+        assert "dos señales" in segundo["huerfanas"][0]["motivo"], (
+            segundo["huerfanas"][0]["motivo"]
         )
 
         assert fichas.leer(raiz, "T-0001").estado == Estado.REABIERTO
@@ -865,12 +898,30 @@ def prueba_reanudar_detecta_ficha_inconsistente():
 
         informe = nucleo.reanudar(raiz)
 
-        assert len(informe["inconsistentes"]) == 1
-        assert "sin identidad completa" in informe["inconsistentes"][0]["motivo"]
+        # Desde A3.3 una fila incompleta se INFORMA y no se toca. No
+        # demuestra que el trabajador esté muerto —puede estar vivo y
+        # latiendo—, y liberarla se la quitaba. La salida es `reabrir`,
+        # que es una orden humana.
+        assert informe["inconsistentes"] == [], (
+            "Se liberó una fila incompleta sin comprobar nada: "
+            + repr(informe["inconsistentes"])
+        )
+        assert len(informe["inconsistentes_sin_tocar"]) == 1, (
+            "No se informó de la fila incompleta: " + repr(informe)
+        )
+        assert (
+            "sin identidad completa"
+            in informe["inconsistentes_sin_tocar"][0]["motivo"]
+        )
+
+        assert nucleo.cargar(raiz, "T-0001").estado == Estado.EN_EJECUCION, (
+            "La recuperación cambió el estado de una fila que no debía tocar."
+        )
+
+        # Y una persona la desbloquea con `reabrir`.
+        nucleo.reabrir(raiz, "T-0001", "Fila incompleta revisada a mano.")
 
         assert nucleo.cargar(raiz, "T-0001").estado == Estado.REABIERTO
-
-        # El espejo JSON quedó regenerado desde SQLite.
         assert fichas.leer(raiz, "T-0001").estado == Estado.REABIERTO
 
     finally:
@@ -889,6 +940,24 @@ def prueba_reanudar_limpia_temporales_abandonados():
             / (fichas.PREFIJO_TEMPORAL + "roto" + fichas.SUFIJO_TEMPORAL)
         )
         basura.write_text("{ esto no es json", encoding="utf-8")
+
+        # Un temporal recién escrito NO está abandonado: es una escritura en
+        # vuelo, probablemente de otro proceso. Borrarlo rompía su
+        # `os.replace` y abortaba la pasada de recuperación a medias.
+        assert fichas.temporales_huerfanos(raiz) == [], (
+            "Un temporal recién creado se consideró abandonado."
+        )
+
+        en_vuelo = nucleo.reanudar(raiz)
+
+        assert en_vuelo["temporales_eliminados"] == [], (
+            "La recuperación borró un temporal que podía estar en uso."
+        )
+        assert basura.exists()
+
+        # Envejecido, sí es basura de un corte.
+        viejo_ts = time.time() - fichas.EDAD_TEMPORAL_HUERFANO_S - 60
+        os.utime(basura, (viejo_ts, viejo_ts))
 
         assert len(fichas.temporales_huerfanos(raiz)) == 1
 
