@@ -245,6 +245,9 @@ describe arriba es cómo estaba el sistema al cerrar A3.1.
   temporal sigue pendiente, y pasa a A3.3.
 - No hay latidos automáticos, expiración de trabajadores, detección de
   trabajadores muertos ni recuperación automática de tareas abandonadas.
+  **SUPERADO EN A3.3 Y T-0003**: latido automático, clasificación con dos
+  señales y recuperación de huérfanas (`reanudar`), cola reconciliada;
+  la expiración por tiempo sigue siendo manual (Workers V2).
 - El espejo JSON se escribe DESPUÉS del COMMIT, con lo que la transacción
   confirmó. Si otra orden se cruza en esa ventana (de microsegundos), el
   JSON queda desfasado respecto de SQLite hasta la siguiente operación
@@ -1471,8 +1474,8 @@ Lo nuevo vive en `trabajadores.py` (cola, despacho, árboles, limpieza,
 reconciliación y cuerpo del trabajador) y `trabajador.py` (el proceso).
 La ficha `T-0003.json` es el contrato original del usuario; la rama se
 desarrolló con un único escritor y se cerró tras una ronda de auditoría
-adversarial (siete revisores de sólo lectura, R1) y otra focalizada (R2),
-descritas al final de esta sección.
+adversarial (siete revisores de sólo lectura, R1) y otra focalizada
+(tres revisores, R2), descritas al final de esta sección.
 
 **1. La cola vive en la base global (tabla `cola`, migración 3).**
 
@@ -1609,12 +1612,20 @@ Su ciclo:
    árbol: `Popen(lista, cwd=árbol, shell=False)` en su PROPIO grupo de
    procesos, con la salida a un archivo (`<registro>.trabajo.log`, del que
    sólo se lee la cola) y no a tuberías, y con el ejecutable resuelto por
-   PATH aquí (`shutil.which`) cuando viene sin ruta. Al agotar el tiempo
-   límite, o si el trabajador recibe SIGTERM/SIGINT, se mata el grupo
-   ENTERO (`killpg`): un nieto que el trabajo hubiera lanzado no
-   sobrevive para seguir escribiendo en el árbol (en Windows sólo muere
-   el hijo directo: un Job Object queda para V2). Sin trabajo encolado,
-   sólo verifica.
+   PATH aquí (`shutil.which`) cuando viene sin ruta, y la RUTA resuelta
+   se vuelve a juzgar: un `.cmd` que `PATHEXT` resolviera, o algo del
+   directorio actual que no está en el PATH, no se ejecutan (R2). El PID
+   del trabajo se anota en la entrada de la cola nada más lanzarlo (si
+   no se puede anotar, el trabajo se mata y cuenta como no lanzado):
+   la recuperación lo tiene en cuenta si el trabajador muere en seco.
+   Al agotar el tiempo límite, o si el trabajador recibe SIGTERM/SIGINT,
+   se mata el grupo ENTERO (`killpg`; en Windows `taskkill /T`, que no
+   alcanza a un nieto desligado: un Job Object queda para V2), y al
+   terminar el trabajo se mata lo que hubiera dejado vivo en su grupo:
+   un nieto no sobrevive para seguir escribiendo en el árbol después de
+   PROPUESTO. Las señales de terminación se aplazan entre el `Popen` y
+   su anotación, y sólo la PRIMERA interrumpe: una segunda durante la
+   devolución no la corta (R2). Sin trabajo encolado, sólo verifica.
 3. Comprueba que TODO lo que la ejecución tocó cae en el ámbito concedido:
    lo confirmado desde el `commit_inicial` de ESTA toma, tanto en HEAD
    como en la punta de la rama de la tarea (confirmar fuera y volver con
@@ -1625,10 +1636,14 @@ Su ciclo:
    borrase su `.git` haría que Git respondiera por la raíz). Los
    comodines aquí no cruzan directorios (`*` no vale `/`; `**` sí, con la
    semántica de `.gitignore`): el error cae del lado de «fuera». Y la
-   RAÍZ se compara antes y después (su checkout salvo el espejo JSON del
-   Supervisor, `.git/config` y los hooks): un `../..` mal calculado o un
-   `git config` del trabajo se ven. Un árbol que quedó en otra rama o con
-   HEAD separada cuenta como fuera del ámbito.
+   RAÍZ se compara antes y después: de su checkout cuentan sólo las
+   rutas NUEVAS que caen en el ámbito concedido —el `../..` mal
+   calculado; lo demás que aparezca es el usuario, que trabaja ahí, y
+   bloquear por ello era un falso positivo frecuente (R2)—, y además
+   `.git/config`, `.git/info/exclude` y los hooks, escriba quien
+   escriba. Un `tag`, un `stash` o el `.gitignore` del árbol no se
+   miran: es una red contra el descuido. Un árbol que quedó en otra
+   rama o con HEAD separada cuenta como fuera del ámbito.
 4. `verificar` en el árbol registrado, con el corredor único.
 
 Cada salida deja la tarea coherente y la entrada cerrada con el resultado,
@@ -1645,7 +1660,14 @@ sería un verde falso); escritura fuera del ámbito o del árbol → BLOQUEADO
 ser válido → devuelta, código 6; la propiedad perdida a mitad → la entrada
 se cierra como fallida si aún es suya (quien quitó la tarea decide si la
 vuelve a encolar); el propio trabajador averiado o interrumpido → intenta
-devolver y cerrar antes de salir (código 2). Códigos: 0 propuesta, 1 no
+devolver con el cierre dentro, reintentando ante un candado de la base;
+si no puede por PROPIEDAD o ESTADO, cierra sola la entrada si aún es
+suya; si no puede por un error transitorio, no toca nada («EN_EJECUCION
++ despachada» lo recuperan `reanudar` y la reconciliación; «EN_EJECUCION
++ cerrada» no lo recuperaba nadie, R2) y sale con código 2. Un fallo del
+espejo JSON después del COMMIT (`ErrorEspejo`: archivo abierto por otro
+proceso) es éxito con aviso en el despacho, la adopción, el latido y
+las transiciones, nunca un rechazo (R2). Códigos: 0 propuesta, 1 no
 propuesta, 2 avería, 4 no era suya, 6 el árbol no sirve.
 
 **5. Limpieza: nunca `--force`, nunca fuera de la zona, nunca sin
@@ -1662,14 +1684,25 @@ sólo viva ahí se perdería), cuando la tarea está EN_EJECUCION o su entrada
 sigue despachada, cuando el árbol tiene CUALQUIER cosa sin confirmar,
 versionada o no (un nombre con espacios y acentos incluido: `git status
 -z`), y cuando tiene archivos IGNORADOS por Git (salidas, modelos, un
-`.env`; el bytecode de Python se exceptúa porque se regenera solo). Decide
-y borra CON el candado de escritura tomado —la única operación del
-paquete que hace Git dentro de una transacción, a propósito: un
-`despachar` simultáneo ya no puede reutilizar el árbol entre la decisión
-y el `remove`—. Lo que pasa todo eso se retira con `git worktree remove`
-a secas; la rama de la tarea conserva sus commits. Lo que hay en la zona
-con un nombre que no es de tarea, o que es un enlace, se informa y no se
-toca.
+`.env`; el bytecode de Python se exceptúa porque se regenera solo). Lo
+que el árbol contiene se mira SIN el candado (`status` sobre un árbol
+grande tarda segundos y el candado es el de toda la base, R2); el estado
+de la tarea y de su entrada se deciden, y el árbol se retira, CON el
+candado de escritura tomado —la única orden de Git del paquete dentro de
+una transacción, a propósito y con tope de 30 s: un `despachar`
+simultáneo ya no puede reutilizar el árbol entre la decisión y el
+`remove` (la comprobación 32 lo reproduce de verdad)—. Lo que pasa todo
+eso se retira con `git worktree remove` a secas (que vuelve a negarse
+por sí mismo ante cambios aparecidos entre medias); la rama de la tarea
+conserva sus commits, y es la que la ficha exige (`rama`), no siempre
+`tarea/<id>`. Lo que hay en la zona con un nombre que no es de tarea, o
+que es un enlace, se informa y no se toca; una zona que es un enlace
+rechaza limpiar y despachar. Los restos de un `worktree add` o `remove`
+interrumpidos se reparan sin `git worktree prune` (que poda TODAS las
+entradas prunables del repositorio y destrozaba un worktree del usuario
+en un disco desconectado, R2): sólo los metadatos cuya `gitdir` apunta
+a la ranura, y un directorio vacío sólo si tiene más de 5 s (Git lo crea
+antes de registrarlo).
 
 **6. Recuperación: la cola sigue a la tarea, y ante la duda no se libera
 nada.**
@@ -1687,12 +1720,21 @@ que terminó por otra vía (propuesta, bloqueada, aprobada, rechazada) se
 cierra como TERMINADA con nota; la de una ejecución que sigue viva con el
 mismo trabajador y generación —incluido el latido vencido con el proceso
 vivo, el trabajador de otra máquina y la fila incompleta— NO se toca, y
-`reanudar` la escala a una persona igual que a la tarea. Y SALVO que el
-proceso trabajador de la entrada (el PID que adoptó) siga vivo en esta
-máquina: entonces tampoco se reencola —un segundo lanzamiento escribiría
-en el mismo árbol a la vez que el primero— y se informa como duda
-(`CON EL PROCESO TRABAJADOR VIVO Y LA TAREA YA EN OTRAS MANOS`; `reanudar`
-devuelve 1). Una entrada pendiente de una tarea APROBADA se retira.
+`reanudar` la escala a una persona igual que a la tarea. Y SALVO que haya
+DUDA sobre una entrada ADOPTADA: su proceso trabajador (`pid`) o su
+trabajo (`pid_trabajo`) siguen vivos en esta máquina, o su trabajador es
+de OTRO equipo (desde aquí no hay segunda señal): entonces ni se
+reencola —un segundo lanzamiento escribiría en el mismo árbol a la vez
+que el primero— ni se cierra —una limpieza borraría el árbol debajo del
+trabajo que una orden humana dejó atrás—, y se informa con el motivo
+(`CON DUDA: ...`; `reanudar` devuelve 1). La salida la decide una
+persona: `desencolar` retira también una despachada cuya ejecución ya no
+existe (un PID reutilizado, un trabajador ajeno que nadie puede
+comprobar) y deja los PID en el resultado para que mire el árbol antes
+de limpiarlo; una despachada con la ejecución viva sigue sin poder
+retirarse. Antes de la adopción `cola.pid` es el del despacho, que no
+ejecuta nada: esa entrada no es duda y vuelve a la cola (R2). Una
+entrada pendiente de una tarea APROBADA se retira.
 
 El despacho que muere después de confirmar y antes de lanzar deja la fila
 con su propio PID, ya muerto: dentro del margen de cortesía es ACTIVA;
@@ -1705,7 +1747,7 @@ retrocederla).
 
 **Órdenes nuevas.**
 
-    python -m orquestacion.ingenieria_supervisor encolar T-0003 --prioridad 5 --trabajo python herramienta.py "un argumento"
+    python -m orquestacion.ingenieria_supervisor encolar T-0003 --prioridad 5 [--base main] --trabajo python herramienta.py "un argumento"
     python -m orquestacion.ingenieria_supervisor cola [--json]
     python -m orquestacion.ingenieria_supervisor despachar [T-0003] [--trabajador W]
     python -m orquestacion.ingenieria_supervisor desencolar T-0003 [--motivo "..."]
@@ -1725,12 +1767,21 @@ motivo de cada uno. `reanudar` imprime además lo que hizo con la cola.
   Encadenarlos es de n8n o de un guion.
 - Expirar o matar trabajadores: `reanudar` sigue siendo manual y no
   libera ante la duda.
-- En Windows, matar al trabajo mata sólo al hijo directo (sin Job
-  Object); un nieto puede sobrevivir. `CREATE_BREAKAWAY_FROM_JOB` y
-  `DETACHED_PROCESS` no se han ejecutado en Windows: lo comprueba el gate.
+- En Windows, matar al trabajo usa `taskkill /T` (el árbol de procesos
+  por PID padre): un nieto que se hubiera desligado sobrevive, y al
+  terminar el trabajo no hay grupo que consultar (sin Job Object).
+  Un proceso `DETACHED_PROCESS` no recibe señales de consola: el
+  manejador de señales del trabajador sólo actúa en POSIX. Nada de
+  esto se ha ejecutado en Windows: lo comprueba el gate.
 - Reutilización de PID: sigue acotada en la dirección segura (A3.3). Un
-  PID de trabajador reutilizado por otro programa deja la entrada como
-  «proceso vivo» hasta que una persona la retire.
+  PID de trabajador o de trabajo reutilizado por otro programa deja la
+  entrada como duda hasta que una persona la retire con `desencolar`.
+- Un candado huérfano de Git (`locked initializing` tras matar un
+  `worktree add`; `index.lock` tras matar un `git` del trabajo) no se
+  retira solo: el despacho espera con tope y dice la receta
+  (`git worktree unlock` + `remove --force`; borrar `index.lock`).
+  Retirar un candado ajeno a ciegas podría romper un `worktree add`
+  lento en curso.
 - Acciones desde el tablero web, que sigue sin conocer la cola.
 - Un trabajo que modifica el Supervisor de su árbol se verifica con el
   corredor de ese árbol (es lo que se juzga); el trabajador y sus
@@ -1741,10 +1792,16 @@ motivo de cada uno. `reanudar` imprime además lo que hizo con la cola.
   herramienta local sin autenticación, no una garantía técnica; la
   comparación de la raíz antes y después es una red contra el descuido,
   no contra la mala fe.
-- La rama de una tarea nueva nace de `main` cuando existe. Si `main`
-  está por detrás de lo que la tarea necesita, se indica la base al
-  encolar (`encolar(..., base=...)` por la API; la consola no lo expone
-  todavía).
+- La rama de una tarea nueva nace de `main` cuando existe; si no, del
+  HEAD de la raíz. Si `main` está por detrás de lo que la tarea necesita
+  (en este repositorio lo está: la raíz trabaja en `tarea/T-0003`), se
+  indica la base al encolar (`encolar T-0003 --base <ref>`). Qué base
+  debe ser la de omisión (`main`, la rama de la raíz, `origin/main`) es
+  una DECISIÓN DE INGENIERÍA pendiente, marcada para revisión humana
+  (auditoría R2).
+- La huella de la raíz no mira `tag`, `stash` ni el `.gitignore` del
+  árbol: un trabajo puede esconder un archivo fuera del ámbito tras un
+  patrón ignorado. Red contra el descuido, no contra la mala fe.
 - La migración 3 la aplica cualquier orden de esta build, también las de
   sólo lectura (patrón heredado de A2): una build anterior sobre la misma
   base común queda en `ESQUEMA_MAS_NUEVO` hasta integrar.
@@ -1764,7 +1821,7 @@ misma rama (a6e4f0c) y tiene su comprobación en la batería.
 | 4 | Un `Popen` fallido tras la toma dejaba la tarea EN_EJECUCION sin nadie y la excepción escapaba de `despachar` | CONFIRMADO | 17 |
 | 5 | Una ficha ilegible, sin ámbito o con patrones no relativos en cabeza paraba la cola entera; `cola` la mostraba «despachable» | CONFIRMADO | 18 |
 | 6 | `reconciliar_cola` cerraba como terminada la entrada de una tarea retomada a mano por otro (trabajo perdido), y reencolaba aunque el proceso trabajador siguiera vivo (dos trabajos en el mismo árbol) | CONFIRMADO | 19 |
-| 7 | `limpiar_arbol` decidía sin candado (TOCTOU con `despachar`); `al_conceder` no comprobaba que el árbol siguiera | CONFIRMADO | 20 |
+| 7 | `limpiar_arbol` decidía sin candado (TOCTOU con `despachar`); `al_conceder` no comprobaba que el árbol siguiera | CONFIRMADO | 20 (el árbol que desaparece), 32 (la carrera real, desde R2) |
 | 8 | Un enlace simbólico en la zona con nombre de otra tarea hacía borrar el árbol de la ejecución viva de esa otra tarea; la zona enlazada dejaba residuos | CONFIRMADO | 21 |
 | 9 | Confirmar fuera del ámbito y volver con `checkout --detach`; un `git mv` desde fuera; `skip-worktree`: invisibles a la comprobación de ámbito | CONFIRMADO | 22 |
 | 10 | La limpieza borraba archivos ignorados por Git y un árbol con HEAD separada (commits sueltos) | CONFIRMADO | 22 |
@@ -1775,7 +1832,7 @@ misma rama (a6e4f0c) y tiene su comprobación en la batería.
 | 15 | `ORDER BY prioridad DESC` sin desempate desordenaba las vivas mezcladas y nadie lo miraba; restos de `worktree add/remove` interrumpidos bloqueaban el despacho para siempre | CONFIRMADO | 26 |
 | 16 | La rama nueva nacía del HEAD que la raíz tuviera extraído; `commit_inicial` se heredaba de la ejecución anterior y bloqueaba la segunda vuelta | CONFIRMADO | 27 |
 | 17 | El gancho `al_conceder` podía alterar la fila de la toma sin que nadie lo comprobara; el evento de cola se insertaba antes que el de la toma | CONFIRMADO | 6 (orden de eventos), guarda en `tomar` |
-| 18 | Escrituras fuera del árbol (raíz, `.git/config`, hooks) invisibles | CONFIRMADO (red contra el descuido) | 22, `huella_de_la_raiz` |
+| 18 | Escrituras fuera del árbol (raíz, `.git/config`, hooks) invisibles | CONFIRMADO (red contra el descuido) | 34 (desde R2), `huella_de_la_raiz` |
 | 19 | `cola.pid` era el del despacho; eventos `cola` sin estado; `ultimo_rechazo` crudo en `--json`; registro compartido entre lanzamientos; prioridad de más de 64 bits; encolar una aprobada; `diagnostico` con base más nueva; docstrings rancios | CONFIRMADO (menores) | 4, 6, 11, 18, 26 |
 | 20 | La lectura previa `_por_que_no_se_despacha` sólo miraba el ámbito grabado y `cola` podía decir «despachable» de lo que `tomar` iba a rechazar | CONFIRMADO (informativo) | 19 |
 | 21 | Un trabajo puede leer la base o llamar a `aprobar`; el trabajo corre como el usuario | FUERA DE ALCANCE (modelo de confianza de una herramienta local; documentado arriba) | — |
@@ -1806,18 +1863,70 @@ se reintroduce sola y la batería tiene que fallar:
 | · no cerrar la del trabajo fallido | 7 |
 | · cerrar la entrada en OTRA transacción, después de la transición | 7 |
 
+**Auditoría focalizada R2 (tres revisores de sólo lectura, en paralelo,
+sobre a6e4f0c: concurrencia, transacciones y recuperación; procesos,
+Git y zona controlada; la batería y las regresiones A3.1–A3.3).** Cada
+hallazgo se reprodujo en repositorios temporales antes de clasificarlo;
+lo CONFIRMADO se corrigió en esta misma rama y tiene su comprobación
+(28–36, y las aserciones débiles reparadas).
+
+| # | Hallazgo | Clasificación | Comprobación |
+|---|---|---|---|
+| 1 | SIGKILL al trabajador dejaba el TRABAJO vivo (sesión propia, PID desconocido) y la recuperación relanzaba sobre el mismo árbol | CONFIRMADO (reproducido: dos trabajos en el mismo árbol) | 28, 11 |
+| 2 | Un candado retenido más que `busy_timeout` durante la transición dejaba «EN_EJECUCION + entrada FALLIDA», que nadie recuperaba, y perdía la corrida | CONFIRMADO | 29 |
+| 3 | `limpiar_arbol` hacía `git status` ×2 y `worktree remove` con el candado de toda la base, sin tope | CONFIRMADO (lecturas fuera; `remove` con tope) | 32 (sigue bajo candado), 20 |
+| 4 | Un fallo del espejo JSON tras el COMMIT se confundía con un rechazo en la adopción (código 4 con la fila adoptada), el despacho (tarea colgada sin trabajador) y la transición (código 2 con PROPUESTO) | CONFIRMADO (`ErrorEspejo`) | 30 |
+| 5 | Un PID reutilizado dejaba la entrada despachada sin salida: `desencolar` la rechazaba y la consola lo aconsejaba | CONFIRMADO | 31 |
+| 6 | Un trabajador de OTRO equipo se reencolaba sin segunda señal, al revés de la regla de `clasificar_ejecucion` | CONFIRMADO | 31 |
+| 7 | La rama «tarea cerrada → entrada TERMINADA» no miraba el PID, y la limpieza borraba el árbol debajo de un trabajo en marcha tras un `bloquear` humano | CONFIRMADO (reproducido) | 31 |
+| 8 | `ErrorFicha` al adoptar escapaba como traceback | CONFIRMADO (lectura) | 30 |
+| 9 | `_reparar_restos` hacía `git worktree prune` GLOBAL: un worktree del usuario en un disco desconectado perdía índice y reflog | CONFIRMADO (reproducido) | 36 |
+| 10 | En Windows `shutil.which` resuelve `npm` → `npm.cmd` (cmd.exe) y hasta 3.11 antepone el cwd al PATH | CONFIRMADO (hipótesis Windows, demostrada sobre `which`) | 36, gate |
+| 11 | `locked initializing` se detectaba por la cadena sin traducir; con git en español no casaba | CONFIRMADO (`LC_ALL=C`; también «inicializando») | 36 |
+| 12 | Ventana de señal entre el `Popen` del trabajo y su anotación: el trabajo sobrevivía a la devolución | CONFIRMADO (reproducido por inyección) | 35 |
+| 13 | Un trabajo que salía con 0 dejando un nieto: nadie mataba el grupo; el nieto escribía tras PROPUESTO y la limpieza borraba debajo | CONFIRMADO (reproducido) | 28 |
+| 14 | La huella de la raíz bloqueaba trabajos honestos por cualquier archivo que el usuario tocara en la raíz | CONFIRMADO (sólo cuenta lo que cae en el ámbito) | 34 |
+| 15 | Candados huérfanos (`locked`, `index.lock`) con mensaje engañoso y sin receta | CONFIRMADO (mensajes y receta; sin reparación a ciegas, a propósito) | 36 |
+| 16 | Una segunda señal durante la devolución la cortaba: EN_EJECUCION fantasma con la entrada cerrada | CONFIRMADO (reproducido) | 35 |
+| 17 | Base `main` desactualizada para ramas nuevas; la consola no exponía `--base` | DECISIÓN HUMANA (documentada); `--base` expuesto | — |
+| 18 | `info/exclude`, `tag`, `stash`, `.gitignore` del árbol invisibles a la huella | PARCIAL: `info/exclude` sí; el resto FUERA DE ALCANCE (red contra el descuido, documentado) | 34 |
+| 19 | `rmdir` de un directorio vacío recién creado por un `worktree add` ajeno (ventana de un syscall) | CONFIRMADO (lectura; edad mínima) | 36 |
+| 20 | `.arboles` como enlace colgante: traceback | CONFIRMADO | 36 |
+| 21 | `fuera_del_arbol` O(n·m) | CONFIRMADO | 36 |
+| 22 | El manejador de señales no actúa en Windows (`DETACHED_PROCESS`) y el mensaje de `matar_grupo` mentía | CONFIRMADO (mensaje según SO, `taskkill /T`; Job Object V2) | gate |
+| 23 | `limpiar_arbol` exigía `tarea/<id>` mientras la toma honra `ficha.rama` | CONFIRMADO (lectura) | 36 |
+| 24 | Batería: `matar` del arnés no alcanzaba al trabajo (otra sesión); mínimos de métricas con margen cero; aserciones vacías en 16a, 17, 20b, 21 (prefijo del temporal), 22b (tautología), 27 (segunda vuelta) | CONFIRMADO | arnés, 11, 16, 17, 21, 22, 27 |
+| 25 | Batería: sin cobertura la limpieza bajo candado frente a un despacho real, el gancho de la toma, la huella de config/hooks, el evento del reencolado, otra máquina, `ESQUEMA_MAS_NUEVO` | CONFIRMADO | 32, 33, 34, 28, 31 |
+| 26 | Docstrings y README rancios (autoridad SQLite, argv de ejemplo, `limpiar_arbol`, `proceso_vivo`, `adoptar`, uso de la consola, «C pendiente») | CONFIRMADO | — |
+
+Tras R2 la batería tiene 36 comprobaciones y tarda 38.5 s aquí.
+Las quince mutaciones nuevas, cada una deshaciendo UNA corrección de R2,
+se detectan todas; la comprobación que cae en cada caso: la
+reconciliación ignora los procesos vivos → 19; poda global → 36; sin
+matar la descendencia → 28; el respaldo cierra a ciegas → 29; la huella
+cuenta al usuario → 34; el ejecutable resuelto sin juzgar → 36; el
+espejo como rechazo → 30; la segunda señal interrumpe → 35; `desencolar`
+de una ejecución viva → 13; señales sin aplazar → 35; limpieza sin la
+rama de la ficha → 36; candado traducido ignorado → 36; `rmdir` sin edad
+mínima → 36; el PID del trabajo sin anotar → 11; la toma confirmada
+tratada como rechazo → 30. Las ocho exigidas y las variantes de R1
+siguen detectándose igual (M2b sólo por `prueba_toma_atomica.py` y M2c
+por nadie, como se documenta arriba).
+
 **Verificación en Windows.** Esta rama sólo se ha ejecutado en Linux
 (Python 3.11, git 2.43). `WINDOWS_GATE_REQUIRED = SI`,
 `WINDOWS_GATE_EXECUTED = NO`. Lo que puede comportarse distinto en
 Windows, y que el gate tiene que mirar: `DETACHED_PROCESS` y
 `CREATE_BREAKAWAY_FROM_JOB` al lanzar el trabajador (nunca ejecutados);
-la muerte del trabajo mata sólo al hijo directo (la comprobación 23 se
-omite y lo dice); los enlaces simbólicos (la 21 se omite si el sistema no
-los permite); `shutil.which` con `PATHEXT`; `git worktree add` dentro de
-la raíz y `info/exclude`; el manejador de `SIGBREAK`; y la duración: la
-batería lanza unos 120 procesos de Python (carreras, trabajadores con su
-corredor, consolas) y tarda 29 s aquí frente al límite de 120 s del
-corredor por archivo. Un solo bloque, en PowerShell 7, desde un CLON
+la muerte del trabajo usa `taskkill /T` y al terminar no hay grupo que
+consultar (las comprobaciones 23, 28e y 35 se omiten y lo dicen); los
+enlaces simbólicos (la 21 y la 36c se omiten si el sistema no los
+permite); `shutil.which` con `PATHEXT` y el cwd (36e); `git worktree
+add` dentro de la raíz, `info/exclude` y `LC_ALL=C` con Git en español;
+el manejador de `SIGBREAK`; y la duración: la batería lanza más de 150
+procesos de Python (carreras, trabajadores con su corredor, consolas) y
+tarda 38.5 s aquí frente al límite de 120 s del corredor por
+archivo. Un solo bloque, en PowerShell 7, desde un CLON
 TEMPORAL del repositorio (la base SQLite vive en `.git/` y el gate crea
 tareas de usar y tirar; T-0001 y T-0002 no se ejecutan):
 
@@ -1832,7 +1941,7 @@ tareas de usar y tirar; T-0001 y T-0002 no se ejecutan):
         if ($LASTEXITCODE -ne 0) { $script:fallos += "$nombre (codigo $LASTEXITCODE)"; Write-Host "FALLO: $nombre" -ForegroundColor Red }
         Write-Host ("{0}: {1:N1} s" -f $nombre, $t.TotalSeconds)
     }
-    # 1. La batería de Workers V1, sola y cronometrada (27 comprobaciones; 21 y 23 pueden salir OMITIDA en Windows y deben decirlo).
+    # 1. La batería de Workers V1, sola y cronometrada (36 comprobaciones; 21, 23, 28e, 35 y 36c pueden salir OMITIDA en Windows y deben decirlo).
     Paso "1 bateria workers v1" { python .\pruebas\orquestacion\prueba_workers_v1.py }
     # 2. Estrés entre procesos.
     Paso "2 estres" { python .\pruebas\orquestacion\prueba_workers_v1.py --rondas 10 --despachadores 8 }
@@ -1999,9 +2108,15 @@ prioridad. Queda para Workers V2:
 - Expiración automática de trabajadores: `reanudar` sigue siendo una orden
   manual y no libera ante la duda. A3.3 hace que acierte al juzgar, no
   que se ejecute sola.
-- Matar el árbol de procesos del trabajo en Windows (Job Object).
+- Matar el árbol de procesos del trabajo en Windows (Job Object): hoy
+  `taskkill /T`, que no alcanza a un nieto desligado ni a lo que quede
+  al terminar.
 - Acciones desde el tablero web, que sigue siendo de sólo lectura y no
   conoce la cola.
+- La base por omisión de las ramas nuevas (`main`, la rama de la raíz u
+  `origin/main`): decisión de ingeniería marcada para revisión humana.
+- Retirar candados huérfanos de Git con una orden propia, en vez de la
+  receta manual.
 - La deuda anotada al final de la sección T-0003.
 
 ### Queda para V2

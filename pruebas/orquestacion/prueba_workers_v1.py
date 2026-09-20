@@ -3498,17 +3498,17 @@ def prueba_30_un_fallo_del_espejo_json_tras_el_commit_no_es_un_rechazo():
     print(" 30. un fallo del espejo JSON después del COMMIT es éxito con aviso, en el despacho, la adopción y la transición:", end=" ")
 
     raiz = crear_repositorio("espejo_")
-    original = nucleo._regenerar_espejo
+    original = nucleo.guardar
     principal = threading.main_thread()
 
-    def espejo_roto(raiz_, ficha):
-        # Sólo en el hilo principal: el latido automático sigue escribiendo.
+    def espejo_roto(raiz_, ficha, *argumentos, **claves):
+        # El archivo no se puede escribir (como con otro proceso que lo
+        # tiene abierto en Windows): el camino REAL de `_regenerar_espejo`
+        # tiene que convertirlo en `ErrorEspejo`. Sólo en el hilo
+        # principal: el latido automático sigue escribiendo.
         if threading.current_thread() is principal:
-            raise nucleo.ErrorEspejo(
-                "El estado global de '" + ficha.id + "' quedó confirmado en SQLite, "
-                "pero no se pudo regenerar el espejo JSON (simulado)."
-            )
-        return original(raiz_, ficha)
+            raise OSError("el espejo JSON no se puede escribir (simulado)")
+        return original(raiz_, ficha, *argumentos, **claves)
 
     try:
         ficha_minima(raiz, "T-0901")
@@ -3516,7 +3516,7 @@ def prueba_30_un_fallo_del_espejo_json_tras_el_commit_no_es_un_rechazo():
         METRICAS["TAREAS_ENCOLADAS"] += 1
 
         # a) Despacho: la toma se confirmó; se sigue con la fila, con aviso.
-        nucleo._regenerar_espejo = espejo_roto
+        nucleo.guardar = espejo_roto
         despacho = trabajadores.despachar(raiz, lanzar=False)
         METRICAS["DESPACHOS_ACEPTADOS"] += 1
         METRICAS["WORKTREES_CREADOS"] += int(despacho["arbol_creado"])
@@ -3537,7 +3537,7 @@ def prueba_30_un_fallo_del_espejo_json_tras_el_commit_no_es_un_rechazo():
         assert fila_de(raiz, "T-0901")["estado"] == str(Estado.PROPUESTO)
         assert entrada_de(raiz, "T-0901")["estado_cola"] == estado_global.COLA_TERMINADA
         assert nucleo.leer(raiz, "T-0901").estado == Estado.NUEVO
-        nucleo._regenerar_espejo = original
+        nucleo.guardar = original
         nucleo.reabrir(raiz, "T-0901")
         assert nucleo.leer(raiz, "T-0901").estado == Estado.REABIERTO, "La siguiente escritura no regeneró el espejo."
 
@@ -3545,11 +3545,11 @@ def prueba_30_un_fallo_del_espejo_json_tras_el_commit_no_es_un_rechazo():
         #    base), entrada FALLIDA.
         trabajadores.encolar(raiz, "T-0901", trabajo=trabajo_demo("T-0901", "--fallar", "3"))
         METRICAS["TAREAS_ENCOLADAS"] += 1
-        nucleo._regenerar_espejo = espejo_roto
+        nucleo.guardar = espejo_roto
         despacho = trabajadores.despachar(raiz, lanzar=False)
         METRICAS["DESPACHOS_ACEPTADOS"] += 1
         informe = ejecutar_en_proceso(raiz, despacho)
-        nucleo._regenerar_espejo = original
+        nucleo.guardar = original
         assert informe["resultado"] == trabajadores.RESULTADO_TRABAJO_FALLIDO, informe
         assert informe["estado_final"] == str(Estado.REABIERTO) and informe["entrada_cerrada"] is True, informe
         assert fila_de(raiz, "T-0901")["estado"] == str(Estado.REABIERTO)
@@ -3579,7 +3579,7 @@ def prueba_30_un_fallo_del_espejo_json_tras_el_commit_no_es_un_rechazo():
 
         comprobar_integridad(raiz)
     finally:
-        nucleo._regenerar_espejo = original
+        nucleo.guardar = original
         borrar(raiz)
 
     print("OK")
