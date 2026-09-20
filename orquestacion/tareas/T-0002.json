@@ -23,19 +23,19 @@
     "pruebas/predimensionamiento/prueba_columna_rapida.py",
     "pruebas/aplicacion/prueba_api.py"
   ],
-  "estado": "en_ejecucion",
+  "estado": "bloqueado",
   "rama": "tarea/T-0002",
-  "worktree": "C:\\INGENIERIA_LOCAL\\wt-t0002",
+  "worktree": null,
   "intentos": 0,
   "max_intentos": 3,
   "commit_inicial": "d0139ef",
   "creado_en": "2026-09-19T02:12:23+00:00",
-  "actualizado_en": "2026-09-20T05:20:30+00:00",
+  "actualizado_en": "2026-09-20T05:25:32+00:00",
   "requiere_decision_humana": [],
-  "trabajador_id": "CLAUDE-COLUMNAS",
-  "pid": 8940,
-  "iniciado_en": "2026-09-20T05:20:30+00:00",
-  "ultimo_latido": "2026-09-20T05:20:30+00:00",
+  "trabajador_id": null,
+  "pid": null,
+  "iniciado_en": null,
+  "ultimo_latido": null,
   "ultima_falla": null,
   "ejecuciones": [],
   "historial": [
@@ -57,6 +57,14 @@
         "trabajador_id": "CLAUDE-COLUMNAS",
         "pid": 8940
       }
+    },
+    {
+      "fecha": "2026-09-20T05:25:32+00:00",
+      "tipo": "transicion",
+      "estado_anterior": "en_ejecucion",
+      "estado_nuevo": "bloqueado",
+      "motivo": "Congelada por continuidad: A3.3 está integrada, pero Workers V1/C sigue pendiente; retomar después de cerrar C.",
+      "origen": "humano"
     }
   ]
 }
