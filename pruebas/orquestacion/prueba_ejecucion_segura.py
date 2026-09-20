@@ -28,6 +28,7 @@ límite del corredor único (120 s). Para la corrida de estrés:
 
 import argparse
 import copy
+import json
 import multiprocessing
 import os
 import shutil
@@ -1271,7 +1272,7 @@ def prueba_g_crear_concurrente_tiene_un_solo_ganador(creadores: int):
     ganó. Contar ganadores no bastaría.
     """
     print(
-        " 28. crear concurrente (" + str(creadores) + " procesos): ",
+        " 35. crear concurrente (" + str(creadores) + " procesos): ",
         end="",
     )
 
@@ -2096,7 +2097,7 @@ def prueba_r_estres_de_escrituras_concurrentes(escritores: int, vueltas: int):
     puesta acaba apareciendo.
     """
     print(
-        " 29. estrés: " + str(escritores) + " escritores x " + str(vueltas)
+        " 36. estrés: " + str(escritores) + " escritores x " + str(vueltas)
         + " vueltas:",
         end=" ",
     )
@@ -3010,6 +3011,428 @@ def prueba_ab_la_consola_distingue_sus_rechazos():
     print("OK")
 
 
+
+def prueba_ac_un_latido_a_tiempo_evita_la_recuperacion():
+    """
+    Si el dueño da señal justo antes de la escritura, no se le quita nada.
+
+    Un latido no mueve ni el estado ni la generación, que son las dos
+    únicas columnas del WHERE de la recuperación. Así que la prueba de
+    vida más reciente que existe —el dueño latiendo— llegaba a la base, se
+    confirmaba, y acto seguido `reanudar` la pisaba y se llevaba la tarea.
+    Y `reclamadas_mientras_tanto` quedaba vacío: el sistema ni se enteraba
+    de que había robado.
+    """
+    print(" 30. un latido a tiempo evita la recuperación:", end=" ")
+
+    raiz = crear_repositorio("latido_a_tiempo_")
+
+    try:
+        ficha_minima(raiz, "T-0901")
+        tomada = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A",
+                              pid=999999)
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        # Latido viejo: dentro de la ventana que exige dos señales.
+        antiguo = (
+            nucleo.ahora_datetime() - timedelta(seconds=1000)
+        ).isoformat(timespec="seconds")
+
+        con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+        try:
+            with estado_global.transaccion(con):
+                con.execute(
+                    "UPDATE tareas SET ultimo_latido = ? WHERE id = ?",
+                    (antiguo, "T-0901"),
+                )
+        finally:
+            con.close()
+
+        acompanante = nucleo.LatidoAutomatico(
+            raiz, "T-0901", "worker-A", tomada.generacion
+        )
+
+        # El dueño late EXACTAMENTE entre la clasificación y la escritura.
+        def clasificando(_pid):
+            acompanante.emitir_uno()
+
+            return False
+
+        informe = nucleo.reanudar(raiz, comprobar_proceso=clasificando)
+        METRICAS["OPERACIONES"] += 1
+
+        assert acompanante.emitidos == 1, (
+            "El latido no llegó a entrar: la prueba no probaría nada."
+        )
+
+        fila = fila_de(raiz, "T-0901")
+
+        if fila["trabajador_id"] != "worker-A":
+            METRICAS["ROBOS_INDEBIDOS"] += 1
+
+        assert fila["trabajador_id"] == "worker-A", (
+            "Se le quitó la tarea a un dueño que acababa de dar señal de "
+            "vida."
+        )
+        assert fila["estado"] == str(Estado.EN_EJECUCION)
+        assert informe["huerfanas"] == [], repr(informe["huerfanas"])
+        assert [uno["id"] for uno in informe["reclamadas_mientras_tanto"]] == [
+            "T-0901"
+        ], (
+            "La recuperación no informó de que la tarea daba señales: "
+            + repr(informe)
+        )
+        METRICAS["RECHAZADAS"] += 1
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+def prueba_ad_el_latido_aguanta_un_fallo_transitorio():
+    """
+    Un `database is locked` no puede apagar el latido para siempre.
+
+    Es el error más probable justo en el escenario para el que existe el
+    latido: varios procesos escribiendo a la vez. Rendirse al primero
+    dejaba la operación sin señal el resto del tiempo, en silencio
+    —`propiedad_perdida` seguía en falso—, y a partir de ahí bastaba que la
+    verificación durase para que la recuperación le quitara la tarea al
+    trabajador mientras trabajaba.
+    """
+    print(" 31. el latido aguanta un fallo transitorio:", end=" ")
+
+    raiz = crear_repositorio("transitorio_")
+
+    try:
+        ficha_minima(raiz, "T-0901")
+        tomada = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        acompanante = nucleo.LatidoAutomatico(
+            raiz, "T-0901", "worker-A", tomada.generacion
+        )
+
+        abrir_real = estado_global.abrir
+        fallos = {"restantes": 1}
+
+        def abrir_con_un_tropiezo(*argumentos, **extras):
+            if fallos["restantes"] > 0:
+                fallos["restantes"] -= 1
+                raise sqlite3.OperationalError("database is locked")
+
+            return abrir_real(*argumentos, **extras)
+
+        estado_global.abrir = abrir_con_un_tropiezo
+
+        try:
+            sigue = acompanante.emitir_uno()
+        finally:
+            estado_global.abrir = abrir_real
+
+        METRICAS["OPERACIONES"] += 1
+
+        assert sigue is True, (
+            "El latido se rindió al primer fallo transitorio; a partir de "
+            "ahí la operación se queda sin señal en silencio."
+        )
+        assert acompanante.propiedad_perdida is False, (
+            "Un fallo de escritura se confundió con perder la tarea."
+        )
+        assert acompanante.error, "El fallo no quedó anotado."
+        assert acompanante.emitidos == 0
+
+        # Y al siguiente intento late con normalidad.
+        assert acompanante.emitir_uno() is True
+        assert acompanante.emitidos == 1
+        assert acompanante.fallos_seguidos == 0, (
+            "El contador de fallos seguidos no se reinició tras un acierto."
+        )
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+        METRICAS["LATIDOS_AUTOMATICOS"] += 1
+
+        # Con fallos suficientes SÍ se rinde, que también hace falta.
+        fallos["restantes"] = nucleo.FALLOS_LATIDO_SEGUIDOS
+        estado_global.abrir = abrir_con_un_tropiezo
+
+        try:
+            resultados = [
+                acompanante.emitir_uno()
+                for _ in range(nucleo.FALLOS_LATIDO_SEGUIDOS)
+            ]
+        finally:
+            estado_global.abrir = abrir_real
+
+        assert resultados[-1] is False, (
+            "El latido no se rinde nunca: un fallo permanente lo dejaría "
+            "girando para siempre."
+        )
+        METRICAS["RECHAZADAS"] += 1
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+def prueba_ae_el_latido_no_puede_retroceder_la_marca_de_vida():
+    """
+    El reloj de pared no es monótono, y la señal de vida no puede encoger.
+
+    `Event.wait` usa reloj monótono, pero el valor ESCRITO es hora de
+    pared. Un salto hacia atrás —NTP, cambio de zona, una máquina virtual
+    restaurada— hacía que el propio latido REDUJERA la antigüedad
+    registrada de la señal. La recuperación lee esa marca y declara
+    huérfana una ejecución viva: el componente que existe para mantenerla
+    viva se convierte en el que la mata.
+    """
+    print(" 32. el latido no puede retroceder la marca de vida:", end=" ")
+
+    raiz = crear_repositorio("monotonia_")
+
+    try:
+        ficha_minima(raiz, "T-0901")
+        tomada = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        bueno = "2030-06-01T12:00:00+00:00"
+        atrasado = "2030-06-01T10:00:00+00:00"
+
+        adelantado = nucleo.LatidoAutomatico(
+            raiz, "T-0901", "worker-A", tomada.generacion,
+            reloj=lambda: bueno,
+        )
+
+        assert adelantado.emitir_uno() is True
+        assert fila_de(raiz, "T-0901")["ultimo_latido"] == bueno
+        METRICAS["LATIDOS_AUTOMATICOS"] += 1
+
+        # Ahora el reloj salta dos horas atrás.
+        retrasado = nucleo.LatidoAutomatico(
+            raiz, "T-0901", "worker-A", tomada.generacion,
+            reloj=lambda: atrasado,
+        )
+
+        METRICAS["OPERACIONES"] += 1
+
+        # No es un error: simplemente no encoge la marca. El latido sigue.
+        assert retrasado.emitir_uno() is True, (
+            "Un reloj atrasado se confundió con perder la tarea."
+        )
+        assert retrasado.propiedad_perdida is False
+        assert retrasado.retrocesos == 1, (
+            "El retroceso no quedó contado: " + str(retrasado.retrocesos)
+        )
+
+        fila = fila_de(raiz, "T-0901")
+
+        if fila["ultimo_latido"] != bueno:
+            METRICAS["ACTUALIZACIONES_PERDIDAS"] += 1
+
+        assert fila["ultimo_latido"] == bueno, (
+            "La marca de vida retrocedió: " + repr(fila["ultimo_latido"])
+        )
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+def prueba_af_dos_decisiones_humanas_no_se_pisan():
+    """
+    Resolver una decisión no puede devolver otra a «pendiente».
+
+    `decisiones` es UNA columna con el JSON de todas dentro. Resolver una
+    leyendo la lista, cambiando un elemento en Python y reescribiendo la
+    columna entera es el lost update de manual, y aquí no lo frenaba nada:
+    dos `decidir` sobre claves DISTINTAS son órdenes válidas —misma
+    generación, mismo estado, sin propietario que exigir—, así que las dos
+    pasaban el WHERE y la segunda revertía a la primera. Sin error y sin
+    rastro: al humano que decidió se le devolvía su decisión como resuelta.
+
+    Se prueba con dos fichas leídas ANTES de que ninguna escriba, que es
+    justo el solapamiento que ocurre entre dos procesos.
+    """
+    print(" 33. dos decisiones humanas no se pisan:", end=" ")
+
+    raiz = crear_repositorio("decisiones_")
+
+    try:
+        ficha_minima(
+            raiz,
+            "T-0901",
+            decisiones=[
+                {"clave": "D-1", "descripcion": "primera"},
+                {"clave": "D-2", "descripcion": "segunda"},
+            ],
+        )
+
+        nucleo.decidir(raiz, "T-0901", "D-1", "la resuelve el jefe")
+        nucleo.decidir(raiz, "T-0901", "D-2", "la resuelve el calculista")
+        METRICAS["OPERACIONES"] += 2
+        METRICAS["ACEPTADAS"] += 2
+
+        registradas = {
+            str(una["clave"]): una
+            for una in (fila_de(raiz, "T-0901")["decisiones"] or [])
+        }
+
+        for clave in ("D-1", "D-2"):
+            if not registradas.get(clave, {}).get("resuelta"):
+                METRICAS["ACTUALIZACIONES_PERDIDAS"] += 1
+
+            assert registradas.get(clave, {}).get("resuelta"), (
+                "La resolución de " + clave + " se perdió: "
+                + repr(registradas)
+            )
+
+        assert fila_de(raiz, "T-0901")["requiere_decision_humana"] in (0, False)
+
+        # Y una definición que no declara una clave NO borra su resolución.
+        archivo = fichas.carpeta_tareas(raiz) / "T-0901.json"
+        datos = json.loads(archivo.read_text(encoding="utf-8"))
+        datos["requiere_decision_humana"] = [
+            {"clave": "D-2", "descripcion": "segunda"}
+        ]
+        archivo.write_text(
+            json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        nucleo.cargar(raiz, "T-0901")
+        METRICAS["OPERACIONES"] += 1
+
+        despues = {
+            str(una["clave"]): una
+            for una in (fila_de(raiz, "T-0901")["decisiones"] or [])
+        }
+
+        if not despues.get("D-1", {}).get("resuelta"):
+            METRICAS["ACTUALIZACIONES_PERDIDAS"] += 1
+
+        assert despues.get("D-1", {}).get("resuelta"), (
+            "Abrir la tarea desde una definición que no declara D-1 borró "
+            "su resolución de la base: " + repr(despues)
+        )
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+def prueba_ag_el_espejo_no_borra_lo_que_escribe_una_persona():
+    """
+    Lo que un ingeniero escribe en la ficha sobrevive a la operación.
+
+    El espejo sólo debe reescribir los campos OPERATIVOS. Lo declarativo se
+    quedaba en memoria tal como se leyó AL EMPEZAR la orden y se volcaba
+    encima del archivo al terminar. Con `verificar` esa ventana es la
+    batería entera: minutos. Y lo peor: una decisión humana recién
+    declarada desaparecía, así que la tarea se iba a PROPUESTO saltándose
+    justo la decisión que esa persona quería forzar.
+    """
+    print(" 34. el espejo no borra lo que escribe una persona:", end=" ")
+
+    raiz = crear_repositorio("espejo_")
+
+    try:
+        carpeta = raiz / "pruebas" / "demostracion"
+        (carpeta / "prueba_lenta.py").write_text(
+            "import time\ntime.sleep(1.2)\nprint('PRUEBA_LENTA=OK')\n",
+            encoding="utf-8",
+        )
+
+        ficha_minima(
+            raiz,
+            "T-0901",
+            pruebas_requeridas=["pruebas/demostracion/prueba_lenta.py"],
+        )
+        tomada = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+        METRICAS["OPERACIONES"] += 2
+        METRICAS["ACEPTADAS"] += 2
+
+        archivo = fichas.carpeta_tareas(raiz) / "T-0901.json"
+        escrito = {"hecho": False}
+
+        def persona():
+            time.sleep(0.5)
+            datos = json.loads(archivo.read_text(encoding="utf-8"))
+            datos["objetivo"] = "OBJETIVO ESCRITO POR UNA PERSONA"
+            datos["criterios_aceptacion"] = ["criterio nuevo"]
+            datos["max_intentos"] = 9
+            datos["requiere_decision_humana"] = [
+                {"clave": "D-NUEVA", "descripcion": "hay que decidir esto"}
+            ]
+            archivo.write_text(
+                json.dumps(datos, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            escrito["hecho"] = True
+
+        hilo = threading.Thread(target=persona)
+        hilo.start()
+
+        informe = nucleo.verificar(
+            raiz,
+            "T-0901",
+            trabajador_id="worker-A",
+            generacion=tomada.generacion,
+        )
+        hilo.join()
+
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        assert escrito["hecho"], "La edición no llegó a ocurrir."
+
+        final = json.loads(archivo.read_text(encoding="utf-8"))
+
+        for campo, esperado in (
+            ("objetivo", "OBJETIVO ESCRITO POR UNA PERSONA"),
+            ("criterios_aceptacion", ["criterio nuevo"]),
+            ("max_intentos", 9),
+        ):
+            if final[campo] != esperado:
+                METRICAS["ACTUALIZACIONES_PERDIDAS"] += 1
+
+            assert final[campo] == esperado, (
+                "El espejo borró '" + campo + "': " + repr(final[campo])
+            )
+
+        claves = [
+            str(una["clave"]) for una in final["requiere_decision_humana"]
+        ]
+
+        assert "D-NUEVA" in claves, (
+            "El espejo borró la decisión que una persona acababa de "
+            "declarar: " + repr(claves)
+        )
+
+        # Y esa decisión frena la propuesta, que es para lo que se declara.
+        assert informe["estado"] == str(Estado.REQUIERE_REVISION), (
+            "Las pruebas iban en verde y la tarea se propuso saltándose la "
+            "decisión humana declarada durante la corrida: "
+            + informe["estado"]
+        )
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
 # ----------------------------------------------------------------------
 # Corredor de este archivo
 # ----------------------------------------------------------------------
@@ -3042,6 +3465,11 @@ COMPROBACIONES = (
     prueba_z_el_tablero_publica_la_vitalidad_y_el_arbol_reales,
     prueba_aa_el_tablero_no_escribe_y_aguanta_una_fila_rota,
     prueba_ab_la_consola_distingue_sus_rechazos,
+    prueba_ac_un_latido_a_tiempo_evita_la_recuperacion,
+    prueba_ad_el_latido_aguanta_un_fallo_transitorio,
+    prueba_ae_el_latido_no_puede_retroceder_la_marca_de_vida,
+    prueba_af_dos_decisiones_humanas_no_se_pisan,
+    prueba_ag_el_espejo_no_borra_lo_que_escribe_una_persona,
 )
 
 
