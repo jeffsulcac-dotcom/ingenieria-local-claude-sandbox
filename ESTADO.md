@@ -751,9 +751,25 @@ y no se escribe a ciegas); el efecto está acotado en la dirección segura
 —la tarea espera a una persona en vez de quitársele a nadie— y la salida
 manual es `reabrir`.
 
-Pendiente de ejecución en Windows: es el entorno final real y esta corrida
-fue en Linux. Los comandos y el criterio de aprobación están en
-`orquestacion/README.md`.
+Verificado en Windows (PowerShell 7.6.5 y Python 3.12.4) el 19/09/2026:
+
+- `prueba_ejecucion_segura.py`: OK en 18.54 s; 0 actualizaciones perdidas,
+  robos indebidos, errores SQLite, excepciones y fallos de integridad.
+- Estrés de 40 rondas: 240 órdenes concurrentes aceptadas, 0 pérdidas y 0
+  errores SQLite, en 18.55 s.
+- La misma batería con `-X dev -W error::ResourceWarning`: OK, sin avisos.
+- Corredor completo confirmado desde `verificar` sobre T-9003 temporal: 8 de
+  8 pruebas OK, ejecutadas en un worktree Git real y registradas como
+  verificadas allí.
+- Rutas Windows `C:pruebas` y `\pruebas`: rechazadas con código 6; junction
+  y ruta con espacios: aceptadas por la comprobación de worktree.
+- La desaparición de un worktree no libera una ejecución fresca; la
+  comprobación 17 fuerza el caso huérfano y exige el aviso correspondiente.
+
+El guion del gate se corrigió para no devolver T-9004 antes de comprobar la
+retoma: devolver libera el worktree por diseño y, por tanto, no podía probar
+su desaparición. Las tareas de gate vivieron sólo en un clon temporal, sin
+afectar T-0001 ni T-0002, que no se ejecutaron.
 
 NO implementado en A3.3, reservado a C: lanzamiento de trabajadores,
 trabajadores paralelos, worktrees automáticos, cola y priorización,
@@ -763,4 +779,4 @@ T-0001 y T-0002 siguen sin ejecutar, en estado NUEVA.
 
 Estado:
 A3.2 = CERRADA
-A3.3 = IMPLEMENTADO_PENDIENTE_DE_VERIFICACION_EN_WINDOWS
+A3.3 = LISTO_PARA_REVISION

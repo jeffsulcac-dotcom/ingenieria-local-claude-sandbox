@@ -1171,9 +1171,12 @@ Desde `C:\INGENIERIA_LOCAL\motor`, en PowerShell 7:
     Write-Host "Codigo esperado 0, obtenido: $LASTEXITCODE"
 
     # 8. El worktree que desaparece.
-    python -m orquestacion.ingenieria_supervisor devolver T-9004 --trabajador W1 --generacion 1
     git worktree remove "..\wt con espacios" --force
     python -m orquestacion.ingenieria_supervisor reanudar
+    #    El latido recién emitido conserva T-9004 dentro del margen de
+    #    cortesía: debe quedar ACTIVA, no liberarse por la desaparición del
+    #    árbol. La batería (comprobación 17) fuerza además un latido viejo
+    #    y exige el aviso WORKTREE REGISTRADO QUE YA NO EXISTE.
 
     # 9. Que no quedaron temporales ni procesos huérfanos.
     Get-ChildItem $env:TEMP -Directory -Filter "ejecucion_segura_*"
@@ -1186,6 +1189,7 @@ Desde `C:\INGENIERIA_LOCAL\motor`, en PowerShell 7:
 
     # 10. Limpieza del gate.
     python -m orquestacion.ingenieria_supervisor devolver T-9003 --trabajador W1 --generacion 1
+    python -m orquestacion.ingenieria_supervisor devolver T-9004 --trabajador W1 --generacion 1
     Remove-Item ..\wt_enlace -Force
     git worktree remove ..\wt_gate_a33 --force
     git worktree prune
@@ -1194,6 +1198,13 @@ Desde `C:\INGENIERIA_LOCAL\motor`, en PowerShell 7:
 Los pasos 5 a 8 usan tareas de usar y tirar (`T-9003`, `T-9004`); bórralas
 después. **No se deben ejecutar sobre T-0001 ni T-0002**, que tienen que
 seguir en estado NUEVA y sin ejecutar.
+
+Como SQLite conserva los identificadores operativos aunque se quite su JSON,
+el gate completo debe hacerse en un **clon local temporal** cuando se quiera
+que la base operativa del motor permanezca sin esas T-900x. Un clon conserva
+la comprobación real de Git, worktrees, junctions y rutas Windows, pero deja
+su SQLite dentro de su propio `.git`; al borrar el clon se eliminan también
+las tareas desechables. No se ejecutan T-0001 ni T-0002 en ese clon.
 
 Criterio para decidir que Windows pasó, los ocho a la vez:
 
@@ -1205,8 +1216,10 @@ Criterio para decidir que Windows pasó, los ocho a la vez:
 5. La (4) da 8 de 8 archivos de prueba en OK.
 6. En la (5), `Verificado en` nombra el worktree y no la raíz del motor.
 7. La (6) devuelve 6 las dos veces, y la (7) devuelve 0.
-8. En la (8) aparece `WORKTREE REGISTRADO QUE YA NO EXISTE`, y la (9) no
-   devuelve nada.
+8. En la (8), T-9004 sigue ACTIVA dentro del margen de cortesía: perder el
+   árbol no autoriza a liberar una ejecución fresca. La comprobación 17 de
+   la batería (1) fuerza una ejecución huérfana y exige además el aviso
+   `WORKTREE REGISTRADO QUE YA NO EXISTE`; la (9) no devuelve nada.
 
 Prueba correspondiente:
 
