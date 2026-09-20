@@ -588,6 +588,12 @@ def orden_sincronizar_definiciones(raiz: Path, argumentos) -> int:
     _linea("Actualizadas", ", ".join(informe["actualizadas"]) or "ninguna")
     _linea("Sin cambios", ", ".join(informe["sin_cambios"]) or "ninguna")
 
+    if informe.get("espejos_regenerados"):
+        _linea(
+            "Espejos JSON regenerados",
+            ", ".join(informe["espejos_regenerados"]),
+        )
+
     # A3.2: no se puede informar como "sin cambios" una edición que está
     # esperando. El usuario editó el ámbito y tiene que saber que no se
     # aplicó, por qué, y que se aplicará sola cuando la tarea se cierre.
@@ -1166,6 +1172,9 @@ def orden_despachar(raiz: Path, argumentos) -> int:
         print("  Saltada la entrada " + str(uno.get("secuencia")) + " ("
               + str(uno.get("tarea")) + "): " + str(uno.get("detalle")))
 
+    for uno in informe.get("avisos") or []:
+        print("  AVISO: " + str(uno))
+
     return 0
 
 
@@ -1557,6 +1566,19 @@ def principal(argumentos_crudos: list[str] | None = None) -> int:
         print("")
 
         return CODIGO_WORKTREE_INVALIDO
+    except nucleo.ErrorEspejo as aviso:
+        # La orden SE HIZO y está confirmada en la base; lo único que
+        # falló fue reescribir el espejo JSON (otro proceso lo tiene
+        # abierto, permisos). Devolver 2 hacía que un guion diera por no
+        # hecho algo que sí se hizo —y con `tomar`, que dejara la tarea
+        # EN_EJECUCION creyendo que no la tomó (auditoría R3).
+        print("")
+        print("  AVISO: " + str(aviso))
+        print("  La orden se completó. El espejo JSON se regenerará en la "
+              "siguiente escritura de esta tarea.")
+        print("")
+
+        return 0
     except (
         nucleo.ErrorSupervisor,
         ErrorFicha,

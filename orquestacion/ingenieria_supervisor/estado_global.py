@@ -2481,6 +2481,31 @@ def sincronizar_lista(
     return informe
 
 
+def _reparar_espejos_ausentes(raiz: Path) -> list[str]:
+    """Reconstruye el JSON de las tareas cuya fila existe y cuyo archivo
+    falta. Lo resuelve el Supervisor, que es quien sabe escribir fichas."""
+    from . import supervisor as nucleo
+
+    reparadas = []
+
+    try:
+        with conexion(raiz) as con:
+            identificadores = [str(fila["id"]) for fila in listar_tareas(con)]
+    except ErrorEstadoGlobal:
+        return reparadas
+
+    for identificador in identificadores:
+        try:
+            if nucleo.regenerar_espejo_desde_la_base(raiz, identificador):
+                reparadas.append(identificador)
+        except Exception:
+            # Reparar es un extra de esta orden: que una ficha concreta no
+            # se pueda reescribir no puede tumbar la sincronización.
+            continue
+
+    return reparadas
+
+
 def sincronizar_definiciones(raiz: Path, con: sqlite3.Connection | None = None) -> dict:
     """
     Importa al estado global todas las fichas JSON legibles del repositorio.
@@ -2491,6 +2516,12 @@ def sincronizar_definiciones(raiz: Path, con: sqlite3.Connection | None = None) 
     """
     raiz = Path(raiz)
 
+    # Antes de leer los archivos, se reconstruyen los que FALTAN y cuya
+    # fila sí existe: un espejo JSON que no se pudo escribir dejaba la
+    # tarea invisible para esta orden, que recorre el disco, y por tanto
+    # sin ninguna vía de reparación desde el producto (auditoría R3).
+    reparadas = _reparar_espejos_ausentes(raiz)
+
     fichas, errores = listar_con_errores(raiz)
 
     if con is not None:
@@ -2500,6 +2531,7 @@ def sincronizar_definiciones(raiz: Path, con: sqlite3.Connection | None = None) 
             informe = sincronizar_lista(propia, fichas)
 
     informe["fichas_ilegibles"] = errores
+    informe["espejos_regenerados"] = reparadas
 
     return informe
 

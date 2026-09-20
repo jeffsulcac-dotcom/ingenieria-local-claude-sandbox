@@ -163,9 +163,27 @@ COLA_DE_SALIDA_BYTES = 64 * 1024
 # señal de interrupción pueda matar su grupo entero.
 _TRABAJO_EN_CURSO = None
 
+# El hilo principal está entre el `Popen` del trabajo y su anotación:
+# una señal que llegue ahí se aplaza en vez de interrumpir (R3).
+_LANZAMIENTO_EN_CURSO = False
+_INTERRUPCION_APLAZADA = None
+
 # Lo que se ignora al comparar la raíz antes y después del trabajo: el
 # espejo JSON lo reescribe el propio Supervisor.
 RASTRO_DEL_SUPERVISOR = "orquestacion/tareas/"
+
+
+class Interrumpido(Exception):
+    """
+    El sistema pidió terminar (SIGTERM, Ctrl-C, cierre de sesión).
+
+    NO hereda de `ErrorSupervisor` a propósito: el respaldo del
+    trabajador cierra la entrada sola ante un `ErrorSupervisor` (la
+    ejecución ya no es suya), y una interrupción no es eso. Aquí la
+    tarea sigue siendo nuestra y lo correcto es devolverla, o dejarla
+    EN_EJECUCION con la entrada despachada para que la recuperación la
+    juzgue.
+    """
 
 
 class ErrorCola(ErrorSupervisor):
@@ -426,6 +444,17 @@ def _entrada_a_dict(fila) -> dict:
 def _obtener_entrada(con, secuencia: int) -> dict | None:
     fila = con.execute(
         "SELECT * FROM cola WHERE secuencia = ?", (int(secuencia),)
+    ).fetchone()
+
+    return None if fila is None else _entrada_a_dict(fila)
+
+
+def _ultima_entrada_de(con, identificador: str) -> dict | None:
+    """La entrada más reciente de la tarea, viva o cerrada."""
+    fila = con.execute(
+        "SELECT * FROM cola WHERE tarea_id = ? "
+        "ORDER BY secuencia DESC LIMIT 1",
+        (identificador,),
     ).fetchone()
 
     return None if fila is None else _entrada_a_dict(fila)
@@ -976,7 +1005,12 @@ def _reparar_restos(raiz: Path, destino: Path) -> bool:
 
         # Git crea el directorio ANTES de registrar el árbol: uno vacío y
         # recién nacido puede ser el de un `worktree add` ajeno en curso.
-        if vacio and edad >= EDAD_MINIMA_DE_RESTOS_S:
+        # Una edad NEGATIVA (marca de tiempo en el futuro: reloj
+        # corregido hacia atrás, copia de otra máquina, recurso de red)
+        # no es «recién nacido»: un `worktree add` de esta máquina no
+        # deja marcas futuras, y tratarla como reciente dejaba la ranura
+        # bloqueada PARA SIEMPRE (auditoría R3).
+        if vacio and (edad >= EDAD_MINIMA_DE_RESTOS_S or edad < 0):
             registrados, descartados = nucleo._inventario_de_arboles(raiz)
             resuelto = destino.resolve()
 
@@ -1036,7 +1070,15 @@ def _podar_metadatos_de(raiz: Path, destino: Path) -> bool:
             continue
 
         try:
-            if not apunta or Path(apunta).resolve() != objetivo:
+            # Desde git 2.48 (`worktree.useRelativePaths`) el `gitdir`
+            # puede ser RELATIVO, y lo es a su propia carpeta, no al
+            # directorio de trabajo del Supervisor (auditoría R3).
+            senalada = Path(apunta)
+
+            if not senalada.is_absolute():
+                senalada = metadatos / senalada
+
+            if not apunta or senalada.resolve() != objetivo:
                 continue
         except OSError:
             continue
@@ -1431,8 +1473,8 @@ def _despachar_entrada(
 
         cursor = con.execute(
             "UPDATE cola SET estado_cola = ?, trabajador_id = ?, generacion = ?, "
-            "pid = ?, worktree = ?, despachado_en = ?, actualizado_en = ?, "
-            "ultimo_rechazo = NULL, registro = ? "
+            "pid = ?, pid_trabajo = NULL, worktree = ?, despachado_en = ?, "
+            "actualizado_en = ?, ultimo_rechazo = NULL, registro = ? "
             "WHERE secuencia = ? AND estado_cola = ?",
             (
                 global_.COLA_DESPACHADA,
@@ -2020,6 +2062,28 @@ def reconciliar_cola(raiz: Path, comprobar_proceso=nucleo.proceso_vivo) -> dict:
     return informe
 
 
+def procesos_vivos_de(entrada: dict, comprobar_proceso) -> str | None:
+    """
+    Si el proceso trabajador de la entrada, o el del trabajo que lanzó,
+    siguen vivos EN ESTA MÁQUINA. Devuelve el motivo, o None.
+    """
+    equipo = nucleo.equipo_de(entrada.get("trabajador_id"))
+
+    if equipo not in (None, socket.gethostname()):
+        return None
+
+    for clave, papel in (("pid", "trabajador"), ("pid_trabajo", "trabajo")):
+        pid = entrada.get(clave)
+
+        if pid and comprobar_proceso(int(pid)):
+            return (
+                "el proceso " + str(pid) + " (" + papel + ") sigue vivo en "
+                "esta máquina"
+            )
+
+    return None
+
+
 def _duda_sobre_la_entrada(entrada: dict, comprobar_proceso) -> str | None:
     """
     Por qué NO se puede dar por muerta la ejecución de una entrada
@@ -2036,16 +2100,7 @@ def _duda_sobre_la_entrada(entrada: dict, comprobar_proceso) -> str | None:
             "se puede comprobar su proceso"
         )
 
-    for clave, papel in (("pid", "trabajador"), ("pid_trabajo", "trabajo")):
-        pid = entrada.get(clave)
-
-        if pid and comprobar_proceso(int(pid)):
-            return (
-                "el proceso " + str(pid) + " (" + papel + ") sigue vivo en "
-                "esta máquina"
-            )
-
-    return None
+    return procesos_vivos_de(entrada, comprobar_proceso)
 
 
 def _resumen(entrada: dict, fila: dict | None, motivo: str | None = None) -> dict:
@@ -2088,6 +2143,7 @@ def _cambiar_entrada(
         cursor = con.execute(
             "UPDATE cola SET estado_cola = ?, actualizado_en = ?, "
             "trabajador_id = NULL, generacion = NULL, pid = NULL, "
+            "pid_trabajo = NULL, "
             "worktree = NULL, despachado_en = NULL, adoptado_en = NULL, "
             "ultimo_rechazo = ? "
             "WHERE secuencia = ? AND estado_cola = ?",
@@ -2240,12 +2296,15 @@ def limpiar_arbol(raiz: Path, identificador: str) -> dict:
             "ahí se perdería. Vuelve a la rama o confírmalo a mano."
         )
 
-    # Lo que el árbol contiene se mira SIN el candado: `status` sobre un
-    # árbol grande tarda segundos, y el candado de escritura es el de toda
-    # la base (un despacho, una adopción o un cierre que esperara más que
-    # `busy_timeout` fallaban; auditoría R2). `worktree remove` sin
-    # `--force` vuelve a rechazar por sí mismo un árbol con cambios
-    # versionados o sin versionar que aparecieran entre medias.
+    # Lo que el árbol contiene se mira primero SIN el candado: `status`
+    # sobre un árbol grande tarda segundos, y el candado de escritura es
+    # el de toda la base (un despacho, una adopción o un cierre que
+    # esperara más que `busy_timeout` fallaban; auditoría R2). Esto es
+    # sólo un ATAJO para rechazar pronto y barato: lo que decide se
+    # vuelve a mirar abajo con el candado tomado. Para los cambios
+    # versionados y sin versionar basta, además, con que `worktree
+    # remove` sin `--force` se niegue por sí mismo; para los IGNORADOS
+    # no, porque Git los borra sin decir nada (auditoría R3).
     cambios = Git(arbol).cambios_del_arbol()
 
     if cambios is None:
@@ -2311,10 +2370,68 @@ def limpiar_arbol(raiz: Path, identificador: str) -> dict:
                     "borra hasta que el trabajador o la recuperación la cierren."
                 )
 
+            # Las dos guardas de arriba miran el ESTADO; ninguna ve un
+            # proceso que siga corriendo con su entrada ya cerrada. Pasa
+            # de verdad: una orden humana (`reabrir`, `bloquear`) saca la
+            # tarea de EN_EJECUCION sin mirar si hay alguien detrás, y
+            # entonces `desencolar` retira la entrada. Sin esto, el árbol
+            # se borraba debajo del trabajo en marcha (auditoría R3).
+            ultima = _ultima_entrada_de(con, identificador)
+            vivo = (
+                None if ultima is None
+                else procesos_vivos_de(ultima, nucleo.proceso_vivo)
+            )
+
+            if vivo is not None:
+                raise ErrorLimpieza(
+                    "La última ejecución de '" + identificador + "' (entrada "
+                    + str(ultima["secuencia"]) + ", " + str(ultima["estado_cola"])
+                    + ") todavía tiene vida: " + vivo + ". Su árbol no se "
+                    "borra mientras algo pueda estar escribiendo en él; "
+                    "para el proceso y repite."
+                )
+
+            # Lo IGNORADO se relee CON EL CANDADO, justo antes de borrar:
+            # `worktree remove` sin `--force` protege lo versionado y lo
+            # sin versionar, pero NO lo ignorado (comprobado con git
+            # 2.43: lo borra y sale con 0). La lectura de arriba, fuera
+            # del candado, sólo sirve para rechazar pronto y barato; la
+            # que decide es ésta (auditoría R3).
+            ignorados = _ignorados_del_arbol(
+                arbol, tiempo_limite_s=TIEMPO_GIT_BAJO_CANDADO_S
+            )
+
+            if ignorados is None:
+                raise ErrorLimpieza(
+                    "Git no pudo listar los archivos ignorados de '"
+                    + str(arbol) + "' con el candado tomado: no se borra lo "
+                    "que no se puede verificar."
+                )
+
+            if ignorados:
+                raise ErrorLimpieza(
+                    "El árbol '" + str(arbol) + "' tiene " + str(len(ignorados))
+                    + " archivo(s) ignorados por Git (" + ", ".join(ignorados[:5])
+                    + ("..." if len(ignorados) > 5 else "") + "). No se borran "
+                    "sin que alguien los mire; retíralos a mano si sobran."
+                )
+
             resultado = _git(
                 raiz, "worktree", "remove", str(arbol),
                 tiempo_limite_s=TIEMPO_GIT_BAJO_CANDADO_S,
             )
+
+            if resultado.returncode == 124:
+                # Lo interrumpimos NOSOTROS al agotar el tope, con el
+                # candado tomado: Git no se negó a nada y el árbol puede
+                # haber quedado a medio retirar.
+                raise ErrorLimpieza(
+                    "Se interrumpió a Git tras "
+                    + str(TIEMPO_GIT_BAJO_CANDADO_S) + " s retirando '"
+                    + str(arbol) + "' (el candado de la base no puede "
+                    "esperar más): el árbol puede haber quedado a medio "
+                    "borrar. Revísalo antes de repetir."
+                )
 
             if resultado.returncode != 0:
                 raise ErrorLimpieza(
@@ -2351,11 +2468,14 @@ def limpiar_arbol(raiz: Path, identificador: str) -> dict:
     }
 
 
-def _ignorados_del_arbol(arbol: Path) -> list[str] | None:
+def _ignorados_del_arbol(
+    arbol: Path, tiempo_limite_s: float | None = None,
+) -> list[str] | None:
     """Rutas ignoradas por Git presentes en el árbol, sin el bytecode de
-    Python. None si Git no puede responder."""
+    Python. None si Git no puede responder (o no responde a tiempo)."""
     resultado = _git(
         arbol, "status", "--porcelain=v1", "-z", "--ignored", "--untracked-files=all",
+        tiempo_limite_s=tiempo_limite_s,
     )
 
     if resultado.returncode != 0:
@@ -2513,35 +2633,72 @@ def _matar_descendencia(proceso):
 
 
 @contextlib.contextmanager
-def _senales_de_terminacion_bloqueadas():
+def _lanzamiento_sin_interrupciones():
     """
-    Aplaza SIGTERM/SIGINT/SIGHUP mientras dura el bloque (POSIX). Entre
-    el `Popen` del trabajo y su anotación en `_TRABAJO_EN_CURSO` una
-    señal hacía saltar `Interrumpido` con el trabajo ya vivo y sin nadie
-    que lo matara: la tarea se devolvía y el trabajo seguía escribiendo
-    (auditoría R2). La señal pendiente se entrega al salir del bloque,
-    cuando el manejador ya encuentra el trabajo anotado y lo mata.
+    APLAZA la interrupción mientras el trabajo se lanza y se anota.
+
+    Entre el `Popen` del trabajo y su anotación en `_TRABAJO_EN_CURSO`
+    hay una ventana: una señal que llegue ahí hacía saltar
+    `Interrumpido` con el trabajo ya vivo y sin nadie que lo matara, y
+    la tarea se devolvía con el trabajo escribiendo todavía (R2).
+
+    R2 lo intentó con `pthread_sigmask`, y estaba MAL por dos motivos
+    (auditoría R3): la máscara es POR HILO, así que con el hilo del
+    latido vivo el núcleo entregaba la señal a ese hilo y el manejador
+    de Python corría igualmente en el principal —la ventana seguía
+    abierta—; y la máscara SE HEREDA, así que todo trabajo nacía con
+    SIGTERM, SIGINT y SIGHUP bloqueadas y ya no podía terminar de
+    forma ordenada (sólo `SIGKILL` lo mataba).
+
+    Aquí no se toca ninguna máscara: se marca la ventana y el
+    manejador de señales del trabajador, que corre SIEMPRE en el hilo
+    principal (semántica de Python, sea cual sea el hilo al que el
+    núcleo entregue la señal), ANOTA la señal en vez de lanzar. Al
+    cerrar la ventana se cobra: se mata el grupo del trabajo y se
+    lanza `Interrumpido`. No depende de cuántos hilos haya ni deja
+    herencia en el hijo.
     """
-    if not hasattr(signal, "pthread_sigmask"):
-        yield
-        return
+    global _LANZAMIENTO_EN_CURSO
 
-    senales = {
-        senal for senal in (
-            getattr(signal, nombre, None) for nombre in ("SIGTERM", "SIGINT", "SIGHUP")
-        ) if senal is not None
-    }
-
-    try:
-        anterior = signal.pthread_sigmask(signal.SIG_BLOCK, senales)
-    except (OSError, ValueError):
-        yield
-        return
+    _LANZAMIENTO_EN_CURSO = True
 
     try:
         yield
     finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, anterior)
+        _LANZAMIENTO_EN_CURSO = False
+
+
+def aplazar_interrupcion(numero: int) -> bool:
+    """
+    Para el manejador de señales del trabajador: ¿estamos dentro de la
+    ventana de lanzamiento? Si lo estamos, se anota la señal y se
+    responde True (el manejador NO debe lanzar todavía).
+    """
+    global _INTERRUPCION_APLAZADA
+
+    if not _LANZAMIENTO_EN_CURSO:
+        return False
+
+    if _INTERRUPCION_APLAZADA is None:
+        _INTERRUPCION_APLAZADA = int(numero)
+
+    return True
+
+
+def cobrar_interrupcion_aplazada() -> None:
+    """Si llegó una señal durante el lanzamiento, se atiende AHORA, con
+    el trabajo ya anotado: se mata su grupo y se interrumpe."""
+    global _INTERRUPCION_APLAZADA
+
+    numero = _INTERRUPCION_APLAZADA
+
+    if numero is None:
+        return
+
+    _INTERRUPCION_APLAZADA = None
+    interrumpir_trabajo_en_curso()
+
+    raise Interrumpido("señal " + str(numero))
 
 
 def _cola_del_archivo(ruta: Path) -> str:
@@ -2591,9 +2748,20 @@ def _resolver_ejecutable(argv: list[str]) -> tuple:
         carpeta = os.path.normcase(
             os.path.abspath(os.path.dirname(ruta) or os.curdir)
         )
+        # El MISMO origen que usa `shutil.which`: sin `PATH` en el
+        # entorno (un servicio, un `cron`) busca en `os.confstr("CS_PATH")`
+        # y encuentra el ejecutable; comparar contra un PATH vacío lo
+        # rechazaba con un motivo falso (auditoría R3).
+        camino = os.environ.get("PATH")
+
+        if camino is None:
+            camino = (
+                os.confstr("CS_PATH") if hasattr(os, "confstr") else os.defpath
+            ) or os.defpath
+
         en_path = {
             os.path.normcase(os.path.abspath(una))
-            for una in os.environ.get("PATH", "").split(os.pathsep) if una
+            for una in camino.split(os.pathsep) if una
         }
 
         if carpeta not in en_path:
@@ -2694,25 +2862,44 @@ def correr_trabajo(
             "descendencia_matada": None,
         }
 
+    proceso = None
+
     try:
-        # El lanzamiento y su anotación van juntos, sin que una señal
-        # pueda colarse entre los dos.
-        with _senales_de_terminacion_bloqueadas():
+        # El lanzamiento y su anotación van juntos: una señal que llegue
+        # entre los dos se aplaza y se cobra al salir del bloque.
+        with _lanzamiento_sin_interrupciones():
             with open(salida, "ab") as archivo:
                 proceso = _lanzar_desligado(
                     [ejecutable] + argv[1:], str(arbol), entorno, archivo,
                 )
 
             _TRABAJO_EN_CURSO = proceso
+
+        cobrar_interrupcion_aplazada()
     except OSError as error:
+        # El `open` o el propio `Popen` fallaron: no hay trabajo vivo,
+        # pero puede quedar una señal aplazada que hay que atender.
+        cobrar_interrupcion_aplazada()
+
         return informe(
             None, False,
             "No se pudo lanzar el trabajo " + repr(argv[:1]) + ": "
             + type(error).__name__ + ": " + str(error),
         )
+    except BaseException:
+        # Cualquier otra interrupción con el trabajo ya lanzado: no se
+        # sale de aquí dejándolo huérfano (auditoría R3).
+        if proceso is not None:
+            matar_grupo(proceso)
+            _TRABAJO_EN_CURSO = None
+
+        raise
 
     descendencia = None
 
+    # El tiempo límite del trabajo empieza a contar AQUÍ, después de
+    # anotar su PID: la anotación reintenta ante un candado de la base
+    # y podía comerse decenas de segundos del límite (auditoría R3).
     try:
         if al_lanzar is not None:
             try:
@@ -2727,8 +2914,12 @@ def correr_trabajo(
                     "interrumpió para no dejar un trabajo que nadie vigile.",
                 )
 
+        limite = time.monotonic() + int(tiempo_limite_s)
+
         try:
-            codigo = proceso.wait(timeout=int(tiempo_limite_s))
+            codigo = proceso.wait(
+                timeout=max(0.0, limite - time.monotonic())
+            )
         except subprocess.TimeoutExpired:
             matar_grupo(proceso)
 
@@ -3457,7 +3648,15 @@ def _devolver_tras_averia(
             return
         except nucleo.ErrorEspejo as aviso:
             informe["avisos"].append(str(aviso))
-            informe["estado_final"] = _estado_en_base(raiz, identificador)
+
+            try:
+                informe["estado_final"] = _estado_en_base(raiz, identificador)
+            except Exception:
+                # La transición SÍ se confirmó; que la base no responda
+                # ahora no puede convertir esto en un traceback que"
+                # escape del trabajador (auditoría R3).
+                informe["estado_final"] = None
+
             return
         except global_.ErrorEstadoGlobal as transitorio:
             rechazo = transitorio

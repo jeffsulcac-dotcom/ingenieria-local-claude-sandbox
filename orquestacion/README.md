@@ -1563,10 +1563,19 @@ zona ni la ranura pueden ser enlaces simbólicos: con `<zona>/T-0201 ->
 a la vez el mismo árbol esperan a que el ganador termine el checkout
 (`locked initializing` e `index.lock`), y la toma decide. Los restos de
 un `worktree add`/`remove` interrumpido se reparan solos si no contienen
-nada de nadie: una carpeta vacía que Git no lista se retira con `rmdir`, y
-los metadatos de un árbol cuyo directorio ya no existe con `git worktree
-prune` (que no toca ramas ni archivos). Una carpeta con contenido pero sin
-`.git` no se toca: puede ser de alguien.
+nada de nadie: una carpeta vacía que Git no lista y que tiene más de
+cinco segundos se retira con `rmdir` —Git crea el directorio ANTES de
+registrar el árbol, así que uno recién nacido puede ser de otro despacho
+en curso; una marca de tiempo en el FUTURO cuenta como resto, porque si
+no la ranura quedaba bloqueada para siempre—, y los metadatos de un
+árbol cuyo directorio ya no existe se retiran UNO A UNO, sólo los de esa
+ranura. No se usa `git worktree prune`: poda TODAS las entradas
+prunables del repositorio, y un worktree del usuario en un disco
+desconectado en ese instante perdía su índice y su reflog (auditoría
+R2). Una entrada bloqueada (`locked`) no se toca, igual que hace Git, y
+un `gitdir` relativo (git 2.48 y posteriores) se resuelve contra su
+propia carpeta. Una carpeta con contenido pero sin `.git` no se toca:
+puede ser de alguien.
 
 Un árbol preparado por un despacho que luego pierde la toma se QUEDA: es
 de la tarea, no de quien lo creó, y quien ganó pudo haberlo grabado como
@@ -1874,7 +1883,7 @@ lo CONFIRMADO se corrigió en esta misma rama y tiene su comprobación
 |---|---|---|---|
 | 1 | SIGKILL al trabajador dejaba el TRABAJO vivo (sesión propia, PID desconocido) y la recuperación relanzaba sobre el mismo árbol | CONFIRMADO (reproducido: dos trabajos en el mismo árbol) | 28, 11 |
 | 2 | Un candado retenido más que `busy_timeout` durante la transición dejaba «EN_EJECUCION + entrada FALLIDA», que nadie recuperaba, y perdía la corrida | CONFIRMADO | 29 |
-| 3 | `limpiar_arbol` hacía `git status` ×2 y `worktree remove` con el candado de toda la base, sin tope | CONFIRMADO (lecturas fuera; `remove` con tope) | 32 (sigue bajo candado), 20 |
+| 3 | `limpiar_arbol` hacía `git status` ×2 y `worktree remove` con el candado de toda la base, sin tope | CONFIRMADO (la lectura de cambios, fuera; la de ignorados volvió dentro en R3; `remove` con tope) | 39 (desde R3), 32, 20 |
 | 4 | Un fallo del espejo JSON tras el COMMIT se confundía con un rechazo en la adopción (código 4 con la fila adoptada), el despacho (tarea colgada sin trabajador) y la transición (código 2 con PROPUESTO) | CONFIRMADO (`ErrorEspejo`) | 30 |
 | 5 | Un PID reutilizado dejaba la entrada despachada sin salida: `desencolar` la rechazaba y la consola lo aconsejaba | CONFIRMADO | 31 |
 | 6 | Un trabajador de OTRO equipo se reencolaba sin segunda señal, al revés de la regla de `clasificar_ejecucion` | CONFIRMADO | 31 |
@@ -1886,20 +1895,20 @@ lo CONFIRMADO se corrigió en esta misma rama y tiene su comprobación
 | 12 | Ventana de señal entre el `Popen` del trabajo y su anotación: el trabajo sobrevivía a la devolución | CONFIRMADO (reproducido por inyección) | 35 |
 | 13 | Un trabajo que salía con 0 dejando un nieto: nadie mataba el grupo; el nieto escribía tras PROPUESTO y la limpieza borraba debajo | CONFIRMADO (reproducido) | 28 |
 | 14 | La huella de la raíz bloqueaba trabajos honestos por cualquier archivo que el usuario tocara en la raíz | CONFIRMADO (sólo cuenta lo que cae en el ámbito) | 34 |
-| 15 | Candados huérfanos (`locked`, `index.lock`) con mensaje engañoso y sin receta | CONFIRMADO (mensajes y receta; sin reparación a ciegas, a propósito) | 36 |
+| 15 | Candados huérfanos (`locked`, `index.lock`) con mensaje engañoso y sin receta | CONFIRMADO (mensajes y receta; sin reparación a ciegas, a propósito) | 36 (`locked`), 39e (`index.lock`, desde R3) |
 | 16 | Una segunda señal durante la devolución la cortaba: EN_EJECUCION fantasma con la entrada cerrada | CONFIRMADO (reproducido) | 35 |
 | 17 | Base `main` desactualizada para ramas nuevas; la consola no exponía `--base` | DECISIÓN HUMANA (documentada); `--base` expuesto | — |
 | 18 | `info/exclude`, `tag`, `stash`, `.gitignore` del árbol invisibles a la huella | PARCIAL: `info/exclude` sí; el resto FUERA DE ALCANCE (red contra el descuido, documentado) | 34 |
 | 19 | `rmdir` de un directorio vacío recién creado por un `worktree add` ajeno (ventana de un syscall) | CONFIRMADO (lectura; edad mínima) | 36 |
 | 20 | `.arboles` como enlace colgante: traceback | CONFIRMADO | 36 |
 | 21 | `fuera_del_arbol` O(n·m) | CONFIRMADO | 36 |
-| 22 | El manejador de señales no actúa en Windows (`DETACHED_PROCESS`) y el mensaje de `matar_grupo` mentía | CONFIRMADO (mensaje según SO, `taskkill /T`; Job Object V2) | gate |
+| 22 | El manejador de señales no actúa en Windows (`DETACHED_PROCESS`) y el mensaje de `matar_grupo` mentía | CONFIRMADO (mensaje según SO, `taskkill /T`; Job Object V2) | ninguna: el mensaje es de Windows y aquí no se ejecuta. Lo mira una persona en el gate |
 | 23 | `limpiar_arbol` exigía `tarea/<id>` mientras la toma honra `ficha.rama` | CONFIRMADO (lectura) | 36 |
-| 24 | Batería: `matar` del arnés no alcanzaba al trabajo (otra sesión); mínimos de métricas con margen cero; aserciones vacías en 16a, 17, 20b, 21 (prefijo del temporal), 22b (tautología), 27 (segunda vuelta) | CONFIRMADO | arnés, 11, 16, 17, 21, 22, 27 |
+| 24 | Batería: `matar` del arnés no alcanzaba al trabajo (otra sesión); mínimos de métricas con margen cero; aserciones que se cumplían por otra razón en 16a, 21 (prefijo del temporal) y 22b (tautología); cobertura que faltaba en 17 y 27 | CONFIRMADO (R3 precisó el alcance: la 20b no se tocó) | arnés, 11, 16, 21, 22; cobertura nueva en 17 y 27 |
 | 25 | Batería: sin cobertura la limpieza bajo candado frente a un despacho real, el gancho de la toma, la huella de config/hooks, el evento del reencolado, otra máquina, `ESQUEMA_MAS_NUEVO` | CONFIRMADO | 32, 33, 34, 28, 31 |
 | 26 | Docstrings y README rancios (autoridad SQLite, argv de ejemplo, `limpiar_arbol`, `proceso_vivo`, `adoptar`, uso de la consola, «C pendiente») | CONFIRMADO | — |
 
-Tras R2 la batería tiene 36 comprobaciones y tarda 38.5 s aquí.
+Tras R2 la batería tenía 36 comprobaciones; con R3 son 41.
 Las quince mutaciones nuevas, cada una deshaciendo UNA corrección de R2,
 se detectan todas; la comprobación que cae en cada caso: la
 reconciliación ignora los procesos vivos → 19; poda global → 36; sin
@@ -1913,6 +1922,41 @@ tratada como rechazo → 30. Las ocho exigidas y las variantes de R1
 siguen detectándose igual (M2b sólo por `prueba_toma_atomica.py` y M2c
 por nadie, como se documenta arriba).
 
+**Auditoría R3 (tres revisores de sólo lectura, sobre las CORRECCIONES
+de R2, que nadie había revisado: `a6e4f0c..82c172b`).** Una corrección
+es código nuevo y puede traer defectos nuevos; dos de los suyos eran
+graves. Trece hallazgos confirmados, todos cerrados aquí.
+
+| # | Hallazgo | Clasificación | Comprobación |
+|---|---|---|---|
+| 1 | El bloqueo de señales de R2 NO aplazaba nada: `pthread_sigmask` es POR HILO, y con el hilo del latido vivo el núcleo entregaba la señal a ese hilo mientras el manejador de Python corría igualmente en el principal. La ventana que R2 decía cerrar seguía abierta | CONFIRMADO, ALTO (reproducido) | 40a |
+| 2 | Y esa máscara SE HEREDA: todo trabajo nacía con SIGTERM, SIGINT y SIGHUP bloqueadas, así que no podía terminar de forma ordenada y sólo moría con `SIGKILL` | CONFIRMADO, ALTO (reproducido con `/proc/<pid>/status`) | 40b |
+| 3 | `desencolar` de una despachada (nuevo en R2) dejaba la limpieza sin sus dos guardas: tras un `reabrir` humano se borraba el árbol DEBAJO del trabajo en marcha | CONFIRMADO, ALTO (reproducido con procesos reales) | 37a |
+| 4 | `pid_trabajo` no se limpiaba al reencolar ni al despachar: la entrada publicaba el PID de una generación anterior y, si el sistema lo reutilizaba, la cola se bloqueaba para siempre | CONFIRMADO (reproducido) | 37b |
+| 5 | La consola trataba `ErrorEspejo` como avería (código 2) en `crear`, `tomar`, `decidir` y `latido`: un guion daba por no hecho lo que sí se hizo | CONFIRMADO (reproducido) | 38a, 38d |
+| 6 | Una fila sin su JSON quedaba inalcanzable: `crear` decía «ya existe», `ver` «no existe» y `sincronizar-definiciones` no la veía | CONFIRMADO (reproducido) | 38b, 38c |
+| 7 | La justificación de sacar las lecturas del candado era FALSA para lo ignorado: `worktree remove` sin `--force` protege lo versionado y lo sin versionar, pero borra lo ignorado sin decir nada | CONFIRMADO (comprobado con git 2.43) | 39a, 39b |
+| 8 | Una marca de tiempo en el futuro hacía que un resto vacío no se retirara NUNCA y la ranura quedaba bloqueada | CONFIRMADO (reproducido) | 41a |
+| 9 | Sin `PATH` en el entorno (un servicio, un `cron`), `_resolver_ejecutable` rechazaba un ejecutable que `shutil.which` sí encuentra | CONFIRMADO (reproducido) | 41b |
+| 10 | Un `gitdir` relativo (git 2.48 y posteriores) no se reconocía y la poda dirigida no retiraba nada, dejando la tarea sin poder despacharse | CONFIRMADO (lectura; git 2.43 no lo produce) | 41c |
+| 11 | El tope de 30 s del `remove` culpaba a Git de una negativa que era nuestra y no avisaba del árbol a medio borrar | CONFIRMADO | 39d |
+| 12 | El respaldo del trabajador podía lanzar al leer el estado y salir como traceback en inglés con código 1 | CONFIRMADO (lectura) | — (guarda añadida) |
+| 13 | El despacho recogía `avisos` que nadie imprimía | CONFIRMADO | 38e |
+| 14 | Batería: 44 mutaciones nuevas; ocho no las detectaba nadie (lecturas fuera del candado, tope del `remove`, `index.lock`, mensaje según SO, rastro del Supervisor, matar el trabajo sin vigilancia, `locked` en la poda) | CONFIRMADO | 37c, 37d, 39, 40 |
+| 15 | Documentación: §3 seguía prometiendo `git worktree prune`; el paso 6b del gate no probaba lo que decía (argparse partía `--trabajador "-x"`); el paso 7 buscaba prefijos de temporales que ya no existen; tres filas de la tabla de R2 prometían cobertura inexistente | CONFIRMADO | — (corregido aquí) |
+
+La solución del 1 y el 2 no es una máscara mejor: es no usar ninguna. El
+manejador de señales, que corre SIEMPRE en el hilo principal sea cual sea
+el hilo al que el núcleo entregue la señal, ANOTA la señal si llega
+mientras el trabajo se está lanzando, y quien cierra esa ventana la
+cobra con el trabajo ya anotado: lo mata y lanza `Interrumpido`. No
+depende de cuántos hilos haya ni deja herencia en el hijo.
+
+Las diecisiete mutaciones de R3, cada una deshaciendo UNA de estas
+correcciones, se detectan todas; y las dos de R2 que las correcciones
+dejaron sin ancla se reemplazaron (la del bloqueo de señales ya no
+existe: la sustituye «el manejador no aplaza»).
+
 **Verificación en Windows.** Esta rama sólo se ha ejecutado en Linux
 (Python 3.11, git 2.43). `WINDOWS_GATE_REQUIRED = SI`,
 `WINDOWS_GATE_EXECUTED = NO`. Lo que puede comportarse distinto en
@@ -1923,9 +1967,9 @@ consultar (las comprobaciones 23, 28e y 35 se omiten y lo dicen); los
 enlaces simbólicos (la 21 y la 36c se omiten si el sistema no los
 permite); `shutil.which` con `PATHEXT` y el cwd (36e); `git worktree
 add` dentro de la raíz, `info/exclude` y `LC_ALL=C` con Git en español;
-el manejador de `SIGBREAK`; y la duración: la batería lanza más de 150
+el manejador de `SIGBREAK`; y la duración: la batería lanza casi 200
 procesos de Python (carreras, trabajadores con su corredor, consolas) y
-tarda 38.5 s aquí frente al límite de 120 s del corredor por
+tarda unos 50 s aquí frente al límite de 120 s del corredor por
 archivo. Un solo bloque, en PowerShell 7, desde un CLON
 TEMPORAL del repositorio (la base SQLite vive en `.git/` y el gate crea
 tareas de usar y tirar; T-0001 y T-0002 no se ejecutan):
@@ -1941,7 +1985,7 @@ tareas de usar y tirar; T-0001 y T-0002 no se ejecutan):
         if ($LASTEXITCODE -ne 0) { $script:fallos += "$nombre (codigo $LASTEXITCODE)"; Write-Host "FALLO: $nombre" -ForegroundColor Red }
         Write-Host ("{0}: {1:N1} s" -f $nombre, $t.TotalSeconds)
     }
-    # 1. La batería de Workers V1, sola y cronometrada (36 comprobaciones; 21, 23, 28e, 35 y 36c pueden salir OMITIDA en Windows y deben decirlo).
+    # 1. La bateria de Workers V1, sola y cronometrada (41 comprobaciones; 21, 23, 28e, 35, 36c, 38d, 40 y 41b pueden salir OMITIDA en Windows y deben decirlo).
     Paso "1 bateria workers v1" { python .\pruebas\orquestacion\prueba_workers_v1.py }
     # 2. Estrés entre procesos.
     Paso "2 estres" { python .\pruebas\orquestacion\prueba_workers_v1.py --rondas 10 --despachadores 8 }
@@ -1966,12 +2010,14 @@ tareas de usar y tirar; T-0001 y T-0002 no se ejecutan):
     # 6. Lo que debe RECHAZARSE en Windows (codigo esperado entre parentesis).
     python -m orquestacion.ingenieria_supervisor --sin-git encolar T-9005 --trabajo tarea.bat x;        Write-Host "6a .bat (esperado 2): $LASTEXITCODE"
     python -m orquestacion.ingenieria_supervisor --sin-git encolar T-9005 --trabajo python -c "print(1)"
-    python -m orquestacion.ingenieria_supervisor --sin-git despachar T-9005 --trabajador "-x";           Write-Host "6b identidad con guion (esperado 2): $LASTEXITCODE"
+    python -m orquestacion.ingenieria_supervisor --sin-git despachar T-9005 "--trabajador=-x";           Write-Host "6b identidad con guion (esperado 2): $LASTEXITCODE"
+    #    Ojo: pegado con `=`. Con `--trabajador "-x"` el 2 lo devuelve argparse
+    #    («expected one argument») sin llegar nunca a la guarda que se quiere probar.
     python -m orquestacion.ingenieria_supervisor --sin-git despachar T-9005;                              Write-Host "6c despachar aprobada/propuesta (esperado 7): $LASTEXITCODE"
     python -m orquestacion.ingenieria_supervisor --sin-git desencolar T-9005;                             Write-Host "6d desencolar (esperado 0): $LASTEXITCODE"
     # 7. Que no quedaron procesos ni temporales (la salida debe estar vacia).
     Get-Process python, git -ErrorAction SilentlyContinue | Where-Object { $_.StartTime -gt (Get-Date).AddMinutes(-10) }
-    Get-ChildItem $env:TEMP -Directory | Where-Object { $_.Name -match '^(cola_|misma_|solapadas_|paralelas_|doble_|bien_|falla_|duda_|fuera_|fuera_zona_|ajenos_|apagon_|argv_|consola_|estres_|atomico_|adopcion_|lanzamiento_|envenenada_|reconciliar_|desaparece_|enlaces_|esconder_|nietos_|entorno_|roto_|orden_|base_|senales_)' }
+    Get-ChildItem $env:TEMP -Directory | Where-Object { $_.Name -match '^(cola_|misma_|solapadas_|paralelas_|doble_|bien_|falla_|duda_|duda2_|fuera_|fuera_zona_|ajenos_|apagon_|argv_|consola_|consola_espejo_|estres_|atomico_|adopcion_|lanzamiento_|envenenada_|reconciliar_|desaparece_|vinculos_|esconder_|nietos_|entorno_|roto_|orden_|base_|senales_|senal_|huerfano_|respaldo_|espejo_|carrera_|gancho_|huella_|poda_|protegida_|ignorados_|aplazada_|raros_)' }
     Get-ChildItem $env:TEMP -File | Where-Object { $_.Name -match '^trabajo_.*\.log$' }
     # 8. Veredicto.
     if ($fallos.Count -eq 0) { Write-Host "`nWINDOWS_GATE_T0003 = OK" -ForegroundColor Green } else { Write-Host "`nWINDOWS_GATE_T0003 = FALLO" -ForegroundColor Red; $fallos }
@@ -1979,7 +2025,12 @@ tareas de usar y tirar; T-0001 y T-0002 no se ejecutan):
 Criterio para decidir que Windows pasó, todo a la vez: (1) imprime
 `PRUEBA_WORKERS_V1=OK`, sale con 0, las cuatro métricas de fallo en 0 y
 tarda claramente por debajo de 120 s (anotar el tiempo, y qué
-comprobaciones salieron OMITIDA); (2) y (3) salen con 0, la (3) sin
+comprobaciones salieron OMITIDA: las ÚNICAS posibles son 21, 23, 28e,
+35, 36c, 38d, 40 y 41b, y cualquier otra hay que mirarla). Las demás
+métricas, con esas ocho omisiones, deberían quedar cerca de
+94/88/47/7/69/20/26/25/8/39 —medido en Linux simulándolas— frente a
+102/94/50/7/74/21/29/28/8/43 con todo ejecutado; una cifra MUY por
+debajo significa que algo se saltó sin decirlo; (2) y (3) salen con 0, la (3) sin
 avisos; (4) da 9 de 9; (5) la entrada de T-9005 termina `terminada ->
 propuesto`, `ver` muestra el árbol en `.arboles\T-9005` y la limpieza lo
 retira; (6) devuelve 2, 2, 7 y 0; (7) no devuelve nada;

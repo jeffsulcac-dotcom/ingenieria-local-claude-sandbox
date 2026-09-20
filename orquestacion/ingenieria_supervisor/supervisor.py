@@ -1830,28 +1830,104 @@ def crear(
     # De paso, el candado de escritura de TODA la base deja de retenerse
     # durante el `fsync` del archivo, que es lo que `tomar` ya evitaba a
     # propósito.
-    with global_.conexion(raiz) as con:
-        with global_.transaccion(con):
-            if global_.obtener_tarea(con, identificador) is not None:
-                raise ErrorCreacion(
-                    "La tarea '" + identificador + "' ya existe en el "
-                    "estado global: no se puede volver a crear con el "
-                    "mismo identificador."
-                )
+    try:
+        with global_.conexion(raiz) as con:
+            with global_.transaccion(con):
+                if global_.obtener_tarea(con, identificador) is not None:
+                    raise ErrorCreacion(
+                        "La tarea '" + identificador + "' ya existe en el "
+                        "estado global: no se puede volver a crear con el "
+                        "mismo identificador."
+                    )
 
-            # Se relee el árbol con el bloqueo tomado: entre la
-            # comprobación de arriba y este punto, otro proceso pudo haber
-            # creado la ficha y confirmado.
-            if existe(raiz, identificador):
-                raise ErrorCreacion(
-                    "Ya existe la ficha '" + identificador + "'."
-                )
+                # Se relee el árbol con el bloqueo tomado: entre la
+                # comprobación de arriba y este punto, otro proceso pudo
+                # haber creado la ficha y confirmado.
+                if existe(raiz, identificador):
+                    raise ErrorCreacion(
+                        "Ya existe la ficha '" + identificador + "'."
+                    )
 
-            global_.importar_ficha(con, ficha, evento_importacion=False)
+                global_.importar_ficha(con, ficha, evento_importacion=False)
+    except ErrorCreacion:
+        # Una fila SIN su JSON es el resto de un espejo que no se pudo
+        # escribir: se repara desde la fila en vez de rechazar para siempre
+        # con «ya existe» una tarea que nadie puede ver (auditoría R3).
+        #
+        # La reparación va AQUÍ, en el camino de error, y no antes de la
+        # transacción: leer la fila antes rompía el orden que A3.2 exige
+        # —comprobar la existencia DENTRO del candado y justo antes de
+        # insertar— y que la comprobación 36 de A3.3 vigila.
+        reparada = regenerar_espejo_desde_la_base(raiz, identificador)
+
+        if reparada is None:
+            raise
+
+        raise ErrorCreacion(
+            "La tarea '" + identificador + "' ya existía en el estado "
+            "global sin su ficha JSON (un espejo que no se pudo "
+            "escribir): se ha REGENERADO desde la base, con su "
+            "definición y su estado ('" + str(reparada.estado) + "'). No "
+            "se ha creado ninguna tarea nueva; revísala con `ver "
+            + identificador + "`."
+        ) from None
 
     _regenerar_espejo(raiz, ficha)
 
     ficha.eventos_pendientes.clear()
+
+    return ficha
+
+
+def regenerar_espejo_desde_la_base(raiz: Path, identificador: str):
+    """
+    Reescribe el JSON de una tarea A PARTIR DE SU FILA, y sólo si el
+    archivo falta. Devuelve la ficha reconstruida, o None si no había
+    nada que reparar (el JSON está, o la tarea no existe en la base).
+
+    El espejo se escribe DESPUÉS del COMMIT, a propósito (ver `crear`),
+    así que una fila sin JSON es el resto esperable de un fallo al
+    escribirlo: el archivo abierto por otro proceso en Windows, un
+    permiso, un disco lleno. Sin esta reparación la tarea quedaba
+    inalcanzable desde el producto: `crear` respondía «ya existe en el
+    estado global», `ver` «no existe la ficha» y
+    `sincronizar-definiciones` no la veía, porque recorre los archivos
+    (auditoría R3).
+
+    La definición sale de la fila, NUNCA de lo que pida quien repara:
+    la base es la autoridad y reparar no puede ser una puerta para
+    cambiar el ámbito de una tarea viva sin pasar por
+    `sincronizar-definiciones`.
+    """
+    raiz = Path(raiz).resolve()
+    validar_id(identificador)
+
+    if existe(raiz, identificador):
+        return None
+
+    with global_.conexion(raiz) as con:
+        fila = global_.obtener_tarea(con, identificador)
+
+    if fila is None:
+        return None
+
+    ficha = Ficha(
+        id=identificador,
+        titulo=str(fila.get("titulo") or identificador),
+        objetivo=str(fila.get("objetivo") or ""),
+        criterios_aceptacion=list(fila.get("criterios_aceptacion") or []),
+        ambito_archivos=list(fila.get("ambito_archivos") or []),
+        pruebas_requeridas=list(fila.get("pruebas_requeridas") or []),
+        max_intentos=int(fila.get("max_intentos") or 3),
+    )
+    ficha.requiere_decision_humana = normalizar_decisiones(
+        fila.get("decisiones")
+    )
+
+    global_.aplicar_fila(ficha, fila)
+    ficha.eventos_pendientes.clear()
+
+    guardar(raiz, ficha, marcar_actualizacion=False)
 
     return ficha
 

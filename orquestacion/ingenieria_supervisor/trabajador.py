@@ -106,8 +106,9 @@ def construir_analizador() -> argparse.ArgumentParser:
     return analizador
 
 
-class Interrumpido(Exception):
-    """El sistema pidió terminar (SIGTERM, Ctrl-C, cierre de sesión)."""
+# El mismo tipo que usa `trabajadores` para cobrar una interrupción
+# aplazada: `ejecutar_trabajador` tiene que verlas como una sola cosa.
+Interrumpido = trabajadores.Interrumpido
 
 
 # Las señales de terminación recibidas por este proceso, en orden.
@@ -124,6 +125,14 @@ def _instalar_senales() -> None:
     """
     def manejador(numero, _marco):
         SENALES_RECIBIDAS.append(int(numero))
+
+        # Si el trabajo se está lanzando AHORA MISMO, la señal se anota
+        # y no se interrumpe: quien cierra esa ventana la cobra con el
+        # trabajo ya anotado y lo mata (auditoría R3). Si no, se mata lo
+        # que haya en curso.
+        if trabajadores.aplazar_interrupcion(numero):
+            return
+
         trabajadores.interrumpir_trabajo_en_curso()
 
         # Sólo la PRIMERA señal interrumpe: la segunda llegaba mientras
