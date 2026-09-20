@@ -199,7 +199,9 @@ def prueba_creacion_desde_cero():
 
         assert informe["esquema"]["version_anterior"] == 0
         assert informe["esquema"]["version_actual"] == estado_global.VERSION_ESQUEMA
-        assert informe["esquema"]["aplicadas"] == [1, 2]
+        assert informe["esquema"]["aplicadas"] == list(
+            range(1, estado_global.VERSION_ESQUEMA + 1)
+        )
 
         # Pragmas reales, leídos de la base.
         with estado_global.conexion(raiz) as con:
@@ -234,13 +236,17 @@ def prueba_version_de_esquema():
             resultado = estado_global.inicializar(con)
 
             assert resultado["version_actual"] == estado_global.VERSION_ESQUEMA
-            assert estado_global.version_esquema(con) == 2
+            assert estado_global.version_esquema(con) == (
+                estado_global.VERSION_ESQUEMA
+            )
 
             filas = con.execute(
                 "SELECT version, aplicado_en FROM esquema ORDER BY version"
             ).fetchall()
 
-            assert [fila["version"] for fila in filas] == [1, 2]
+            assert [fila["version"] for fila in filas] == list(
+                range(1, estado_global.VERSION_ESQUEMA + 1)
+            )
             assert filas[0]["aplicado_en"]
 
             # Una base "del futuro" se rechaza de forma explícita.
@@ -266,13 +272,19 @@ def prueba_reinicializacion_idempotente():
         segunda = estado_global.inicializar_base(raiz)
         tercera = estado_global.inicializar_base(raiz)
 
-        assert primera["esquema"]["aplicadas"] == [1, 2]
+        assert primera["esquema"]["aplicadas"] == list(
+            range(1, estado_global.VERSION_ESQUEMA + 1)
+        )
         assert segunda["esquema"]["aplicadas"] == []
         assert tercera["esquema"]["aplicadas"] == []
 
         with estado_global.conexion(raiz) as con:
-            assert estado_global.version_esquema(con) == 2
-            assert con.execute("SELECT COUNT(*) FROM esquema").fetchone()[0] == 2
+            assert estado_global.version_esquema(con) == (
+                estado_global.VERSION_ESQUEMA
+            )
+            assert con.execute(
+                "SELECT COUNT(*) FROM esquema"
+            ).fetchone()[0] == estado_global.VERSION_ESQUEMA
 
     finally:
         borrar(raiz)
@@ -964,7 +976,7 @@ def prueba_cli_diagnostico():
         assert informe["estado"] == "ACTIVA"
         assert Path(informe["ruta"]) == estado_global.ruta_base(raiz)
         assert Path(informe["git_common_dir"]) == estado_global.git_common_dir(raiz)
-        assert informe["version_esquema"] == 2
+        assert informe["version_esquema"] == estado_global.VERSION_ESQUEMA
         assert informe["journal_mode"] == "wal"
         assert informe["integridad"] == "ok"
         assert informe["tareas"] == len(identificadores)

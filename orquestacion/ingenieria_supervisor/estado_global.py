@@ -5,7 +5,9 @@ A partir de A2:
 
     SQLite  = autoridad del ESTADO OPERATIVO de cada tarea
               (estado, rama, worktree, intentos, trabajador, latido, fallas,
-              resolución de decisiones humanas, última verificación, eventos).
+              resolución de decisiones humanas, última verificación, eventos)
+              y, desde T-0003, de la COLA de trabajadores (tabla `cola`,
+              migración 3).
 
     JSON    = DEFINICIÓN versionada de cada tarea
               (id, título, objetivo, criterios, ámbito, pruebas requeridas y
@@ -46,9 +48,10 @@ no la usa ninguna orden del ciclo: `supervisor.persistir` pasa por la
 versión condicionada. Queda para la sincronización de definiciones, y
 tiene vetadas las columnas `id` y `generacion`.
 
-Sigue sin implementar: latidos automáticos, expiración temporal de
-trabajadores, detección de trabajadores muertos y recuperación automática
-de tareas abandonadas. Eso queda para A3.3/B.
+Los latidos automáticos, la vitalidad con dos señales y la recuperación
+manual son de A3.3; la cola, el despacho y los trabajadores, de T-0003
+(`trabajadores.py`). Sigue sin implementar la expiración automática de
+trabajadores: ante la duda, decide una persona.
 """
 
 from __future__ import annotations
@@ -74,7 +77,7 @@ from .tarea import (
 
 NOMBRE_BASE = "ingenieria-supervisor.sqlite3"
 
-VERSION_ESQUEMA = 2
+VERSION_ESQUEMA = 3
 
 # Milisegundos que una conexión espera si otra tiene la base ocupada.
 BUSY_TIMEOUT_MS = 5000
@@ -104,6 +107,10 @@ EVENTO_TRANSICION = "transicion"
 EVENTO_VERIFICACION = "verificacion"
 EVENTO_DECISION = "decision"
 EVENTO_RECUPERACION = "recuperacion"
+# T-0003 — movimientos de la cola de trabajadores (encolar, despachar,
+# terminar, reconciliar). Se anotan como eventos de la tarea para que el
+# historial de una tarea cuente también por qué y cuándo se lanzó.
+EVENTO_COLA = "cola"
 
 ORIGEN_AUTOMATICO = "automático"
 
@@ -154,6 +161,20 @@ MOTIVO_ESTADO_INCOMPATIBLE = "estado_incompatible"
 # la grabada (`exigir_no_retroceso`).
 MOTIVO_PRECONDICION_CAMBIADA = "precondicion_cambiada"
 MOTIVO_MARCA_MAS_NUEVA = "marca_mas_nueva"
+
+# T-0003 — estados de una entrada de la cola de trabajadores. La cola vive
+# en esta misma base (tabla `cola`, migración 3): sobrevive a un cierre o
+# a un apagón igual que el estado de las tareas, y se despacha dentro de
+# la misma transacción que concede la toma. Las primitivas que la leen y
+# escriben están en `trabajadores.py`; aquí sólo el esquema y los nombres.
+COLA_PENDIENTE = "pendiente"
+COLA_DESPACHADA = "despachada"
+COLA_TERMINADA = "terminada"
+COLA_FALLIDA = "fallida"
+COLA_RETIRADA = "retirada"
+
+# Entradas que siguen VIVAS: una tarea sólo puede tener una a la vez.
+COLA_ESTADOS_VIVOS = (COLA_PENDIENTE, COLA_DESPACHADA)
 
 # Migraciones versionadas. Cada versión es una lista de sentencias que se
 # aplican dentro de una única transacción. Nunca se edita una versión ya
@@ -226,6 +247,63 @@ MIGRACIONES = {
         #
         # 0 = fila heredada de A2/A3.1 que nunca fue reclamada bajo A3.2.
         "ALTER TABLE tareas ADD COLUMN generacion INTEGER NOT NULL DEFAULT 0",
+    ],
+    3: [
+        # T-0003 — cola persistente de trabajadores.
+        #
+        # `secuencia` es AUTOINCREMENT a propósito: SQLite no reutiliza un
+        # número aunque se borre la fila, así que el orden de llegada es
+        # estable después de cualquier reinicio. El orden de despacho es
+        # `prioridad DESC, secuencia ASC` y lo resuelve la base, no el
+        # proceso que despacha.
+        #
+        # `trabajo` es una LISTA JSON de argumentos (argv). Nunca una
+        # cadena: el trabajador la entrega a `subprocess` tal cual, sin
+        # intérprete de órdenes por medio.
+        #
+        # `pid` es el del proceso trabajador desde que adopta (antes, el
+        # del despacho) y `pid_trabajo` el del trabajo que ese trabajador
+        # lanzó: la recuperación no reencola ni cierra una entrada mientras
+        # cualquiera de los dos siga vivo en esta máquina (auditoría R2).
+        #
+        # Una tarea puede tener varias entradas a lo largo del tiempo
+        # (cada una es el registro de un lanzamiento), pero sólo UNA viva
+        # —pendiente o despachada— a la vez: lo garantiza el índice único
+        # parcial, en el motor, no una comprobación previa en Python.
+        """
+        CREATE TABLE cola (
+            secuencia       INTEGER PRIMARY KEY AUTOINCREMENT,
+            tarea_id        TEXT NOT NULL
+                            REFERENCES tareas(id) ON DELETE RESTRICT,
+            prioridad       INTEGER NOT NULL DEFAULT 0,
+            estado_cola     TEXT NOT NULL,
+            trabajo         TEXT NOT NULL DEFAULT '[]',
+            tiempo_limite_s INTEGER NOT NULL DEFAULT 3600,
+            base            TEXT,
+            encolado_en     TEXT NOT NULL,
+            actualizado_en  TEXT NOT NULL,
+            despachado_en   TEXT,
+            terminado_en    TEXT,
+            trabajador_id   TEXT,
+            generacion      INTEGER,
+            pid             INTEGER,
+            pid_trabajo     INTEGER,
+            worktree        TEXT,
+            registro        TEXT,
+            adoptado_en     TEXT,
+            ultimo_rechazo  TEXT,
+            resultado       TEXT
+        )
+        """,
+        """
+        CREATE UNIQUE INDEX cola_una_viva_por_tarea
+            ON cola (tarea_id)
+            WHERE estado_cola IN ('pendiente', 'despachada')
+        """,
+        """
+        CREATE INDEX cola_por_orden
+            ON cola (estado_cola, prioridad DESC, secuencia ASC)
+        """,
     ],
 }
 
@@ -324,6 +402,11 @@ def _entorno_git_limpio() -> dict:
     for nombre in _VARIABLES_GIT_HEREDADAS:
         entorno.pop(nombre, None)
 
+    # Mensajes de git SIN traducir: el código los interpreta (`locked
+    # initializing`, `prunable`), y con git en español no casaban (R2).
+    entorno["LC_ALL"] = "C"
+    entorno["LANGUAGE"] = "C"
+
     return entorno
 
 
@@ -386,8 +469,9 @@ def git_common_dir(raiz: Path) -> Path:
             # `git` ignore `cwd` y responda por otro repositorio. La base
             # global se ubicaría entonces en el sitio equivocado.
             env=_entorno_git_limpio(),
+            timeout=60,
         )
-    except OSError as error:
+    except (OSError, subprocess.TimeoutExpired) as error:
         raise ErrorEstadoGlobal(
             "Git no está disponible; sin Git no se puede ubicar la base "
             "global del Supervisor: " + str(error)
@@ -2397,6 +2481,31 @@ def sincronizar_lista(
     return informe
 
 
+def _reparar_espejos_ausentes(raiz: Path) -> list[str]:
+    """Reconstruye el JSON de las tareas cuya fila existe y cuyo archivo
+    falta. Lo resuelve el Supervisor, que es quien sabe escribir fichas."""
+    from . import supervisor as nucleo
+
+    reparadas = []
+
+    try:
+        with conexion(raiz) as con:
+            identificadores = [str(fila["id"]) for fila in listar_tareas(con)]
+    except ErrorEstadoGlobal:
+        return reparadas
+
+    for identificador in identificadores:
+        try:
+            if nucleo.regenerar_espejo_desde_la_base(raiz, identificador):
+                reparadas.append(identificador)
+        except Exception:
+            # Reparar es un extra de esta orden: que una ficha concreta no
+            # se pueda reescribir no puede tumbar la sincronización.
+            continue
+
+    return reparadas
+
+
 def sincronizar_definiciones(raiz: Path, con: sqlite3.Connection | None = None) -> dict:
     """
     Importa al estado global todas las fichas JSON legibles del repositorio.
@@ -2407,6 +2516,12 @@ def sincronizar_definiciones(raiz: Path, con: sqlite3.Connection | None = None) 
     """
     raiz = Path(raiz)
 
+    # Antes de leer los archivos, se reconstruyen los que FALTAN y cuya
+    # fila sí existe: un espejo JSON que no se pudo escribir dejaba la
+    # tarea invisible para esta orden, que recorre el disco, y por tanto
+    # sin ninguna vía de reparación desde el producto (auditoría R3).
+    reparadas = _reparar_espejos_ausentes(raiz)
+
     fichas, errores = listar_con_errores(raiz)
 
     if con is not None:
@@ -2416,6 +2531,7 @@ def sincronizar_definiciones(raiz: Path, con: sqlite3.Connection | None = None) 
             informe = sincronizar_lista(propia, fichas)
 
     informe["fichas_ilegibles"] = errores
+    informe["espejos_regenerados"] = reparadas
 
     return informe
 
@@ -2534,6 +2650,21 @@ def diagnostico(raiz: Path) -> dict:
             informe["detalle"] = (
                 "El archivo existe pero no tiene esquema. "
                 "Ejecute 'inicializar-estado'."
+            )
+            return informe
+
+        if informe["version_esquema"] > VERSION_ESQUEMA:
+            # Otra build más nueva (otro worktree, otra rama) ya migró la
+            # base común. `inicializar-estado` no puede bajarla: lo que
+            # toca es usar un Supervisor que la entienda.
+            informe["estado"] = "ESQUEMA_MAS_NUEVO"
+            informe["detalle"] = (
+                "Versión de esquema "
+                + str(informe["version_esquema"])
+                + ", más nueva que la que entiende este Supervisor ("
+                + str(VERSION_ESQUEMA)
+                + "). Use la build que la migró; 'inicializar-estado' no "
+                "puede retrocederla."
             )
             return informe
 

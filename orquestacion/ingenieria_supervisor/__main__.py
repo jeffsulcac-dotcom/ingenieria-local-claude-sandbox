@@ -13,6 +13,11 @@ Uso desde la raíz del repositorio:
     python -m orquestacion.ingenieria_supervisor reanudar
     python -m orquestacion.ingenieria_supervisor aprobar T-0001
     python -m orquestacion.ingenieria_supervisor rechazar T-0001 --motivo "..."
+    python -m orquestacion.ingenieria_supervisor encolar T-0003 --prioridad 5 --trabajo python herramienta.py
+    python -m orquestacion.ingenieria_supervisor cola
+    python -m orquestacion.ingenieria_supervisor despachar
+    python -m orquestacion.ingenieria_supervisor desencolar T-0003
+    python -m orquestacion.ingenieria_supervisor limpiar-arboles
 
 Desde A2 las órdenes de consulta leen la base SQLite global del
 repositorio; las órdenes que cambian estado escriben en ella.
@@ -34,6 +39,7 @@ from . import RAIZ
 from . import estado_global as global_
 from . import pruebas as corredor
 from . import supervisor as nucleo
+from . import trabajadores
 from .tarea import ErrorFicha
 
 
@@ -268,7 +274,7 @@ def mostrar_tablero(raiz: Path) -> int:
                 + "]  "
                 + anterior
                 + " -> "
-                + str(evento.get("estado_nuevo"))
+                + (evento.get("estado_nuevo") or "—")
             )
             print("      " + str(evento.get("motivo")))
 
@@ -581,6 +587,12 @@ def orden_sincronizar_definiciones(raiz: Path, argumentos) -> int:
     _linea("Importadas", ", ".join(informe["importadas"]) or "ninguna")
     _linea("Actualizadas", ", ".join(informe["actualizadas"]) or "ninguna")
     _linea("Sin cambios", ", ".join(informe["sin_cambios"]) or "ninguna")
+
+    if informe.get("espejos_regenerados"):
+        _linea(
+            "Espejos JSON regenerados",
+            ", ".join(informe["espejos_regenerados"]),
+        )
 
     # A3.2: no se puede informar como "sin cambios" una edición que está
     # esperando. El usuario editó el ámbito y tiene que saber que no se
@@ -914,6 +926,53 @@ def orden_reanudar(raiz: Path, argumentos) -> int:
         for error in informe["fichas_ilegibles"]:
             print("      · " + error["archivo"] + ": " + error["motivo"])
 
+    # T-0003: la cola se pone de acuerdo con lo que la recuperación dejó.
+    # Una entrada despachada cuya ejecución se liberó por huérfana vuelve
+    # a pendiente con su misma secuencia; la de una tarea que ya terminó
+    # se cierra; la de una ejecución con duda (latido vencido, otra
+    # máquina, fila incompleta) NO se toca, igual que la tarea.
+    try:
+        cola = trabajadores.reconciliar_cola(raiz)
+    except (trabajadores.ErrorCola, global_.ErrorEstadoGlobal) as problema:
+        # Las tareas ya quedaron recuperadas: se dice y se sale con 1,
+        # no con una avería que escondiera el informe de arriba.
+        print("")
+        print("  LA COLA NO SE PUDO RECONCILIAR: " + str(problema))
+        print("  Repite `reanudar` o `despachar`, que vuelven a intentarlo.")
+        print("")
+        return 1
+
+    print("")
+    _linea("Entradas de la cola revisadas", cola["revisadas"])
+    _linea("Devueltas a la cola", len(cola["reencoladas"]))
+    _linea("Cerradas por terminadas", len(cola["cerradas"]))
+    _linea("Retiradas", len(cola["retiradas"]))
+    _linea("Despachadas que siguen vivas", len(cola["sin_tocar"]))
+    _linea("Con proceso vivo sin tarea", len(cola["vivas_sin_tarea"]))
+
+    for grupo, etiqueta in (
+        ("reencoladas", "DEVUELTAS A LA COLA (misma secuencia)"),
+        ("cerradas", "ENTRADAS CERRADAS (la tarea ya terminó)"),
+        ("retiradas", "ENTRADAS RETIRADAS (la tarea está aprobada)"),
+        ("sin_tocar", "DESPACHADAS QUE SIGUEN VIVAS (no se tocan)"),
+        (
+            "vivas_sin_tarea",
+            "CON DUDA: PROCESO VIVO O TRABAJADOR DE OTRO EQUIPO, Y LA TAREA YA EN "
+            "OTRAS MANOS (no se reencolan ni se cierran: decide una persona; "
+            "`desencolar` la retira, o mata el proceso y vuelve a `reanudar`)",
+        ),
+    ):
+        if cola[grupo]:
+            print("")
+            print("  " + etiqueta + ":")
+            for elemento in cola[grupo]:
+                print(
+                    "      · entrada " + str(elemento["secuencia"]) + " de "
+                    + elemento["tarea"] + " (tarea en '"
+                    + str(elemento["estado_tarea"]) + "')"
+                    + ((": " + str(elemento["motivo"])) if elemento.get("motivo") else "")
+                )
+
     print("")
 
     # 1 cuando quedan tareas que piden a una persona: latido vencido, árbol
@@ -930,7 +989,7 @@ def orden_reanudar(raiz: Path, argumentos) -> int:
             "sin_definicion",
             "fichas_ilegibles",
         )
-    )
+    ) or bool(cola["vivas_sin_tarea"])
 
     return 1 if pendientes_de_persona else 0
 
@@ -956,6 +1015,193 @@ def orden_pruebas(raiz: Path, argumentos) -> int:
     return 0 if corrida["resultado"] == corredor.RESULTADO_APROBADO else 1
 
 
+# T-0003: un despacho que no despacha nada no es una avería: la cola está
+# vacía, la tarea la tiene otro, el ámbito choca o el árbol no vale. Quien
+# lo invoque en bucle (una persona, un guion, n8n) tiene que distinguirlo.
+CODIGO_DESPACHO_RECHAZADO = 7
+
+
+def orden_encolar(raiz: Path, argumentos) -> int:
+    trabajo = list(argumentos.trabajo or [])
+
+    if trabajo and trabajo[0] == "--":
+        trabajo = trabajo[1:]
+
+    entrada = trabajadores.encolar(
+        raiz,
+        argumentos.tarea,
+        prioridad=argumentos.prioridad,
+        trabajo=trabajo,
+        tiempo_limite_s=argumentos.tiempo_limite,
+        base=argumentos.base,
+    )
+
+    print("Encolada: " + entrada["tarea_id"] + " (entrada "
+          + str(entrada["secuencia"]) + ", prioridad "
+          + str(entrada["prioridad"]) + ")")
+    print("Trabajo: " + (
+        json.dumps(entrada["trabajo"], ensure_ascii=False)
+        if entrada["trabajo"] else "ninguno (sólo se verificará)"
+    ))
+
+    return 0
+
+
+def orden_desencolar(raiz: Path, argumentos) -> int:
+    entrada = trabajadores.desencolar(
+        raiz, argumentos.tarea, argumentos.motivo or ""
+    )
+
+    print("Retirada de la cola: " + entrada["tarea_id"] + " (entrada "
+          + str(entrada["secuencia"]) + ")")
+
+    resultado = entrada.get("resultado") or {}
+
+    if resultado.get("estaba") == global_.COLA_DESPACHADA:
+        print(
+            "AVISO: la entrada estaba despachada (trabajador "
+            + str(entrada.get("trabajador_id")) + ", PID "
+            + str(entrada.get("pid")) + ", trabajo "
+            + str(entrada.get("pid_trabajo")) + "). Comprueba que ningún "
+            "proceso siga escribiendo en " + str(entrada.get("worktree"))
+            + " antes de limpiar el árbol."
+        )
+
+    return 0
+
+
+def orden_cola(raiz: Path, argumentos) -> int:
+    entradas = trabajadores.listar_cola(raiz)
+
+    if argumentos.json:
+        print(json.dumps(entradas, ensure_ascii=False, indent=2))
+        return 0
+
+    _titulo("COLA DE TRABAJADORES")
+
+    vivas = [una for una in entradas if una["estado_cola"] in
+             global_.COLA_ESTADOS_VIVOS]
+    cerradas = [una for una in entradas if una not in vivas]
+
+    _linea("Pendientes", sum(
+        1 for una in vivas if una["estado_cola"] == global_.COLA_PENDIENTE
+    ))
+    _linea("Despachadas", sum(
+        1 for una in vivas if una["estado_cola"] == global_.COLA_DESPACHADA
+    ))
+    _linea("Cerradas", len(cerradas))
+
+    if vivas:
+        print("")
+        print("  ORDEN DE DESPACHO (prioridad, luego llegada):")
+
+    for entrada in vivas:
+        linea = (
+            "      " + str(entrada["secuencia"]).rjust(4) + "  "
+            + entrada["tarea_id"] + "  prioridad " + str(entrada["prioridad"])
+            + "  " + entrada["estado_cola"].upper()
+            + "  tarea: " + str(entrada["estado_tarea"]).upper()
+        )
+
+        if entrada["estado_cola"] == global_.COLA_DESPACHADA:
+            linea += "  trabajador: " + str(entrada["trabajador_id"])
+        elif entrada["por_que_no"]:
+            linea += "  (no se despacharía ahora: " + entrada["por_que_no"] + ")"
+
+        print(linea)
+
+        if entrada["estado_cola"] == global_.COLA_PENDIENTE and entrada.get(
+            "ultimo_rechazo"
+        ):
+            rechazo = entrada["ultimo_rechazo"] or {}
+            print("            último rechazo: " + str(rechazo.get("detalle")))
+
+    if cerradas:
+        print("")
+        print("  CERRADAS:")
+        for entrada in cerradas:
+            resultado = entrada.get("resultado") or {}
+            print(
+                "      " + str(entrada["secuencia"]).rjust(4) + "  "
+                + entrada["tarea_id"] + "  " + entrada["estado_cola"].upper()
+                + "  " + str(resultado.get("tipo"))
+                + (
+                    "  -> tarea en " + str(resultado.get("estado")).upper()
+                    if resultado.get("estado") else ""
+                )
+            )
+
+    print("")
+
+    return 0
+
+
+def orden_despachar(raiz: Path, argumentos) -> int:
+    try:
+        informe = trabajadores.despachar(
+            raiz,
+            argumentos.tarea,
+            trabajador_id=argumentos.trabajador,
+        )
+    except trabajadores.ErrorDespacho as rechazo:
+        print("")
+        print("  DESPACHO RECHAZADO: " + str(rechazo))
+        print("")
+        for uno in rechazo.rechazos:
+            print("      · entrada " + str(uno.get("secuencia")) + " ("
+                  + str(uno.get("tarea")) + "): " + str(uno.get("detalle")))
+        if rechazo.rechazos:
+            print("")
+
+        return CODIGO_DESPACHO_RECHAZADO
+
+    print("Despachada: " + informe["tarea"] + " (entrada "
+          + str(informe["secuencia"]) + ")")
+    print("Trabajador: " + str(informe["trabajador_id"]))
+    print("Generación: " + str(informe["generacion"]))
+    print("Árbol: " + informe["worktree"]
+          + ("  (creado ahora)" if informe["arbol_creado"] else "  (reutilizado)"))
+    print("Rama @ commit inicial: " + str(informe["rama"]) + " @ "
+          + str(informe["commit_inicial"]))
+    print("Proceso trabajador: " + str(informe["pid_trabajador"]))
+    print("Registro: " + informe["registro"])
+    print("Argumentos (lista, sin intérprete): "
+          + json.dumps(informe["argv"], ensure_ascii=False))
+
+    for uno in informe["rechazos"]:
+        print("  Saltada la entrada " + str(uno.get("secuencia")) + " ("
+              + str(uno.get("tarea")) + "): " + str(uno.get("detalle")))
+
+    for uno in informe.get("avisos") or []:
+        print("  AVISO: " + str(uno))
+
+    return 0
+
+
+def orden_limpiar_arboles(raiz: Path, argumentos) -> int:
+    if argumentos.tarea:
+        resultado = trabajadores.limpiar_arbol(raiz, argumentos.tarea)
+        print(("Árbol retirado: " if resultado["limpiado"] else "Sin árbol: ")
+              + resultado["arbol"])
+        print("  " + resultado["motivo"])
+        return 0
+
+    informe = trabajadores.limpiar_arboles(raiz)
+
+    _titulo("LIMPIEZA DE ÁRBOLES AUTOMÁTICOS")
+    _linea("Retirados", len(informe["limpiados"]))
+    _linea("Rechazados", len(informe["rechazados"]))
+
+    for uno in informe["limpiados"]:
+        print("      · " + uno["tarea"] + ": retirado " + uno["arbol"])
+    for uno in informe["rechazados"]:
+        print("      · " + uno["tarea"] + ": NO SE TOCA. " + uno["motivo"])
+
+    print("")
+
+    return 1 if informe["rechazados"] else 0
+
+
 def _git(raiz: Path, argumentos):
     if getattr(argumentos, "sin_git", False):
         return None
@@ -971,14 +1217,17 @@ CODIGOS_DE_SALIDA = """\
 Códigos de salida:
   0   la orden se completó.
   1   la orden se completó pero el resultado no es el deseado (por ejemplo,
-      una verificación que no deja la tarea en PROPUESTO, o una
-      reanudación que deja tareas que una persona debe mirar).
+      una verificación que no deja la tarea en PROPUESTO, una
+      reanudación que deja tareas que una persona debe mirar, o una
+      limpieza que deja árboles sin retirar).
   2   error de uso o avería del Supervisor.
   3   toma rechazada: la tarea ya la tiene otro, o su estado no la admite.
   4   orden rechazada por propiedad: identidad, generación o estado no
       coinciden con los de la ejecución vigente.
   5   la tarea ya existe.
   6   el árbol de trabajo declarado o heredado no sirve.
+  7   despacho rechazado: la cola está vacía, la entrada ya no está
+      pendiente, la tarea no puede tomarse o su ámbito choca.
 """
 
 
@@ -1177,7 +1426,9 @@ def construir_analizador() -> argparse.ArgumentParser:
     bloquear.set_defaults(funcion=orden_bloquear)
 
     reanudar = ordenes.add_parser(
-        "reanudar", help="Recuperar tareas tras un cierre o apagón."
+        "reanudar",
+        help="Recuperar tareas tras un cierre o apagón y poner la cola de "
+             "acuerdo con lo recuperado.",
     )
     reanudar.set_defaults(funcion=orden_reanudar)
 
@@ -1190,6 +1441,82 @@ def construir_analizador() -> argparse.ArgumentParser:
         help="Mostrar la salida real de las pruebas que no quedaron en OK.",
     )
     pruebas.set_defaults(funcion=orden_pruebas)
+
+    encolar = ordenes.add_parser(
+        "encolar",
+        help="Poner una tarea en la cola de trabajadores.",
+        description=(
+            "Añade la tarea a la cola persistente. El trabajo, si lo hay, va "
+            "detrás de --trabajo, argumento por argumento: se ejecutará en el "
+            "árbol de la tarea como lista, sin intérprete de órdenes."
+        ),
+    )
+    encolar.add_argument("tarea")
+    encolar.add_argument(
+        "--prioridad", type=int, default=0,
+        help="Mayor primero; a igual prioridad, orden de llegada.",
+    )
+    encolar.add_argument(
+        "--tiempo-limite", dest="tiempo_limite", type=int,
+        default=trabajadores.TIEMPO_LIMITE_TRABAJO_S,
+        help="Segundos que puede durar el trabajo encolado.",
+    )
+    encolar.add_argument(
+        "--base",
+        help="Referencia desde la que nace la rama de la tarea si no "
+             "existe (por omisión `main` si existe; si no, el HEAD de la "
+             "raíz).",
+    )
+    # Opción con REMAINDER, y no un posicional: con un subanalizador,
+    # `argparse` entrega lo que sigue a `--` al analizador PADRE como
+    # «argumentos no reconocidos», y un posicional REMAINDER se traga las
+    # demás opciones de la orden. `--trabajo` se queda con TODO lo que
+    # venga detrás, tal cual, argumento por argumento; por eso va la última.
+    encolar.add_argument(
+        "--trabajo", nargs=argparse.REMAINDER, default=[],
+        help="Ejecutable y argumentos del trabajo, tal cual, uno por uno. "
+             "Va la última: se queda con todo lo que la siga.",
+    )
+    encolar.set_defaults(funcion=orden_encolar)
+
+    desencolar = ordenes.add_parser(
+        "desencolar",
+        help="Retirar de la cola una entrada pendiente, o una despachada "
+             "cuya ejecución ya no existe (decisión de una persona).",
+    )
+    desencolar.add_argument("tarea")
+    desencolar.add_argument("--motivo")
+    desencolar.set_defaults(funcion=orden_desencolar)
+
+    cola = ordenes.add_parser("cola", help="Ver la cola de trabajadores.")
+    cola.add_argument("--json", action="store_true", help="Salida en formato JSON.")
+    cola.set_defaults(funcion=orden_cola)
+
+    despachar = ordenes.add_parser(
+        "despachar",
+        help="Tomar la siguiente tarea de la cola y lanzar su trabajador.",
+        description=(
+            "Despacha UNA entrada: la primera del orden que pueda tomarse, o "
+            "la de la tarea indicada. Crea su árbol en la zona controlada "
+            "(.arboles/<tarea>), la toma y lanza el proceso trabajador."
+        ),
+    )
+    despachar.add_argument("tarea", nargs="?")
+    despachar.add_argument(
+        "--trabajador", help="Identidad que se concede al trabajador."
+    )
+    despachar.set_defaults(funcion=orden_despachar)
+
+    limpiar = ordenes.add_parser(
+        "limpiar-arboles",
+        help="Retirar los árboles automáticos que ya no sostienen nada.",
+        description=(
+            "Sólo dentro de .arboles/, sólo los que Git reconoce, sólo sin "
+            "ejecución viva y sin nada sin confirmar. Nunca con --force."
+        ),
+    )
+    limpiar.add_argument("tarea", nargs="?")
+    limpiar.set_defaults(funcion=orden_limpiar_arboles)
 
     return analizador
 
@@ -1239,6 +1566,19 @@ def principal(argumentos_crudos: list[str] | None = None) -> int:
         print("")
 
         return CODIGO_WORKTREE_INVALIDO
+    except nucleo.ErrorEspejo as aviso:
+        # La orden SE HIZO y está confirmada en la base; lo único que
+        # falló fue reescribir el espejo JSON (otro proceso lo tiene
+        # abierto, permisos). Devolver 2 hacía que un guion diera por no
+        # hecho algo que sí se hizo —y con `tomar`, que dejara la tarea
+        # EN_EJECUCION creyendo que no la tomó (auditoría R3).
+        print("")
+        print("  AVISO: " + str(aviso))
+        print("  La orden se completó. El espejo JSON se regenerará en la "
+              "siguiente escritura de esta tarea.")
+        print("")
+
+        return 0
     except (
         nucleo.ErrorSupervisor,
         ErrorFicha,

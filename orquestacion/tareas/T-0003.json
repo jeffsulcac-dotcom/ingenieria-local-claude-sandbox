@@ -1,0 +1,62 @@
+{
+  "id": "T-0003",
+  "titulo": "Workers V1: despacho local seguro de tareas",
+  "objetivo": "Implementar C/Workers V1 sobre la base A3.3: despacho explícito y seguro de un trabajador, worktrees administrados, cola persistente con orden determinista y recuperación/expiración segura. Excluye acciones web, n8n, Redis y PostgreSQL.",
+  "criterios_aceptacion": [
+    "El lanzamiento de un trabajador es explícito, trazable y no usa una cadena de shell interpretable; una prueba usa un trabajador simulado, sin consumir servicios externos.",
+    "Cada worktree automático queda asociado a una tarea, dentro de una ubicación controlada, y nunca se elimina una ruta ajena o con estado no verificable.",
+    "El despacho respeta ámbito, propietario y generación: no lanza dos escritores sobre ámbitos solapados ni duplica una tarea.",
+    "La selección de cola es persistente, determinista y probada bajo competencia; no requiere Redis, PostgreSQL ni n8n.",
+    "La expiración o recuperación no libera ni mata una ejecución cuya muerte no esté demostrada; los casos dudosos quedan visibles para decisión humana.",
+    "T-0002 permanece bloqueada hasta la aprobación humana de T-0003.",
+    "Las pruebas nuevas, las regresiones del Supervisor y el corredor completo quedan en OK; se ejecuta gate Windows antes de proponer.",
+    "ESTADO.md sólo se actualiza cuando la tarea quede aprobada."
+  ],
+  "ambito_archivos": [
+    "orquestacion/ingenieria_supervisor/*",
+    "orquestacion/README.md",
+    "pruebas/orquestacion/prueba_workers_v1.py",
+    "pruebas/orquestacion/prueba_ejecucion_segura.py"
+  ],
+  "pruebas_requeridas": [
+    "pruebas/orquestacion/prueba_workers_v1.py",
+    "pruebas/orquestacion/prueba_ejecucion_segura.py"
+  ],
+  "estado": "en_ejecucion",
+  "rama": "tarea/T-0003",
+  "worktree": "C:\\INGENIERIA_LOCAL\\wt-t0003-workers-v1",
+  "intentos": 0,
+  "max_intentos": 3,
+  "commit_inicial": "7c2f191",
+  "creado_en": "2026-09-20T05:27:10+00:00",
+  "actualizado_en": "2026-09-20T05:27:18+00:00",
+  "requiere_decision_humana": [],
+  "trabajador_id": "CLAUDE-WORKERS-V1",
+  "pid": 5660,
+  "iniciado_en": "2026-09-20T05:27:18+00:00",
+  "ultimo_latido": "2026-09-20T05:27:18+00:00",
+  "ultima_falla": null,
+  "ejecuciones": [],
+  "historial": [
+    {
+      "fecha": "2026-09-20T05:27:10+00:00",
+      "tipo": "creacion",
+      "estado_anterior": null,
+      "estado_nuevo": "nuevo",
+      "motivo": "Ficha creada.",
+      "origen": "humano"
+    },
+    {
+      "fecha": "2026-09-20T05:27:18+00:00",
+      "tipo": "transicion",
+      "estado_anterior": "nuevo",
+      "estado_nuevo": "en_ejecucion",
+      "motivo": "Tarea tomada por CLAUDE-WORKERS-V1.",
+      "origen": "automático",
+      "datos": {
+        "trabajador_id": "CLAUDE-WORKERS-V1",
+        "pid": 5660
+      }
+    }
+  ]
+}

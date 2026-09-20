@@ -39,11 +39,16 @@ Reglas duras que este módulo hace cumplir:
    Un rechazo lanza `ErrorPropiedad` dentro de la transacción: nada se
    escribe, ni el estado, ni los eventos, ni el espejo JSON.
 
-Lo que NO hace este módulo (reservado para A3.3/C): latidos automáticos,
-expiración temporal de trabajadores, detección automática de trabajadores
-muertos, recuperación automática de tareas abandonadas, cola o
-planificador de tareas, verificación dentro del worktree de la tarea,
-lanzamiento de trabajadores.
+Desde T-0003 (Workers V1) la cola persistente, el despacho, los worktrees
+automáticos y el proceso trabajador viven en `trabajadores.py` y
+`trabajador.py`, construidos SOBRE estas primitivas: el despacho marca
+la entrada de la cola dentro de la misma transacción que concede la toma
+(`tomar(..., al_conceder=...)`), y el trabajador adopta la ejecución que
+se le entrega con `adoptar` antes de hacer nada. Este módulo sigue sin
+conocer la cola.
+
+Lo que NO hace este módulo: expiración automática de trabajadores
+(`reanudar` sigue siendo una orden manual y no libera ante la duda).
 
 Este módulo no realiza cálculos de ingeniería.
 """
@@ -242,6 +247,20 @@ class ErrorPropiedad(ErrorSupervisor):
         self.generacion_vigente = informe.get("generacion_vigente")
 
 
+class ErrorEspejo(ErrorSupervisor):
+    """
+    El estado global YA QUEDÓ CONFIRMADO en SQLite, pero el espejo JSON
+    no se pudo reescribir (archivo abierto por otro proceso, carpeta
+    sin permisos). No es un rechazo: la transición, la toma o la
+    adopción que la lanzó están hechas, y la siguiente persistencia
+    regenera el espejo. Quien la reciba tiene que tratarla como éxito
+    con aviso, nunca como «no se hizo» (auditoría R2: tres llamadores
+    la confundían con un rechazo y salían con la tarea colgada).
+    """
+
+    confirmado = True
+
+
 class ErrorToma(ErrorSupervisor):
     """
     La tarea no se pudo reclamar: otro trabajador se adelantó, la tarea no
@@ -311,8 +330,12 @@ def proceso_vivo(pid: int | None) -> bool:
     """
     Comprueba si un proceso sigue existiendo.
 
-    Nunca se usa como única señal: el Supervisor exige además un latido
-    reciente, porque el sistema operativo puede reutilizar un PID.
+    Nunca se usa como única señal para LIBERAR nada: el Supervisor exige
+    además un latido vencido, porque el sistema operativo puede
+    reutilizar un PID. En la dirección contraria sí basta sola: la
+    reconciliación de la cola (T-0003) no reencola ni cierra una
+    entrada mientras su proceso figure vivo, y un PID reutilizado sólo
+    cuesta que una persona lo mire (`desencolar`).
     """
     if pid is None or pid <= 0:
         return False
@@ -653,6 +676,10 @@ CAMPOS_VERIFICAR = (
 
 CAMPOS_DECIDIR = ("decisiones", "requiere_decision_humana")
 
+# T-0003: el proceso trabajador registra su PID sobre la ejecución que el
+# despacho reclamó en su nombre, y de paso late: es su primera señal.
+CAMPOS_ADOPCION = ("pid", "ultimo_latido")
+
 # `reabrir` devuelve además el presupuesto de intentos, que es un valor
 # fijo (cero) y no un incremento.
 CAMPOS_REABRIR = CAMPOS_TRANSICION + CAMPOS_LIBERACION + ("intentos",)
@@ -696,6 +723,7 @@ def persistir(
     incrementos=None,
     exigir_iguales=None,
     exigir_no_retroceso=None,
+    al_confirmar=None,
 ) -> Ficha:
     # `campos_propios` es OBLIGATORIO. Su valor por omisión era escribir
     # las dieciséis columnas operativas, es decir, exactamente el defecto
@@ -748,6 +776,16 @@ def persistir(
 
     No sirve para la TOMA de una tarea: la toma es quien CONCEDE la
     propiedad y la genera, y usa `estado_global.reclamar` (ver `tomar`).
+
+    `al_confirmar(con, momento)` (T-0003) se ejecuta DENTRO de la
+    transacción, después de que el UPDATE condicionado haya aceptado la
+    escritura y de insertar los eventos, y antes del COMMIT. Es el
+    simétrico de `al_conceder` en `tomar`: el trabajador cierra su entrada
+    de la cola en la MISMA transacción que la transición de la tarea, de
+    modo que nadie puede ver «tarea liberada, entrada aún despachada» y
+    tomar decisiones sobre ese estado a medias. Si el gancho lanza, el
+    ROLLBACK deshace también la transición. Sólo escrituras sobre la
+    conexión que recibe: nada de disco ni de Git con el candado tomado.
     """
     Ficha.desde_dict(ficha.a_dict())
 
@@ -821,6 +859,9 @@ def persistir(
 
                 for evento in eventos:
                     global_.insertar_evento(con, ficha.id, evento)
+
+                if al_confirmar is not None:
+                    al_confirmar(con, ficha.actualizado_en)
 
                 # La fila se relee DENTRO de la transacción para que la
                 # ficha refleje lo que el COMMIT confirma, incluidos los
@@ -983,7 +1024,7 @@ def _regenerar_espejo(raiz: Path, ficha: Ficha) -> None:
     try:
         guardar(raiz, ficha, marcar_actualizacion=False)
     except (ErrorFicha, OSError) as error:
-        raise ErrorSupervisor(
+        raise ErrorEspejo(
             "El estado global de '" + ficha.id + "' quedó confirmado en "
             "SQLite (" + str(ficha.estado) + "), pero no se pudo regenerar "
             "el espejo JSON: " + str(error) + ". La siguiente operación lo "
@@ -1041,6 +1082,12 @@ def entorno_git_limpio() -> dict:
 
     for nombre in VARIABLES_GIT_HEREDADAS:
         entorno.pop(nombre, None)
+
+    # Mensajes SIN traducir: el inventario de worktrees interpreta
+    # `locked initializing` y `prunable`, y con git en español (el del
+    # usuario) escribía «inicializando» y nada casaba (auditoría R2).
+    entorno["LC_ALL"] = "C"
+    entorno["LANGUAGE"] = "C"
 
     return entorno
 
@@ -1167,6 +1214,19 @@ def _inventario_de_arboles(raiz: Path) -> tuple:
                 motivo = "Git la marca como prunable" + (
                     " (" + detalle + ")" if detalle else ""
                 )
+            elif atributo.startswith("locked") and atributo[
+                len("locked"):
+            ].strip().lower().startswith(MOTIVOS_DE_CANDADO_EN_CREACION):
+                # `git worktree add` registra el árbol y escribe HEAD
+                # antes de poblarlo, y mientras tanto lo deja bloqueado
+                # con este motivo. Un despacho que llegara ahora vería
+                # un árbol a medio extraer (T-0003, auditoría R1).
+                motivo = (
+                    "Git la está creando todavía (locked initializing). Si "
+                    "ningún `git worktree add` sigue en curso, el candado "
+                    "quedó huérfano: `git worktree unlock <ruta>` y después "
+                    "`git worktree remove --force <ruta>`"
+                )
 
         bloque = []
 
@@ -1186,6 +1246,12 @@ def _inventario_de_arboles(raiz: Path) -> tuple:
             descartados[resuelta] = motivo
 
     return utilizables, descartados
+
+
+# Lo que `git worktree add` escribe en `locked` mientras extrae el árbol,
+# en inglés y en las traducciones habituales (un candado escrito por el
+# git del usuario, en su idioma, no pasa por `entorno_git_limpio`).
+MOTIVOS_DE_CANDADO_EN_CREACION = ("initializ", "inicializ", "initialis")
 
 
 def arboles_registrados(raiz: Path) -> set:
@@ -1325,8 +1391,11 @@ def resolver_worktree(raiz: Path, declarado: str | None) -> Path:
         raise ErrorWorktree(
             "La ruta '" + str(candidato) + "' figura en la lista de "
             "worktrees de Git, pero no es utilizable: "
-            + descartados[candidato] + ". Repárala (`git worktree repair`) "
-            "o retírala (`git worktree prune`) antes de declararla."
+            + descartados[candidato] + ". Una entrada prunable se retira "
+            "con `git worktree prune` (retira TODAS las prunables del "
+            "repositorio: mira antes `git worktree list`); una movida, con "
+            "`git worktree repair`; una bloqueada sin nadie detrás, con "
+            "`git worktree unlock`."
         )
 
     if candidato not in registrados:
@@ -1470,6 +1539,86 @@ class Git:
             return False
 
         return bool(resultado.stdout.strip())
+
+    def cambios_del_arbol(self) -> list[str] | None:
+        """
+        Rutas (relativas a la raíz del árbol, con `/`) que difieren de
+        HEAD: modificadas, preparadas, borradas, renombradas Y SIN
+        VERSIONAR. None si Git no puede responder.
+
+        Es la lista con la que un trabajador demuestra que escribió sólo
+        dentro de su ámbito y con la que la limpieza decide si un árbol
+        contiene trabajo que no es suyo (T-0003). Aquí los archivos sin
+        versionar SÍ cuentan, al revés que en `hay_cambios_sin_confirmar`:
+        un archivo nuevo fuera del ámbito es exactamente lo que hay que
+        ver, y un archivo nuevo en un árbol que se va a borrar es trabajo
+        que se perdería.
+
+        `-z` separa las entradas con NUL, así que un nombre con espacios,
+        comillas o acentos llega entero; en un renombrado la ruta antigua
+        viene en la entrada siguiente y se salta.
+        """
+        resultado = self._ejecutar(
+            "status", "--porcelain=v1", "-z", "--untracked-files=all",
+        )
+
+        if resultado.returncode != 0:
+            return None
+
+        rutas = []
+        entradas = resultado.stdout.split("\0")
+        indice = 0
+
+        while indice < len(entradas):
+            entrada = entradas[indice]
+            indice += 1
+
+            if len(entrada) < 4:
+                continue
+
+            codigo = entrada[:2]
+            rutas.append(entrada[3:])
+
+            if ("R" in codigo or "C" in codigo) and indice < len(entradas):
+                # La entrada siguiente es la ruta de ORIGEN del
+                # renombrado o la copia. Cuenta: un `git mv` desde fuera
+                # del ámbito hacia dentro toca las dos rutas, y saltarla
+                # escondía el borrado de la de fuera (auditoría R1).
+                rutas.append(entradas[indice])
+                indice += 1
+
+        # Lo que `update-index --skip-worktree` o `--assume-unchanged`
+        # ocultan a `status` también cuenta como cambio: es un archivo
+        # cuyo contenido en el árbol no se compara con HEAD, es decir,
+        # justo lo que una comprobación de ámbito no puede dar por quieto.
+        marcados = self._ejecutar("ls-files", "-v", "-z")
+
+        if marcados.returncode != 0:
+            return None
+
+        for entrada in marcados.stdout.split("\0"):
+            if len(entrada) > 2 and entrada[0] in ("S", "h") and entrada[1] == " ":
+                rutas.append(entrada[2:])
+
+        return sorted(set(rutas))
+
+    def rutas_cambiadas_desde(self, commit: str, hasta: str = "HEAD") -> list[str] | None:
+        """
+        Rutas que difieren entre `commit` y HEAD, ya confirmadas.
+
+        Junto con `cambios_del_arbol` da TODO lo que una ejecución tocó
+        desde su commit inicial (T-0003): un trabajo que escribe fuera de
+        su ámbito y además lo confirma no puede esconderlo en un commit.
+        None si Git no puede responder (el commit no está en este árbol).
+        """
+        resultado = self._ejecutar(
+            "diff", "--name-only", "-z", "--no-renames", str(commit), str(hasta),
+        )
+
+        if resultado.returncode != 0:
+            return None
+
+        return sorted(ruta for ruta in resultado.stdout.split("\0") if ruta)
 
     def huella_de_cambios(self) -> str | None:
         """
@@ -1681,28 +1830,104 @@ def crear(
     # De paso, el candado de escritura de TODA la base deja de retenerse
     # durante el `fsync` del archivo, que es lo que `tomar` ya evitaba a
     # propósito.
-    with global_.conexion(raiz) as con:
-        with global_.transaccion(con):
-            if global_.obtener_tarea(con, identificador) is not None:
-                raise ErrorCreacion(
-                    "La tarea '" + identificador + "' ya existe en el "
-                    "estado global: no se puede volver a crear con el "
-                    "mismo identificador."
-                )
+    try:
+        with global_.conexion(raiz) as con:
+            with global_.transaccion(con):
+                if global_.obtener_tarea(con, identificador) is not None:
+                    raise ErrorCreacion(
+                        "La tarea '" + identificador + "' ya existe en el "
+                        "estado global: no se puede volver a crear con el "
+                        "mismo identificador."
+                    )
 
-            # Se relee el árbol con el bloqueo tomado: entre la
-            # comprobación de arriba y este punto, otro proceso pudo haber
-            # creado la ficha y confirmado.
-            if existe(raiz, identificador):
-                raise ErrorCreacion(
-                    "Ya existe la ficha '" + identificador + "'."
-                )
+                # Se relee el árbol con el bloqueo tomado: entre la
+                # comprobación de arriba y este punto, otro proceso pudo
+                # haber creado la ficha y confirmado.
+                if existe(raiz, identificador):
+                    raise ErrorCreacion(
+                        "Ya existe la ficha '" + identificador + "'."
+                    )
 
-            global_.importar_ficha(con, ficha, evento_importacion=False)
+                global_.importar_ficha(con, ficha, evento_importacion=False)
+    except ErrorCreacion:
+        # Una fila SIN su JSON es el resto de un espejo que no se pudo
+        # escribir: se repara desde la fila en vez de rechazar para siempre
+        # con «ya existe» una tarea que nadie puede ver (auditoría R3).
+        #
+        # La reparación va AQUÍ, en el camino de error, y no antes de la
+        # transacción: leer la fila antes rompía el orden que A3.2 exige
+        # —comprobar la existencia DENTRO del candado y justo antes de
+        # insertar— y que la comprobación 36 de A3.3 vigila.
+        reparada = regenerar_espejo_desde_la_base(raiz, identificador)
+
+        if reparada is None:
+            raise
+
+        raise ErrorCreacion(
+            "La tarea '" + identificador + "' ya existía en el estado "
+            "global sin su ficha JSON (un espejo que no se pudo "
+            "escribir): se ha REGENERADO desde la base, con su "
+            "definición y su estado ('" + str(reparada.estado) + "'). No "
+            "se ha creado ninguna tarea nueva; revísala con `ver "
+            + identificador + "`."
+        ) from None
 
     _regenerar_espejo(raiz, ficha)
 
     ficha.eventos_pendientes.clear()
+
+    return ficha
+
+
+def regenerar_espejo_desde_la_base(raiz: Path, identificador: str):
+    """
+    Reescribe el JSON de una tarea A PARTIR DE SU FILA, y sólo si el
+    archivo falta. Devuelve la ficha reconstruida, o None si no había
+    nada que reparar (el JSON está, o la tarea no existe en la base).
+
+    El espejo se escribe DESPUÉS del COMMIT, a propósito (ver `crear`),
+    así que una fila sin JSON es el resto esperable de un fallo al
+    escribirlo: el archivo abierto por otro proceso en Windows, un
+    permiso, un disco lleno. Sin esta reparación la tarea quedaba
+    inalcanzable desde el producto: `crear` respondía «ya existe en el
+    estado global», `ver` «no existe la ficha» y
+    `sincronizar-definiciones` no la veía, porque recorre los archivos
+    (auditoría R3).
+
+    La definición sale de la fila, NUNCA de lo que pida quien repara:
+    la base es la autoridad y reparar no puede ser una puerta para
+    cambiar el ámbito de una tarea viva sin pasar por
+    `sincronizar-definiciones`.
+    """
+    raiz = Path(raiz).resolve()
+    validar_id(identificador)
+
+    if existe(raiz, identificador):
+        return None
+
+    with global_.conexion(raiz) as con:
+        fila = global_.obtener_tarea(con, identificador)
+
+    if fila is None:
+        return None
+
+    ficha = Ficha(
+        id=identificador,
+        titulo=str(fila.get("titulo") or identificador),
+        objetivo=str(fila.get("objetivo") or ""),
+        criterios_aceptacion=list(fila.get("criterios_aceptacion") or []),
+        ambito_archivos=list(fila.get("ambito_archivos") or []),
+        pruebas_requeridas=list(fila.get("pruebas_requeridas") or []),
+        max_intentos=int(fila.get("max_intentos") or 3),
+    )
+    ficha.requiere_decision_humana = normalizar_decisiones(
+        fila.get("decisiones")
+    )
+
+    global_.aplicar_fila(ficha, fila)
+    ficha.eventos_pendientes.clear()
+
+    guardar(raiz, ficha, marcar_actualizacion=False)
 
     return ficha
 
@@ -1735,9 +1960,19 @@ def tomar(
     ahora: datetime | None = None,
     git=None,
     worktree: str | None = None,
+    al_conceder=None,
 ) -> Ficha:
     """
     Reclama una tarea para trabajarla. Toma ATÓMICA desde A3.1.
+
+    `al_conceder(con, informe, momento)` (T-0003) se ejecuta DENTRO de la
+    transacción, justo después de que el UPDATE condicional haya concedido
+    la toma y antes del COMMIT. Es el punto por el que el despacho de la
+    cola marca su entrada como despachada en la MISMA transacción que
+    concede la tarea: o se confirman las dos cosas o ninguna. Si el
+    gancho lanza, el ROLLBACK deshace también la toma. Debe limitarse a
+    escrituras sobre la conexión que recibe: nada de disco ni de Git con
+    el candado tomado.
 
     Cuando varios trabajadores compiten por la MISMA tarea, exactamente uno
     obtiene la toma; los demás reciben `ErrorToma`, que describe quién la
@@ -1757,7 +1992,8 @@ def tomar(
     `BEGIN IMMEDIATE` sobre la base global:
 
         comprobación de estado  ->  comprobación de ámbitos
-        ->  UPDATE condicional  ->  evento  ->  COMMIT
+        ->  UPDATE condicional  ->  evento  ->  gancho al_conceder
+        ->  comprobación de que el gancho no tocó la fila  ->  COMMIT
 
     El UPDATE lleva el estado esperado en su WHERE y la decisión se toma con
     `rowcount` (ver `estado_global.reclamar`). Si algo falla en medio, el
@@ -1843,10 +2079,13 @@ def tomar(
 
     commit_inicial = ficha.commit_inicial
 
-    if git is not None and commit_inicial is None:
+    if git is not None:
         # El commit de partida es el del árbol donde se va a trabajar, no
-        # el de la raíz desde la que se ordena la toma.
-        commit_inicial = Git(Path(arbol_declarado)).hash_actual()
+        # el de la raíz desde la que se ordena la toma, y es el de ESTA
+        # ejecución: heredar el de la anterior hacía que la comprobación
+        # de ámbito del trabajador contara lo confirmado en la vuelta
+        # anterior (auditoría R1). El anterior queda en el evento.
+        commit_inicial = Git(Path(arbol_declarado)).hash_actual() or commit_inicial
 
     # El árbol de trabajo y Git se leen ANTES de abrir la transacción.
     definiciones, ilegibles = listar_con_errores(raiz)
@@ -2011,13 +2250,42 @@ def tomar(
                     "trabajador_id"
                 ]
 
+            if previa and previa.get("commit_inicial") and previa.get(
+                "commit_inicial"
+            ) != commit_inicial:
+                evento["datos"]["commit_inicial_anterior"] = previa["commit_inicial"]
+
             global_.insertar_evento(con, ficha.id, evento)
+
+            if al_conceder is not None:
+                # Con la toma ya concedida en esta transacción, su evento
+                # ya insertado (el historial tiene que leerse en el orden
+                # en que ocurrió) y el COMMIT todavía por delante: lo que
+                # el gancho escriba se confirma con la toma o se deshace
+                # con ella.
+                al_conceder(con, informe, momento)
 
             # La fila se lee DENTRO de la transacción, no después: así lo
             # que se devuelve es exactamente lo que el COMMIT confirmó. Si
             # se leyera fuera, otra operación podría colarse en medio y
             # `tomar` devolvería una ficha que ya no es de quien la pidió.
             fila = global_.obtener_tarea(con, ficha.id)
+
+            # Y se comprueba que el gancho no la tocó: es la única puerta
+            # por la que una escritura sobre `tareas` no pasa por
+            # `reclamar` ni por `persistir`. Un gancho que cambiara la
+            # propiedad concedida rompería «un solo ganador» con la toma
+            # ya confirmada; aquí se deshace entera (auditoría R1).
+            if (
+                fila is None
+                or fila["estado"] != str(Estado.EN_EJECUCION)
+                or fila["trabajador_id"] != aspirante
+                or int(fila["generacion"] or 0) != int(informe["generacion"])
+            ):
+                raise ErrorSupervisor(
+                    "El gancho de la toma alteró la fila de '" + ficha.id
+                    + "': la toma se deshace entera."
+                )
 
     global_.aplicar_fila(ficha, fila)
 
@@ -2043,7 +2311,8 @@ def latido(
     """
     Señal de vida del trabajador que sostiene la tarea.
 
-    Es una orden manual. Los latidos automáticos pertenecen a A3.3/B.
+    Es una orden manual. Los latidos automáticos los emite
+    `LatidoAutomatico` (A3.3) durante las operaciones largas.
 
     A3.2: sólo la escribe el propietario VIGENTE, con identidad, generación
     y estado EN_EJECUCION en el WHERE. A3.3: escribe únicamente
@@ -2084,6 +2353,102 @@ def latido(
     return ficha
 
 
+def adoptar(
+    raiz: Path,
+    identificador: str,
+    trabajador_id: str,
+    generacion: int,
+    pid: int | None = None,
+    ahora: datetime | None = None,
+    pid_anterior: int | None = None,
+    al_confirmar=None,
+) -> Ficha:
+    """
+    El proceso trabajador hace suya la ejecución que se reclamó en su
+    nombre (T-0003).
+
+    El despacho reclama la tarea ANTES de lanzar el proceso —tiene que
+    hacerlo, porque el trabajador viaja con la generación en su argv y esa
+    generación sólo existe después de la toma—, así que la fila nace con
+    el PID del que despachó, que termina en el acto. Sin esta orden, la
+    vitalidad juzgaría por un proceso que no es el que trabaja.
+
+    Escribe SÓLO `pid` y `ultimo_latido`, con las precondiciones del
+    ciclo: identidad, generación y estado EN_EJECUCION en el WHERE. Un
+    trabajador lanzado para una ejecución que ya no existe —el despacho
+    la perdió, alguien la devolvió, la recuperación la liberó— recibe
+    `ErrorPropiedad` y no toca nada: no puede adoptar lo que no es suyo,
+    y por eso no puede tampoco resucitarlo.
+
+    `pid_anterior` es OBLIGATORIO (desde la auditoría R1): el PID que la
+    fila tiene que seguir teniendo —el del despacho— para que la adopción
+    entre. Con él, la adopción es EXCLUSIVA:
+    un segundo proceso lanzado por accidente con el mismo argv llega
+    cuando la fila ya lleva el PID del primero, su UPDATE no casa y sale
+    sin haber tocado el árbol. Sin esta condición los dos habrían
+    trabajado a la vez sobre el mismo worktree con la misma credencial.
+    """
+    # No es una orden humana: la credencial se DECLARA siempre, y el PID
+    # del despacho también. Sin ellos dos procesos adoptaban la misma
+    # ejecución (auditoría R1), que es justo lo que esta orden impide.
+    if not isinstance(trabajador_id, str) or not trabajador_id.strip():
+        raise ErrorSupervisor(
+            "adoptar exige la identidad del trabajador que adopta."
+        )
+
+    if isinstance(generacion, bool) or not isinstance(generacion, int):
+        raise ErrorSupervisor(
+            "adoptar exige la generación concedida por el despacho."
+        )
+
+    if pid_anterior is None or isinstance(pid_anterior, bool) or not isinstance(
+        pid_anterior, int
+    ) or pid_anterior <= 0:
+        raise ErrorSupervisor(
+            "adoptar exige el PID con el que el despacho reclamó la fila "
+            "(pid_anterior): sin él la adopción no sería exclusiva."
+        )
+
+    ficha = cargar(raiz, identificador)
+
+    if ficha.estado != Estado.EN_EJECUCION:
+        raise ErrorSupervisor(
+            "Sólo se puede adoptar una tarea en ejecución. Estado actual: '"
+            + str(ficha.estado) + "'."
+        )
+
+    propietario, esperada = credencial_de(
+        ficha, "adoptar", trabajador_id, generacion
+    )
+
+    proceso = pid if pid is not None else os.getpid()
+
+    if isinstance(proceso, bool) or not isinstance(proceso, int) or proceso <= 0:
+        raise ErrorSupervisor(
+            "El PID que se adopta debe ser un entero positivo; se recibió: "
+            + repr(pid) + "."
+        )
+
+    ficha.pid = proceso
+    ficha.ultimo_latido = (
+        ahora or ahora_datetime()
+    ).isoformat(timespec="seconds")
+
+    persistir(
+        raiz,
+        ficha,
+        exigir_propietario=propietario,
+        estados_admitidos={Estado.EN_EJECUCION},
+        exigir_generacion=esperada,
+        campos_propios=CAMPOS_ADOPCION,
+        exigir_iguales={"pid": int(pid_anterior)},
+        exigir_no_retroceso={"ultimo_latido": ficha.ultimo_latido},
+        al_confirmar=al_confirmar,
+    )
+
+    return ficha
+
+
 def devolver(
     raiz: Path,
     identificador: str,
@@ -2091,6 +2456,7 @@ def devolver(
     git=None,
     trabajador_id: str | None = None,
     generacion: int | None = None,
+    al_confirmar=None,
 ) -> Ficha:
     """
     El trabajador suelta la tarea sin haberla terminado.
@@ -2122,6 +2488,7 @@ def devolver(
         estados_admitidos={Estado.EN_EJECUCION},
         exigir_generacion=esperada,
         campos_propios=CAMPOS_DEVOLVER,
+        al_confirmar=al_confirmar,
     )
 
     _registrar_en_git(git, ficha, motivo)
@@ -2146,6 +2513,7 @@ def verificar(
     trabajador_id: str | None = None,
     generacion: int | None = None,
     intervalo_latido_s: float | None = None,
+    al_confirmar=None,
 ) -> dict:
     """
     Corre el filtro completo y decide el estado resultante.
@@ -2487,6 +2855,7 @@ def verificar(
         campos_propios=CAMPOS_VERIFICAR,
         incrementos=("intentos",) if consume_intento else (),
         exigir_iguales={"max_intentos": int(ficha.max_intentos)},
+        al_confirmar=al_confirmar,
     )
 
     registro = _registrar_en_git(git, ficha, motivo)
@@ -2717,18 +3086,43 @@ def bloquear(
     motivo: str,
     origen: str = ORIGEN_HUMANO,
     git=None,
+    trabajador_id: str | None = None,
+    generacion: int | None = None,
+    al_confirmar=None,
 ) -> Ficha:
-    """Marca un bloqueo real que exige intervención humana."""
+    """
+    Marca un bloqueo real que exige intervención humana.
+
+    Con `trabajador_id` (y `generacion`) la orden se acredita como una
+    del ciclo (T-0003): es lo que hace el trabajador cuando descubre que
+    el trabajo escribió fuera de su ámbito. Sin ellos es la orden humana
+    de siempre, condicionada sólo por la generación y el estado leídos.
+    """
     if not (motivo or "").strip():
         raise ErrorSupervisor("El bloqueo exige un motivo.")
 
     ficha = cargar(raiz, identificador)
 
+    propietario = None
+    esperada = None
+
+    if trabajador_id is not None:
+        propietario, esperada = credencial_de(
+            ficha, "bloquear", trabajador_id, generacion
+        )
+
     _liberar_trabajador(ficha)
 
     transicionar(ficha, Estado.BLOQUEADO, motivo, origen)
 
-    persistir(raiz, ficha, campos_propios=CAMPOS_DEVOLVER)
+    persistir(
+        raiz,
+        ficha,
+        exigir_propietario=propietario,
+        exigir_generacion=esperada,
+        campos_propios=CAMPOS_DEVOLVER,
+        al_confirmar=al_confirmar,
+    )
 
     _registrar_en_git(git, ficha, motivo)
 
@@ -2750,7 +3144,7 @@ class LatidoAutomatico:
 
     Esto NO es un demonio de trabajadores. Es un acompañante de UNA
     operación concreta, que empieza y termina con ella. El lanzamiento de
-    trabajadores es C.
+    trabajadores lo hace `trabajadores.despachar` (T-0003).
 
     Lo que garantiza, y por qué cada cosa
     -------------------------------------
@@ -2877,6 +3271,14 @@ class LatidoAutomatico:
             self.fallos_totales += 1
 
             return self.fallos_seguidos < FALLOS_LATIDO_SEGUIDOS
+        except ErrorEspejo as aviso:
+            # El latido SÍ quedó confirmado; sólo falló el espejo JSON
+            # (archivo abierto por otro proceso). No es motivo para parar
+            # la señal de vida (auditoría R2).
+            self.error = type(aviso).__name__ + ": " + str(aviso)
+            self.fallos_seguidos = 0
+
+            return True
         except Exception as error:
             # Cualquier otra cosa no es transitoria: se anota y se para.
             self.error = type(error).__name__ + ": " + str(error)
@@ -3301,8 +3703,11 @@ def reanudar(
     que decidió (`exigir_iguales`); deja sin tocar, informándolas, las
     ACTIVAS, las de LATIDO_VENCIDO y las INCONSISTENTES; avisa del
     worktree ausente de toda ejecución revisada; y un fallo del espejo de
-    una tarea no detiene la pasada. El lanzamiento y la expiración
-    automática de trabajadores siguen siendo de C.
+    una tarea no detiene la pasada. El lanzamiento de trabajadores lo
+    hace `trabajadores.despachar` (T-0003) y, tras esta pasada, la
+    consola pone la cola de acuerdo con lo recuperado
+    (`trabajadores.reconciliar_cola`). La expiración automática sigue
+    sin existir: ante la duda, decide una persona.
     """
     ahora = ahora or ahora_datetime()
 
