@@ -39,6 +39,16 @@ from .tarea import ErrorFicha
 
 ANCHO = 74
 
+# Las claves son las del motor; lo que se imprime va acentuado porque es
+# texto para una persona. El criterio no se toca aquí: sólo la etiqueta.
+ETIQUETAS_VITALIDAD = {
+    "ACTIVA": "ACTIVA",
+    "LATIDO_VENCIDO": "LATIDO VENCIDO",
+    "HUERFANA": "HUÉRFANA",
+    "REANUDABLE": "REANUDABLE",
+    "FINALIZADA": "FINALIZADA",
+}
+
 # PRAGMA synchronous devuelve un número; el nombre es el de SQLite.
 SYNCHRONOUS_LEGIBLE = {"0": "OFF", "1": "NORMAL", "2": "FULL", "3": "EXTRA"}
 
@@ -123,8 +133,22 @@ def mostrar_tablero(raiz: Path) -> int:
         )
         _linea("Última actualización", tarea["actualizado_en"])
         _linea("Trabajador", tarea["trabajador_id"])
+        _linea("Generación", tarea["generacion"])
         _linea("PID", tarea["pid"])
         _linea("Último latido", tarea["ultimo_latido"])
+
+        # El estado dice en qué punto del ciclo está la tarea; la vitalidad,
+        # si alguien la está ejecutando AHORA. Una tarea puede quedarse en
+        # EN EJECUCIÓN para siempre porque el proceso que la tomó murió, y
+        # sin esta línea la consola la muestra igual que una viva.
+        _linea(
+            "Vitalidad",
+            ETIQUETAS_VITALIDAD.get(
+                tarea["vitalidad"], str(tarea["vitalidad"])
+            )
+            + "  "
+            + str(tarea["vitalidad_motivo"]),
+        )
 
         verificacion = tarea.get("ultima_verificacion")
 
@@ -138,6 +162,19 @@ def mostrar_tablero(raiz: Path) -> int:
             if verificacion
             else None,
         )
+
+        # Dónde se verificó. Sin esto, «8 de 8» no dice nada: las pruebas
+        # pudieron correr en otro árbol y sobre otro commit.
+        if verificacion:
+            _linea(
+                "Verificado en",
+                str(tarea["verificacion_raiz"])
+                + "  ("
+                + str(tarea["verificacion_rama"])
+                + " @ "
+                + str(tarea["verificacion_commit"])
+                + ")",
+            )
 
         if not tarea.get("definicion_legible", True):
             _linea("Definición JSON", "NO LEGIBLE (" + str(tarea["definicion_ruta"]) + ")")
