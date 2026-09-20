@@ -22,19 +22,19 @@
     "pruebas/orquestacion/prueba_workers_v1.py",
     "pruebas/orquestacion/prueba_ejecucion_segura.py"
   ],
-  "estado": "nuevo",
+  "estado": "en_ejecucion",
   "rama": "tarea/T-0003",
-  "worktree": null,
+  "worktree": "C:\\INGENIERIA_LOCAL\\wt-t0003-workers-v1",
   "intentos": 0,
   "max_intentos": 3,
-  "commit_inicial": null,
+  "commit_inicial": "7c2f191",
   "creado_en": "2026-09-20T05:27:10+00:00",
-  "actualizado_en": "2026-09-20T05:27:10+00:00",
+  "actualizado_en": "2026-09-20T05:27:18+00:00",
   "requiere_decision_humana": [],
-  "trabajador_id": null,
-  "pid": null,
-  "iniciado_en": null,
-  "ultimo_latido": null,
+  "trabajador_id": "CLAUDE-WORKERS-V1",
+  "pid": 5660,
+  "iniciado_en": "2026-09-20T05:27:18+00:00",
+  "ultimo_latido": "2026-09-20T05:27:18+00:00",
   "ultima_falla": null,
   "ejecuciones": [],
   "historial": [
@@ -45,6 +45,18 @@
       "estado_nuevo": "nuevo",
       "motivo": "Ficha creada.",
       "origen": "humano"
+    },
+    {
+      "fecha": "2026-09-20T05:27:18+00:00",
+      "tipo": "transicion",
+      "estado_anterior": "nuevo",
+      "estado_nuevo": "en_ejecucion",
+      "motivo": "Tarea tomada por CLAUDE-WORKERS-V1.",
+      "origen": "automático",
+      "datos": {
+        "trabajador_id": "CLAUDE-WORKERS-V1",
+        "pid": 5660
+      }
     }
   ]
 }
