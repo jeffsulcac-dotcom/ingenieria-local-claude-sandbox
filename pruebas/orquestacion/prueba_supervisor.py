@@ -810,8 +810,15 @@ def prueba_reanudar_detecta_latido_vencido():
         ficha_minima(raiz)
         nucleo.tomar(raiz, "T-0001")
 
-        # El proceso sigue vivo, pero hace horas que no da señales:
-        # no se confía únicamente en el PID.
+        # El proceso sigue vivo, pero hace CINCO HORAS que no da señales.
+        #
+        # Desde A3.3 un latido vencido no basta por sí solo para declarar
+        # abandono: hay que confirmarlo con el proceso. Cinco horas, en
+        # cambio, superan el umbral de abandono (una hora), que es el único
+        # que decide solo y por eso se fijó holgado: tanto tiempo sin una
+        # señal que se emite automáticamente mientras dura el trabajo ya no
+        # admite otra lectura. Por eso aquí sí sale huérfana pese al PID
+        # vivo, y el motivo lo dice con precisión.
         futuro = datetime.now(timezone.utc) + timedelta(hours=5)
 
         informe = nucleo.reanudar(
@@ -821,7 +828,9 @@ def prueba_reanudar_detecta_latido_vencido():
         )
 
         assert len(informe["huerfanas"]) == 1
-        assert "Latido vencido" in informe["huerfanas"][0]["motivo"]
+        assert "umbral de abandono" in informe["huerfanas"][0]["motivo"], (
+            informe["huerfanas"][0]["motivo"]
+        )
 
         assert fichas.leer(raiz, "T-0001").estado == Estado.REABIERTO
 

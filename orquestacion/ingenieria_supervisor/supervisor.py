@@ -54,6 +54,7 @@ import os
 import socket
 import sqlite3
 import subprocess
+import threading
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 from pathlib import Path, PurePosixPath
@@ -92,6 +93,24 @@ LATIDO_MAXIMO_S = 900
 # desaparición del proceso sólo se considera señal de abandono cuando el
 # latido tampoco es reciente.
 LATIDO_GRACIA_S = 120
+
+# Antigüedad de latido a partir de la cual se da la ejecución por perdida
+# aunque no se pueda comprobar el proceso (por ejemplo, otra máquina).
+#
+# Es el único umbral que decide SOLO, y por eso es holgado: una hora sin
+# una señal que se emite automáticamente mientras dura el trabajo ya no
+# admite otra lectura.
+LATIDO_ABANDONO_S = 3600
+
+# Cada cuánto late el acompañante automático de una operación larga.
+#
+# Un minuto es holgado frente a los 900 s que tarda un latido en caducar:
+# harían falta quince fallos seguidos para que una operación viva pareciera
+# caducada, y cada latido cuesta una escritura de una columna.
+INTERVALO_LATIDO_S = 60
+
+# Lo que se espera a que el hilo del latido termine al cerrar.
+ESPERA_CIERRE_LATIDO_S = 10
 
 ORIGEN_AUTOMATICO = "automático"
 ORIGEN_HUMANO = "humano"
@@ -149,6 +168,23 @@ TRANSICIONES = {
 CLASE_ACTIVA = "ACTIVA"
 CLASE_HUERFANA = "HUERFANA"
 CLASE_INCONSISTENTE = "INCONSISTENTE"
+
+# A3.3 — una ejecución cuyo latido caducó pero que NO está demostrada muerta.
+#
+# Es el estado que faltaba, y su ausencia hacía que un latido viejo bastara
+# por sí solo para declarar abandono. Un latido es una señal débil: puede
+# faltar porque el trabajador murió, pero también porque estuvo una hora
+# compilando, porque el reloj de la otra máquina va adelantado o porque
+# nadie emitió latidos manualmente. Declarar huérfana una tarea por eso es
+# arrebatársela a alguien que sigue trabajando.
+CLASE_LATIDO_VENCIDO = "LATIDO_VENCIDO"
+
+# Estados de vitalidad que se informan (no son estados de la tarea).
+VITALIDAD_ACTIVA = "ACTIVA"
+VITALIDAD_LATIDO_VENCIDO = "LATIDO_VENCIDO"
+VITALIDAD_HUERFANA = "HUERFANA"
+VITALIDAD_FINALIZADA = "FINALIZADA"
+VITALIDAD_REANUDABLE = "REANUDABLE"
 
 
 class ErrorSupervisor(Exception):
@@ -1613,6 +1649,7 @@ def verificar(
     git=None,
     trabajador_id: str | None = None,
     generacion: int | None = None,
+    intervalo_latido_s: float | None = None,
 ) -> dict:
     """
     Corre el filtro completo y decide el estado resultante.
@@ -1655,7 +1692,37 @@ def verificar(
 
     testigo = Git(arbol)
 
-    corrida = corredor.ejecutar_todas(arbol, tiempo_limite_s, ejecutable)
+    # Correr la batería entera es la espera más larga del sistema. Sin
+    # latidos, una verificación de diez minutos deja la tarea sin señal todo
+    # ese rato y la recuperación la ve caducada: el trabajo honesto parece
+    # abandono. El acompañante late mientras dura y se para solo al salir,
+    # también si la corrida lanza.
+    acompanante = LatidoAutomatico(
+        raiz,
+        ficha.id,
+        propietario,
+        esperada,
+        intervalo_s=intervalo_latido_s,
+    )
+
+    with acompanante:
+        corrida = corredor.ejecutar_todas(arbol, tiempo_limite_s, ejecutable)
+
+    # Si durante la corrida la tarea cambió de manos, el acompañante lo
+    # detectó antes que nadie. Se dice aquí y no se disimula: el resultado
+    # de esa corrida ya no pertenece a nadie.
+    if acompanante.propiedad_perdida:
+        raise ErrorPropiedad(
+            {
+                "tarea": ficha.id,
+                "motivo": global_.MOTIVO_GENERACION_VENCIDA,
+                "detalle": "La tarea dejó de ser de '" + str(propietario)
+                + "' MIENTRAS se verificaba, así que el resultado de esa "
+                "corrida no es de nadie. " + str(acompanante.detalle),
+                "propietario": propietario,
+                "generacion": esperada,
+            }
+        )
 
     # La evidencia de DÓNDE se ejecutó viaja con el resultado. Sin esto,
     # dos corridas idénticas de árboles distintos son indistinguibles en el
@@ -1798,6 +1865,7 @@ def verificar(
         "motivo": motivo,
         "git": registro,
         "raiz": str(arbol),
+        "latidos": acompanante.emitidos,
         "es_worktree": corrida["es_worktree"],
         "rama": corrida["rama"],
         "commit": corrida["commit"],
@@ -1985,19 +2053,241 @@ def bloquear(
 # Recuperación tras cierre, cambio de sesión o apagón
 # ----------------------------------------------------------------------
 
+class LatidoAutomatico:
+    """
+    Emite latidos mientras dura una operación larga del Supervisor (A3.3).
+
+    A3.2 hizo segura la orden `latido`; alguien tenía que emitirla. Sin
+    esto, una verificación que tarda diez minutos deja la tarea sin señal
+    todo ese rato y la recuperación la ve caducada: el trabajo honesto
+    parece abandono.
+
+    Esto NO es un demonio de trabajadores. Es un acompañante de UNA
+    operación concreta, que empieza y termina con ella. El lanzamiento de
+    trabajadores es C.
+
+    Lo que garantiza, y por qué cada cosa
+    -------------------------------------
+    - Escribe SÓLO `ultimo_latido`, y con las precondiciones de A3.2:
+      identidad, generación y estado EN_EJECUCION. Un latido no puede
+      resucitar nada: si la ejecución terminó o la tarea cambió de manos,
+      la escritura se rechaza sola.
+
+    - Se PARA si pierde la propiedad, y lo deja anotado. Seguir latiendo
+      sobre una tarea ajena sería sostener artificialmente una ejecución
+      que ya no existe, y haría que la recuperación creyera viva a una
+      tarea muerta: justo al revés de para lo que sirve.
+
+    - Se para siempre al terminar la operación, salga bien o mal, porque
+      es un gestor de contexto y `__exit__` corre también cuando el
+      trabajo principal lanza.
+
+    - No mantiene ninguna conexión SQLite abierta entre latidos: abre,
+      escribe y cierra. Mantenerla abierta durante minutos estorbaría a
+      todos los demás para ahorrar una apertura que cuesta microsegundos.
+
+    - La espera es cancelable: se usa un `Event.wait`, que vuelve en el
+      acto cuando se pide parar, y no un `sleep` que habría que aguantar
+      entero. Por eso una prueba puede usar intervalos de milisegundos sin
+      quedarse esperando nada.
+    """
+
+    def __init__(
+        self,
+        raiz: Path,
+        identificador: str,
+        trabajador_id: str,
+        generacion: int,
+        intervalo_s: float = None,
+        reloj=None,
+    ):
+        self.raiz = Path(raiz)
+        self.identificador = identificador
+        self.trabajador_id = trabajador_id
+        self.generacion = int(generacion)
+        self.intervalo_s = (
+            INTERVALO_LATIDO_S if intervalo_s is None else float(intervalo_s)
+        )
+        self._reloj = reloj or ahora_utc
+
+        self.emitidos = 0
+        self.propiedad_perdida = False
+        self.detalle = None
+        self.error = None
+
+        self._parar = threading.Event()
+        self._hilo = None
+
+    def emitir_uno(self) -> bool:
+        """
+        Un latido. Devuelve False cuando ya no hay que seguir.
+
+        Público a propósito: una prueba puede emitir latidos uno a uno y
+        comprobar el efecto sin depender de ningún tiempo de reloj.
+        """
+        momento = self._reloj()
+
+        try:
+            con = global_.abrir(global_.ruta_base(self.raiz))
+
+            try:
+                with global_.transaccion(con):
+                    informe = global_.actualizar_si_propietario(
+                        con,
+                        self.identificador,
+                        {"ultimo_latido": momento, "actualizado_en": momento},
+                        generacion=self.generacion,
+                        momento=momento,
+                        trabajador_id=self.trabajador_id,
+                        estados_admitidos={str(Estado.EN_EJECUCION)},
+                    )
+            finally:
+                con.close()
+        except Exception as error:
+            # Un fallo al latir no puede tumbar el trabajo principal: se
+            # anota, se deja de latir y quien coordina lo verá al terminar.
+            self.error = type(error).__name__ + ": " + str(error)
+
+            return False
+
+        if informe["resultado"] != global_.ESCRITURA_ACEPTADA:
+            self.propiedad_perdida = True
+            self.detalle = informe["detalle"]
+
+            return False
+
+        self.emitidos += 1
+
+        return True
+
+    def _bucle(self) -> None:
+        # `wait` devuelve True en cuanto se pide parar, así que el latido
+        # se corta en el acto en vez de esperar a que venza el intervalo.
+        while not self._parar.wait(self.intervalo_s):
+            if not self.emitir_uno():
+                return
+
+    def __enter__(self) -> "LatidoAutomatico":
+        self._hilo = threading.Thread(
+            target=self._bucle,
+            name="latido-" + str(self.identificador),
+            daemon=True,
+        )
+        self._hilo.start()
+
+        return self
+
+    def __exit__(self, *_excepcion) -> bool:
+        self._parar.set()
+
+        if self._hilo is not None:
+            self._hilo.join(timeout=ESPERA_CIERRE_LATIDO_S)
+
+        # No se traga ninguna excepción del trabajo principal.
+        return False
+
+
+def vitalidad(
+    fila: dict,
+    ahora: datetime | None = None,
+    comprobar_proceso=proceso_vivo,
+    latido_maximo_s: int = LATIDO_MAXIMO_S,
+    latido_gracia_s: int = LATIDO_GRACIA_S,
+    latido_abandono_s: int = LATIDO_ABANDONO_S,
+) -> dict:
+    """
+    Vitalidad de una tarea, para INFORMAR. No decide ni cambia nada.
+
+    Devuelve uno de cinco estados, que son distintos del estado de la tarea:
+
+        ACTIVA          hay una ejecución y da señales
+        LATIDO_VENCIDO  hay una ejecución, el latido caducó, pero no está
+                        demostrada muerta
+        HUERFANA        hay una ejecución y está demostrada perdida
+        REANUDABLE      no hay ejecución y la tarea se puede tomar
+        FINALIZADA      no hay ejecución y la tarea no se puede tomar
+
+    Separar esto de `clasificar_ejecucion` es deliberado: aquélla decide si
+    la recuperación toca o no toca una tarea, y sólo mira las que están en
+    ejecución. Ésta responde a "¿qué le pasa a esta tarea?" para cualquiera,
+    que es lo que necesita el tablero.
+    """
+    ahora = ahora or ahora_datetime()
+
+    estado = str(fila.get("estado") or "")
+    latido = a_datetime(fila.get("ultimo_latido"))
+    edad = None if latido is None else int((ahora - latido).total_seconds())
+
+    informe = {
+        "estado": estado,
+        "trabajador_id": fila.get("trabajador_id"),
+        "generacion": fila.get("generacion"),
+        "pid": fila.get("pid"),
+        "iniciado_en": fila.get("iniciado_en"),
+        "ultimo_latido": fila.get("ultimo_latido"),
+        "edad_latido_s": edad,
+        "worktree": fila.get("worktree"),
+        "vitalidad": None,
+        "motivo": None,
+    }
+
+    if estado != str(Estado.EN_EJECUCION):
+        tomable = estado in {str(uno) for uno in ESTADOS_TOMABLES}
+
+        informe["vitalidad"] = (
+            VITALIDAD_REANUDABLE if tomable else VITALIDAD_FINALIZADA
+        )
+        informe["motivo"] = (
+            "Sin ejecución en curso; la tarea "
+            + ("puede tomarse." if tomable else "no admite toma en este estado.")
+        )
+
+        return informe
+
+    prestada = Ficha(id=str(fila.get("id") or "T-0000"), titulo="")
+    prestada.estado = Estado.EN_EJECUCION
+    prestada.trabajador_id = fila.get("trabajador_id")
+    prestada.pid = fila.get("pid")
+    prestada.iniciado_en = fila.get("iniciado_en")
+    prestada.ultimo_latido = fila.get("ultimo_latido")
+
+    clase, motivo = clasificar_ejecucion(
+        prestada,
+        ahora,
+        comprobar_proceso,
+        latido_maximo_s,
+        latido_gracia_s,
+        latido_abandono_s,
+    )
+
+    informe["vitalidad"] = {
+        CLASE_ACTIVA: VITALIDAD_ACTIVA,
+        CLASE_LATIDO_VENCIDO: VITALIDAD_LATIDO_VENCIDO,
+        CLASE_HUERFANA: VITALIDAD_HUERFANA,
+        CLASE_INCONSISTENTE: VITALIDAD_HUERFANA,
+    }.get(clase, VITALIDAD_ACTIVA)
+    informe["motivo"] = motivo
+
+    return informe
+
+
 def clasificar_ejecucion(
     ficha: Ficha,
     ahora: datetime,
     comprobar_proceso=proceso_vivo,
     latido_maximo_s: int = LATIDO_MAXIMO_S,
     latido_gracia_s: int = LATIDO_GRACIA_S,
+    latido_abandono_s: int = LATIDO_ABANDONO_S,
 ) -> tuple[str, str]:
     """
     Clasifica una tarea EN_EJECUCION como ACTIVA, HUERFANA o INCONSISTENTE.
 
-    Nunca se juzga sólo por el PID:
+    Nunca se juzga por UNA sola señal, ni por el PID ni por el latido:
 
-    - un latido vencido basta por sí solo para declarar abandono;
+    - un latido vencido NO basta por sí solo: hace falta confirmarlo con el
+      proceso, o que la antigüedad pase del umbral de abandono, que es
+      holgado a propósito. Si no, se devuelve LATIDO_VENCIDO, que informa
+      sin arrebatar;
     - la desaparición del proceso sólo cuenta si además el latido dejó de
       ser reciente, porque el proceso que reclamó la tarea puede haber sido
       un mandato breve de línea de comandos ya terminado;
@@ -2027,26 +2317,61 @@ def clasificar_ejecucion(
         )
 
     antiguedad = ahora - latido
-
-    if antiguedad > timedelta(seconds=latido_maximo_s):
-        return (
-            CLASE_HUERFANA,
-            "Latido vencido: "
-            + str(int(antiguedad.total_seconds()))
-            + " s sin señal (máximo permitido "
-            + str(latido_maximo_s)
-            + " s).",
-        )
+    segundos = int(antiguedad.total_seconds())
 
     equipo_ficha = equipo_de(ficha.trabajador_id)
     equipo_actual = socket.gethostname()
 
-    if equipo_ficha != equipo_actual:
+    # Ajeno significa "declara OTRA máquina", no "no declara ninguna".
+    #
+    # `equipo_de` devuelve None cuando el identificador no lleva equipo, y
+    # tratar eso como ajeno sería un error con consecuencias: el PID local
+    # dejaría de poder confirmar nada y ninguna ejecución con un
+    # identificador libre podría recuperarse hasta el umbral de abandono.
+    # Desconocido no es ajeno: es desconocido, y entonces la señal del
+    # proceso sí vale.
+    ajeno = equipo_ficha is not None and equipo_ficha != equipo_actual
+
+    if antiguedad > timedelta(seconds=latido_maximo_s):
+        # El latido caducó. Eso NO basta para declarar abandono: es una
+        # señal débil y decidir con ella sola es arrebatarle la tarea a
+        # quien quizá sigue trabajando. Se busca una segunda.
+        if antiguedad > timedelta(seconds=latido_abandono_s):
+            return (
+                CLASE_HUERFANA,
+                "Sin señal desde hace " + str(segundos) + " s, por encima "
+                "del umbral de abandono (" + str(latido_abandono_s) + " s). "
+                "Ya no admite otra lectura.",
+            )
+
+        if not ajeno and not comprobar_proceso(ficha.pid):
+            return (
+                CLASE_HUERFANA,
+                "Latido vencido (" + str(segundos) + " s, máximo "
+                + str(latido_maximo_s) + " s) Y el proceso "
+                + str(ficha.pid) + " ya no existe: dos señales.",
+            )
+
+        return (
+            CLASE_LATIDO_VENCIDO,
+            "Latido vencido (" + str(segundos) + " s, máximo "
+            + str(latido_maximo_s) + " s), pero "
+            + (
+                "el trabajador es de otro equipo (" + str(equipo_ficha)
+                + ") y aquí no se puede comprobar su proceso"
+                if ajeno
+                else "el proceso " + str(ficha.pid) + " sigue vivo"
+            )
+            + ". No se declara abandonada con una sola señal.",
+        )
+
+    if ajeno:
         return (
             CLASE_ACTIVA,
             "Trabajador de otro equipo ("
             + str(equipo_ficha)
-            + ") con latido reciente.",
+            + ") con latido reciente: aquí no se puede comprobar su "
+            "proceso, y el latido es la señal que sí vale.",
         )
 
     if comprobar_proceso(ficha.pid):
@@ -2082,6 +2407,7 @@ def reanudar(
     latido_maximo_s: int = LATIDO_MAXIMO_S,
     latido_gracia_s: int = LATIDO_GRACIA_S,
     git=None,
+    latido_abandono_s: int = LATIDO_ABANDONO_S,
 ) -> dict:
     """
     Recuperación tras un cierre, un cambio de sesión o un apagón.
@@ -2105,6 +2431,9 @@ def reanudar(
         "temporales_eliminados": [],
         "fichas_ilegibles": [],
         "reclamadas_mientras_tanto": [],
+        # Ejecuciones con el latido caducado que NO se recuperan porque no
+        # están demostradas muertas (A3.3).
+        "latido_vencido": [],
     }
 
     for temporal in temporales_huerfanos(raiz):
@@ -2153,11 +2482,32 @@ def reanudar(
         ficha.eventos_pendientes.clear()
 
         clase, motivo = clasificar_ejecucion(
-            ficha, ahora, comprobar_proceso, latido_maximo_s, latido_gracia_s
+            ficha,
+            ahora,
+            comprobar_proceso,
+            latido_maximo_s,
+            latido_gracia_s,
+            latido_abandono_s,
         )
 
         if clase == CLASE_ACTIVA:
             informe["activas"].append(
+                {
+                    "id": ficha.id,
+                    "titulo": ficha.titulo,
+                    "trabajador_id": ficha.trabajador_id,
+                    "pid": ficha.pid,
+                    "motivo": motivo,
+                }
+            )
+            continue
+
+        if clase == CLASE_LATIDO_VENCIDO:
+            # Caducó el latido pero NO está demostrada muerta. No se toca:
+            # recuperarla sería arrebatársela a quien quizá sigue
+            # trabajando. Se informa para que una persona lo mire, que es
+            # justo lo que hay que hacer con una duda.
+            informe["latido_vencido"].append(
                 {
                     "id": ficha.id,
                     "titulo": ficha.titulo,

@@ -724,6 +724,7 @@ def orden_reanudar(raiz: Path, argumentos) -> int:
         ("inconsistentes", "INCONSISTENTES RECUPERADAS"),
         ("sin_definicion", "SIN DEFINICIÓN EN ESTE ÁRBOL (no modificadas)"),
         ("reclamadas_mientras_tanto", "RECLAMADAS DURANTE LA RECUPERACIÓN"),
+        ("latido_vencido", "LATIDO VENCIDO (no recuperadas: mirar a mano)"),
     ):
         if informe[grupo]:
             print("")
