@@ -881,6 +881,98 @@ def prueba_i_el_latido_se_para_al_perder_la_propiedad():
     print("OK")
 
 
+def prueba_i2_el_latido_viejo_no_vale_para_la_ejecucion_nueva():
+    """
+    El mismo trabajador, ejecución nueva: el latido viejo NO cuenta.
+
+    Éste es el caso que la identidad sola no cubre. Un trabajador
+    devuelve la tarea y la vuelve a tomar: el `trabajador_id` es el
+    mismo y el estado vuelve a ser EN_EJECUCION, así que las dos
+    precondiciones evidentes coinciden. Sólo la generación distingue la
+    ejecución vieja de la nueva.
+
+    Importa porque un latido rezagado del turno anterior estaría
+    certificando como viva una ejecución que nadie está haciendo. El
+    reloj de abandono no volvería a vencer nunca y la recuperación no
+    llegaría a mirar la tarea.
+
+    Lo descubrió el arnés de mutación: al hacer que el latido leyera la
+    generación de la fila en vez de usar la suya, TODA la batería seguía
+    en verde. Esta comprobación es la que faltaba.
+    """
+    print("  9. un latido del turno anterior no vale para el nuevo:", end=" ")
+
+    raiz = crear_repositorio()
+
+    try:
+        ficha_minima(raiz, "T-0901")
+        primera = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+
+        rezagado = nucleo.LatidoAutomatico(
+            raiz, "T-0901", "worker-A", primera.generacion
+        )
+
+        assert rezagado.emitir_uno() is True, (
+            "El latido no funcionaba ni en su propia ejecución."
+        )
+
+        # Mismo trabajador, ejecución nueva.
+        nucleo.devolver(raiz, "T-0901", trabajador_id="worker-A")
+        segunda = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+        METRICAS["OPERACIONES"] += 2
+        METRICAS["ACEPTADAS"] += 2
+
+        assert segunda.generacion > primera.generacion, (
+            "La retoma no avanzó la generación: la prueba no probaría nada."
+        )
+
+        # Marca imposible de confundir: si el latido viejo escribe, se ve.
+        testigo = "2001-02-03T04:05:06+00:00"
+        con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+        try:
+            with estado_global.transaccion(con):
+                con.execute(
+                    "UPDATE tareas SET ultimo_latido = ? WHERE id = ?",
+                    (testigo, "T-0901"),
+                )
+        finally:
+            con.close()
+
+        fila_previa = fila_de(raiz, "T-0901")
+
+        assert fila_previa["trabajador_id"] == "worker-A"
+        assert fila_previa["estado"] == str(Estado.EN_EJECUCION)
+        assert fila_previa["ultimo_latido"] == testigo
+
+        # Identidad y estado coinciden. Sólo la generación debe frenarlo.
+        assert rezagado.emitir_uno() is False, (
+            "Un latido de la ejecución anterior se aceptó en la nueva."
+        )
+        assert rezagado.propiedad_perdida is True
+        assert rezagado.emitidos == 1, (
+            "Se contó como emitido un latido rechazado."
+        )
+        METRICAS["RECHAZADAS"] += 1
+
+        fila = fila_de(raiz, "T-0901")
+
+        if fila["ultimo_latido"] != testigo:
+            METRICAS["ACTUALIZACIONES_PERDIDAS"] += 1
+
+        assert fila["ultimo_latido"] == testigo, (
+            "El latido viejo escribió sobre la ejecución nueva: "
+            + repr(fila["ultimo_latido"])
+        )
+        assert fila["generacion"] == segunda.generacion
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
 def prueba_j_el_latido_no_resucita_una_ejecucion_terminada():
     """
     Terminada la ejecución, un latido rezagado no la revive.
@@ -889,7 +981,7 @@ def prueba_j_el_latido_no_resucita_una_ejecucion_terminada():
     en vuelo tampoco podría hacer daño: su escritura exige estado
     EN_EJECUCION, y una tarea ya cerrada no lo está.
     """
-    print("  9. un latido rezagado no resucita lo terminado:", end=" ")
+    print(" 10. un latido rezagado no resucita lo terminado:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -933,7 +1025,7 @@ def prueba_k_el_acompanante_se_para_aunque_el_trabajo_falle():
     ejecución que nadie está haciendo. Se comprueba con una excepción
     deliberada, que es el caso en el que un `finally` mal puesto se nota.
     """
-    print(" 10. el acompañante se para aunque el trabajo falle:", end=" ")
+    print(" 11. el acompañante se para aunque el trabajo falle:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -995,7 +1087,7 @@ def prueba_l_verificar_late_mientras_corre():
     Es la operación larga que motivó todo esto, así que se comprueba sobre
     ella y no sólo sobre el componente suelto.
     """
-    print(" 11. verificar late mientras corre la batería:", end=" ")
+    print(" 12. verificar late mientras corre la batería:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1105,7 +1197,7 @@ def prueba_g_crear_concurrente_tiene_un_solo_ganador(creadores: int):
     ganó. Contar ganadores no bastaría.
     """
     print(
-        " 16. crear concurrente (" + str(creadores) + " procesos): ",
+        " 18. crear concurrente (" + str(creadores) + " procesos): ",
         end="",
     )
 
@@ -1291,7 +1383,7 @@ def prueba_m_un_latido_vencido_no_basta_para_declarar_abandono():
     trabajando, y ése es el peor fallo posible en un sistema que va a
     tener varios trabajadores a la vez.
     """
-    print(" 12. un latido vencido no basta para declarar abandono:", end=" ")
+    print(" 13. un latido vencido no basta para declarar abandono:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1363,7 +1455,7 @@ def prueba_n_la_vitalidad_distingue_los_cinco_estados():
     esté ejecutando es otra cosa, y es la que hace falta para decidir si
     hay que mirar algo.
     """
-    print(" 13. la vitalidad distingue los cinco estados:", end=" ")
+    print(" 14. la vitalidad distingue los cinco estados:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1433,7 +1525,7 @@ def prueba_o_reanudar_es_idempotente():
     reintente—. Si cada pasada añadiera una ejecución interrumpida y una
     transición, el historial acabaría contando una historia que no pasó.
     """
-    print(" 14. reanudar dos veces no duplica nada:", end=" ")
+    print(" 15. reanudar dos veces no duplica nada:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1515,7 +1607,7 @@ def prueba_p_tras_recuperar_b_toma_y_la_orden_tardia_de_a_cae():
     que es donde se ve si las garantías se sostienen juntas o sólo por
     separado.
     """
-    print(" 15. tras recuperar, B toma y lo tardío de A cae:", end=" ")
+    print(" 16. tras recuperar, B toma y lo tardío de A cae:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1786,7 +1878,7 @@ def prueba_r_estres_de_escrituras_concurrentes(escritores: int, vueltas: int):
     puesta acaba apareciendo.
     """
     print(
-        " 18. estrés: " + str(escritores) + " escritores x " + str(vueltas)
+        " 19. estrés: " + str(escritores) + " escritores x " + str(vueltas)
         + " vueltas:",
         end=" ",
     )
@@ -1907,6 +1999,7 @@ COMPROBACIONES = (
     prueba_f_el_worktree_se_valida_al_tomar,
     prueba_h_el_latido_automatico_mantiene_viva_la_ejecucion,
     prueba_i_el_latido_se_para_al_perder_la_propiedad,
+    prueba_i2_el_latido_viejo_no_vale_para_la_ejecucion_nueva,
     prueba_j_el_latido_no_resucita_una_ejecucion_terminada,
     prueba_k_el_acompanante_se_para_aunque_el_trabajo_falle,
     prueba_l_verificar_late_mientras_corre,
