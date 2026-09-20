@@ -31,6 +31,7 @@ import copy
 import multiprocessing
 import os
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -1270,7 +1271,7 @@ def prueba_g_crear_concurrente_tiene_un_solo_ganador(creadores: int):
     ganó. Contar ganadores no bastaría.
     """
     print(
-        " 19. crear concurrente (" + str(creadores) + " procesos): ",
+        " 28. crear concurrente (" + str(creadores) + " procesos): ",
         end="",
     )
 
@@ -2029,14 +2030,24 @@ def _escritor_concurrente(ruta_raiz: str, identificador: str, papel: str,
 
         try:
             if papel.startswith("latido"):
+                # Marca propia y creciente por vuelta. Con un literal fijo
+                # para todos, un lost update entre dos latidos era
+                # indetectable: la aserción final pasaba aunque sólo
+                # hubiera entrado UNA escritura de dieciocho.
+                marca_latido = (
+                    "2030-01-01T00:00:%02d+00:00" % min(vuelta, 59)
+                )
                 acompanante = _nucleo.LatidoAutomatico(
                     raiz,
                     identificador,
                     credencial["trabajador_id"],
                     credencial["generacion"],
-                    reloj=lambda: "2030-01-01T00:00:00+00:00",
+                    reloj=lambda valor=marca_latido: valor,
                 )
                 aceptada = acompanante.emitir_uno()
+
+                if aceptada:
+                    recuento.setdefault("latidos", []).append(marca_latido)
             else:
                 con = _global.abrir(_global.ruta_base(raiz))
 
@@ -2060,6 +2071,7 @@ def _escritor_concurrente(ruta_raiz: str, identificador: str, papel: str,
             if aceptada:
                 recuento["aceptadas"] += 1
                 recuento["ultimo"] = marca
+                recuento.setdefault("marcas", []).append(marca)
             else:
                 recuento["rechazadas"] += 1
         except sqlite3.Error as error:
@@ -2084,7 +2096,7 @@ def prueba_r_estres_de_escrituras_concurrentes(escritores: int, vueltas: int):
     puesta acaba apareciendo.
     """
     print(
-        " 20. estrés: " + str(escritores) + " escritores x " + str(vueltas)
+        " 29. estrés: " + str(escritores) + " escritores x " + str(vueltas)
         + " vueltas:",
         end=" ",
     )
@@ -2170,16 +2182,36 @@ def prueba_r_estres_de_escrituras_concurrentes(escritores: int, vueltas: int):
 
         # El latido y la falla conviven: ninguno dejó al otro en su valor
         # inicial, que es justo lo que pasaría si se pisaran.
-        assert fila["ultimo_latido"] == "2030-01-01T00:00:00+00:00", (
-            "El latido quedó revertido: " + repr(fila["ultimo_latido"])
+        latidos = sorted(
+            {marca for uno in recuentos for marca in uno.get("latidos", [])}
         )
+        marcas = {marca for uno in recuentos for marca in uno.get("marcas", [])}
 
-        if not fila["ultima_falla"] or "marca" not in (fila["ultima_falla"] or {}):
+        assert latidos, "Ningún latido llegó a confirmarse."
+        assert marcas, "Ninguna escritura de `ultima_falla` se confirmó."
+
+        # El latido que sobrevive debe ser el MAYOR de los confirmados. La
+        # guarda de no retroceso lo garantiza; sin comprobarlo, un
+        # retroceso pasaba desapercibido.
+        if fila["ultimo_latido"] != latidos[-1]:
             METRICAS["ACTUALIZACIONES_PERDIDAS"] += 1
 
-        assert fila["ultima_falla"] and "marca" in fila["ultima_falla"], (
-            "La escritura de `ultima_falla` se perdió entera: "
-            + repr(fila["ultima_falla"])
+        assert fila["ultimo_latido"] == latidos[-1], (
+            "El latido grabado no es el último confirmado: "
+            + repr(fila["ultimo_latido"]) + " en vez de " + repr(latidos[-1])
+        )
+
+        grabada = (fila["ultima_falla"] or {}).get("marca")
+
+        # Y la falla grabada tiene que ser una que algún proceso emitió de
+        # verdad. Antes bastaba con que existiera la clave: una mutación
+        # que conservara la PRIMERA escritura y perdiera las diecisiete
+        # siguientes pasaba la prueba.
+        if grabada not in marcas:
+            METRICAS["ACTUALIZACIONES_PERDIDAS"] += 1
+
+        assert grabada in marcas, (
+            "La marca grabada no la emitió nadie: " + repr(grabada)
         )
 
         comprobar_integridad(raiz)
@@ -2190,6 +2222,792 @@ def prueba_r_estres_de_escrituras_concurrentes(escritores: int, vueltas: int):
         )
     finally:
         borrar(raiz)
+
+
+# ----------------------------------------------------------------------
+# GRUPO 8 — Lo que la ronda de auditoría destapó
+#
+# Cada comprobación de aquí existe porque un mutante sobrevivió a la
+# batería anterior: el motor hacía lo correcto y nada lo comprobaba.
+# ----------------------------------------------------------------------
+
+def prueba_t_verificar_rechaza_un_arbol_invalido():
+    """
+    `verificar` rechaza de verdad un árbol que ya no vale, y no graba nada.
+
+    Éste era el gate crítico de A3.3 sin ninguna prueba de extremo a
+    extremo: la comprobación 5 llama a `resolver_worktree` directamente y
+    jamás invoca `verificar`. Bastaba con que `verificar` dejara de
+    propagar `ErrorWorktree` —tragarlo y caer a la raíz— para que el
+    agujero volviera con la batería entera en verde, y entonces las
+    pruebas de main se grababan como resultado de la tarea.
+    """
+    print(" 19. verificar rechaza un árbol inválido y no graba:", end=" ")
+
+    principal, aparte, arboles = montar_tres_arboles()
+
+    try:
+        nucleo.crear(
+            principal,
+            "T-0904",
+            titulo="Tarea del árbol A",
+            ambito_archivos=["modulos/a/*.py"],
+            pruebas_requeridas=["pruebas/demostracion/prueba_arbol.py"],
+        )
+        tomada = nucleo.tomar(
+            principal,
+            "T-0904",
+            trabajador_id="worker-A",
+            worktree=str(arboles["A"]),
+        )
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        # El árbol desaparece con la tarea ya tomada.
+        shutil.rmtree(arboles["A"])
+
+        antes = fila_de(principal, "T-0904")
+
+        METRICAS["OPERACIONES"] += 1
+
+        try:
+            nucleo.verificar(
+                principal,
+                "T-0904",
+                trabajador_id="worker-A",
+                generacion=tomada.generacion,
+            )
+            METRICAS["ACEPTADAS"] += 1
+            METRICAS["VERIFICACIONES_EN_ARBOL_INCORRECTO"] += 1
+            raise AssertionError(
+                "verificar se ejecutó pese a que el árbol de la tarea no "
+                "existe: el resultado sería el de otro árbol."
+            )
+        except nucleo.ErrorWorktree as rechazo:
+            METRICAS["RECHAZADAS"] += 1
+            assert "no existe" in str(rechazo), str(rechazo)
+
+        despues = fila_de(principal, "T-0904")
+
+        assert despues["ultima_verificacion"] == antes["ultima_verificacion"], (
+            "Se grabó una verificación que no llegó a ejecutarse: "
+            + repr(despues["ultima_verificacion"])
+        )
+        assert despues["estado"] == str(Estado.EN_EJECUCION), (
+            "El rechazo cambió el estado de la tarea: " + despues["estado"]
+        )
+        assert despues["intentos"] == antes["intentos"], (
+            "El rechazo consumió un intento."
+        )
+
+        comprobar_integridad(principal)
+    finally:
+        borrar(aparte)
+        borrar(principal)
+
+    print("OK")
+
+
+def prueba_u_un_arbol_que_se_mueve_invalida_la_corrida():
+    """
+    Si el árbol cambia MIENTRAS corren las pruebas, no se graba un verde.
+
+    La rama y el commit se leían DESPUÉS de correr. Entre el arranque de
+    la batería —hasta dos minutos por archivo— y esa lectura cabe
+    cualquier `commit`, `rebase` o `checkout` del propio trabajador que
+    sigue trabajando en ese árbol. No hace falta malicia. Quedaba grabado
+    «commit X, todo en verde» cuando X nunca se ejecutó y encima estaba
+    rojo.
+    """
+    print(" 20. un árbol que se mueve durante la corrida no vale:", end=" ")
+
+    principal = crear_repositorio("movil_")
+
+    try:
+        carpeta = principal / "pruebas" / "demostracion"
+        (carpeta / "prueba_lenta.py").write_text(
+            "import time\ntime.sleep(1.5)\nprint('PRUEBA_LENTA=OK')\n",
+            encoding="utf-8",
+        )
+
+        _git(principal, "add", "-A")
+        hecho = _git(principal, "commit", "-q", "-m", "base")
+        assert hecho.returncode == 0, hecho.stderr
+
+        nucleo.crear(
+            principal,
+            "T-0905",
+            titulo="Tarea con árbol móvil",
+            ambito_archivos=["modulos/m/*.py"],
+            pruebas_requeridas=["pruebas/demostracion/prueba_lenta.py"],
+        )
+        tomada = nucleo.tomar(principal, "T-0905", trabajador_id="worker-A")
+        METRICAS["OPERACIONES"] += 2
+        METRICAS["ACEPTADAS"] += 2
+
+        commit_inicial = _commit_de(principal)
+
+        def commitear_a_mitad():
+            time.sleep(0.6)
+            (principal / "otro.txt").write_text("v2", encoding="utf-8")
+            _git(principal, "add", "-A")
+            _git(principal, "commit", "-q", "-m", "v2 a mitad de la corrida")
+
+        hilo = threading.Thread(target=commitear_a_mitad)
+        hilo.start()
+
+        METRICAS["OPERACIONES"] += 1
+
+        try:
+            nucleo.verificar(
+                principal,
+                "T-0905",
+                trabajador_id="worker-A",
+                generacion=tomada.generacion,
+            )
+            METRICAS["ACEPTADAS"] += 1
+            raise AssertionError(
+                "Se dio por buena una corrida sobre un árbol que cambió a "
+                "mitad: el verde no corresponde a ningún commit concreto."
+            )
+        except nucleo.ErrorWorktree as rechazo:
+            METRICAS["RECHAZADAS"] += 1
+            assert "cambió" in str(rechazo), str(rechazo)
+        finally:
+            hilo.join()
+
+        assert _commit_de(principal) != commit_inicial, (
+            "El hilo no llegó a commitear: la prueba no probó nada."
+        )
+
+        fila = fila_de(principal, "T-0905")
+
+        assert not fila["ultima_verificacion"], (
+            "Se grabó la corrida de un árbol que se movió: "
+            + repr(fila["ultima_verificacion"])
+        )
+
+        comprobar_integridad(principal)
+    finally:
+        borrar(principal)
+
+    print("OK")
+
+
+def prueba_v_verificar_abandona_si_pierde_la_propiedad():
+    """
+    Perder la tarea a mitad de la corrida invalida el resultado.
+
+    Son trece líneas de `verificar` con cobertura cero: se podían borrar
+    enteras sin que la batería se inmutara. Y es la pieza que convierte la
+    detección del latido en una decisión: el resultado de esa corrida no
+    es de nadie.
+    """
+    print(" 21. verificar abandona si pierde la propiedad:", end=" ")
+
+    raiz = crear_repositorio("perdida_")
+
+    try:
+        carpeta = raiz / "pruebas" / "demostracion"
+        (carpeta / "prueba_lenta.py").write_text(
+            "import time\ntime.sleep(1.5)\nprint('PRUEBA_LENTA=OK')\n",
+            encoding="utf-8",
+        )
+
+        ficha_minima(
+            raiz,
+            "T-0901",
+            pruebas_requeridas=["pruebas/demostracion/prueba_lenta.py"],
+        )
+        tomada = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        def arrebatar():
+            time.sleep(0.5)
+            nucleo.devolver(raiz, "T-0901", trabajador_id="worker-A")
+            nucleo.tomar(raiz, "T-0901", trabajador_id="worker-B")
+
+        hilo = threading.Thread(target=arrebatar)
+        hilo.start()
+
+        METRICAS["OPERACIONES"] += 1
+
+        try:
+            nucleo.verificar(
+                raiz,
+                "T-0901",
+                trabajador_id="worker-A",
+                generacion=tomada.generacion,
+                intervalo_latido_s=0.02,
+            )
+            METRICAS["ACEPTADAS"] += 1
+            raise AssertionError(
+                "Se grabó el resultado de una corrida cuya tarea cambió de "
+                "manos mientras corría."
+            )
+        except nucleo.ErrorPropiedad as rechazo:
+            METRICAS["RECHAZADAS"] += 1
+            METRICAS["ROBOS_INDEBIDOS"] += 0
+
+            # El motivo tiene que ser el REAL, no uno fijo. Aquí la tarea
+            # cambió de dueño y además de generación.
+            assert rechazo.informe["motivo"] in (
+                estado_global.MOTIVO_OTRO_PROPIETARIO,
+                estado_global.MOTIVO_GENERACION_VENCIDA,
+                estado_global.MOTIVO_SIN_PROPIETARIO,
+            ), repr(rechazo.informe["motivo"])
+        finally:
+            hilo.join()
+
+        fila = fila_de(raiz, "T-0901")
+
+        assert fila["trabajador_id"] == "worker-B", (
+            "El arrebato no llegó a ocurrir: la prueba no probó nada."
+        )
+        assert not fila["ultima_verificacion"], (
+            "Se grabó la verificación de un dueño que ya no lo era."
+        )
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+def prueba_w_cada_precondicion_del_latido_frena_por_separado():
+    """
+    Las tres precondiciones del latido, aisladas una a una.
+
+    Las pruebas 8 y 10 creían comprobar el estado y la identidad, pero
+    `devolver` cambia las tres cosas a la vez: el rechazo lo producía la
+    identidad y las otras dos condiciones se podían borrar del motor sin
+    que nada fallara. Aquí cada fila se deja tocada A MANO para que sólo
+    una condición pueda frenar la escritura.
+    """
+    print(" 22. cada precondición del latido frena por separado:", end=" ")
+
+    for caso, cambios, esperado in (
+        (
+            "sólo el estado",
+            {"estado": str(Estado.PROPUESTO)},
+            "el estado ya no admite latido",
+        ),
+        (
+            "sólo la identidad",
+            {"trabajador_id": "worker-Z"},
+            "el trabajador ya no es el mismo",
+        ),
+        (
+            "sólo la generación",
+            {"generacion": 99},
+            "la generación ya no es la misma",
+        ),
+    ):
+        raiz = crear_repositorio("precondicion_")
+
+        try:
+            ficha_minima(raiz, "T-0901")
+            tomada = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+
+            acompanante = nucleo.LatidoAutomatico(
+                raiz, "T-0901", "worker-A", tomada.generacion
+            )
+
+            assert acompanante.emitir_uno() is True, (
+                "El latido no funcionaba ni en su caso bueno (" + caso + ")."
+            )
+
+            testigo = "2001-02-03T04:05:06+00:00"
+            con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+            try:
+                with estado_global.transaccion(con):
+                    columnas = dict(cambios)
+                    columnas["ultimo_latido"] = testigo
+
+                    for columna, valor in columnas.items():
+                        con.execute(
+                            "UPDATE tareas SET " + columna + " = ? "
+                            "WHERE id = ?",
+                            (valor, "T-0901"),
+                        )
+            finally:
+                con.close()
+
+            METRICAS["OPERACIONES"] += 1
+
+            assert acompanante.emitir_uno() is False, (
+                "El latido pasó aunque " + esperado + " (" + caso + ")."
+            )
+            assert acompanante.propiedad_perdida is True, caso
+            METRICAS["RECHAZADAS"] += 1
+
+            fila = fila_de(raiz, "T-0901")
+
+            if fila["ultimo_latido"] != testigo:
+                METRICAS["ACTUALIZACIONES_PERDIDAS"] += 1
+
+            assert fila["ultimo_latido"] == testigo, (
+                "El latido escribió pese al rechazo (" + caso + "): "
+                + repr(fila["ultimo_latido"])
+            )
+
+            comprobar_integridad(raiz)
+        finally:
+            borrar(raiz)
+
+    print("OK")
+
+
+def prueba_x_un_trabajador_de_otra_maquina_no_se_juzga_por_el_pid_local():
+    """
+    El PID de otra máquina no significa nada aquí.
+
+    Todas las pruebas usaban identidades planas (`worker-A`), para las que
+    `equipo_de` devuelve None y la rama `ajeno` no se ejercitaba nunca. En
+    producción los identificadores llevan equipo, así que se estaba
+    probando el motor con identidades que no existen.
+
+    Sin esta comprobación se podía poner `ajeno = False` y la batería
+    entera seguía en verde: bastaba un PID ajeno que no exista aquí para
+    arrebatarle la tarea a alguien que sigue trabajando en su máquina.
+    """
+    print(" 23. un trabajador de otra máquina no se juzga por el PID:",
+          end=" ")
+
+    ajeno = "OTRA-MAQUINA/4242/abcd"
+    propio = socket.gethostname()
+
+    assert nucleo.equipo_de(ajeno) == "OTRA-MAQUINA"
+    assert nucleo.equipo_de(ajeno) != propio, (
+        "El nombre de esta máquina coincide con el inventado: la prueba no "
+        "probaría nada."
+    )
+
+    def fila(latido_hace_s):
+        momento = nucleo.ahora_datetime() - timedelta(seconds=latido_hace_s)
+
+        return {
+            "id": "T-0901",
+            "estado": str(Estado.EN_EJECUCION),
+            "trabajador_id": ajeno,
+            "pid": 999999,
+            "iniciado_en": momento.isoformat(timespec="seconds"),
+            "ultimo_latido": momento.isoformat(timespec="seconds"),
+            "generacion": 1,
+            "worktree": None,
+        }
+
+    # Latido reciente: viva, aunque el PID no exista en esta máquina.
+    reciente = nucleo.vitalidad(fila(60), comprobar_proceso=lambda _p: False)
+
+    assert reciente["vitalidad"] == nucleo.VITALIDAD_ACTIVA, (
+        "Se juzgó a un trabajador remoto por un PID local: "
+        + repr(reciente)
+    )
+
+    # Latido vencido: duda, NUNCA huérfana. No hay segunda señal posible.
+    for edad in (1800, 7200, 200000):
+        vencido = nucleo.vitalidad(
+            fila(edad), comprobar_proceso=lambda _p: False
+        )
+
+        assert vencido["vitalidad"] == nucleo.VITALIDAD_LATIDO_VENCIDO, (
+            "Se declaró huérfano a un trabajador de otra máquina con "
+            + str(edad) + " s de latido: " + repr(vencido)
+        )
+        assert vencido["requiere_atencion"] is True
+
+    METRICAS["OPERACIONES"] += 4
+    METRICAS["RECHAZADAS"] += 4
+
+    print("OK")
+
+
+def prueba_y_una_fila_incompleta_no_se_da_por_muerta():
+    """
+    Una fila rota es una duda, no una prueba de muerte.
+
+    `CLASE_INCONSISTENTE` se informaba como HUÉRFANA —que afirma que la
+    ejecución está demostrada perdida— y el mapa de vitalidad fallaba
+    ABIERTO: ante algo desconocido devolvía ACTIVA, el valor más
+    tranquilizador y el peor por omisión.
+    """
+    print(" 24. una fila incompleta no se da por muerta:", end=" ")
+
+    base = {
+        "id": "T-0901",
+        "estado": str(Estado.EN_EJECUCION),
+        "trabajador_id": "worker-A",
+        "pid": 4242,
+        "iniciado_en": "2026-01-01T00:00:00+00:00",
+        "ultimo_latido": nucleo.ahora_utc(),
+        "generacion": 1,
+        "worktree": None,
+    }
+
+    for campo in ("pid", "iniciado_en", "ultimo_latido", "trabajador_id"):
+        rota = dict(base)
+        rota[campo] = None
+
+        informe = nucleo.vitalidad(rota, comprobar_proceso=lambda _p: True)
+
+        assert informe["vitalidad"] == nucleo.VITALIDAD_LATIDO_VENCIDO, (
+            "Una fila sin '" + campo + "' se informó como "
+            + str(informe["vitalidad"]) + ", que afirma más de lo que se "
+            "sabe: " + repr(informe["motivo"])
+        )
+        assert informe["requiere_atencion"] is True
+
+    # Latido ilegible y latido en el futuro: lo mismo.
+    for valor, caso in (
+        ("no-es-una-fecha", "latido ilegible"),
+        (
+            (nucleo.ahora_datetime() + timedelta(days=365)).isoformat(
+                timespec="seconds"
+            ),
+            "latido en el futuro",
+        ),
+    ):
+        rara = dict(base)
+        rara["ultimo_latido"] = valor
+
+        informe = nucleo.vitalidad(rara, comprobar_proceso=lambda _p: True)
+
+        assert informe["vitalidad"] == nucleo.VITALIDAD_LATIDO_VENCIDO, (
+            caso + " se informó como " + str(informe["vitalidad"])
+            + ": " + repr(informe["motivo"])
+        )
+
+    METRICAS["OPERACIONES"] += 6
+    METRICAS["RECHAZADAS"] += 6
+
+    print("OK")
+
+
+def prueba_z_el_tablero_publica_la_vitalidad_y_el_arbol_reales():
+    """
+    Lo que el tablero enseña sale del motor, no de un valor inventado.
+
+    Ninguna prueba del repositorio miraba `vitalidad`, `verificacion_raiz`
+    ni `verificacion_commit`, así que `resumen_de_tarea` podía devolver
+    cualquier cosa: tres mutantes que hacían mentir al tablero sobrevivían
+    a la batería completa.
+    """
+    print(" 25. el tablero publica la vitalidad y el árbol reales:", end=" ")
+
+    principal, aparte, arboles = montar_tres_arboles()
+
+    try:
+        nucleo.crear(
+            principal,
+            "T-0906",
+            titulo="Tarea del árbol B",
+            ambito_archivos=["modulos/b/*.py"],
+            pruebas_requeridas=["pruebas/demostracion/prueba_arbol.py"],
+        )
+        tomada = nucleo.tomar(
+            principal,
+            "T-0906",
+            trabajador_id="worker-A",
+            worktree=str(arboles["B"]),
+        )
+        METRICAS["OPERACIONES"] += 2
+        METRICAS["ACEPTADAS"] += 2
+
+        commit_b = _commit_de(arboles["B"])
+
+        # Viva y trabajando.
+        viva = {
+            una["id"]: una for una in nucleo.tablero(principal)["tareas"]
+        }["T-0906"]
+
+        assert viva["vitalidad"] == nucleo.VITALIDAD_ACTIVA, repr(viva)
+        assert viva["requiere_atencion"] is False
+        assert viva["worktree"] == str(arboles["B"].resolve())
+        assert viva["generacion"] == tomada.generacion
+
+        nucleo.verificar(
+            principal,
+            "T-0906",
+            trabajador_id="worker-A",
+            generacion=tomada.generacion,
+        )
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        verificada = {
+            una["id"]: una for una in nucleo.tablero(principal)["tareas"]
+        }["T-0906"]
+
+        assert verificada["verificacion_raiz"] == str(arboles["B"].resolve()), (
+            "El tablero no dice dónde se verificó: "
+            + repr(verificada["verificacion_raiz"])
+        )
+        assert verificada["verificacion_commit"] == commit_b, (
+            "El commit publicado no es el del árbol que se ejecutó: "
+            + repr(verificada["verificacion_commit"]) + " != " + commit_b
+        )
+        assert verificada["verificacion_rama"] == "rama-b", (
+            repr(verificada["verificacion_rama"])
+        )
+        assert verificada["verificacion_vigente"] is True
+
+        # Tras reabrir y volver a tomar, ese verde es de OTRA ejecución.
+        nucleo.reabrir(principal, "T-0906", "Se reabre a mano.")
+        nucleo.tomar(principal, "T-0906", trabajador_id="worker-B")
+        METRICAS["OPERACIONES"] += 2
+        METRICAS["ACEPTADAS"] += 2
+
+        retomada = {
+            una["id"]: una for una in nucleo.tablero(principal)["tareas"]
+        }["T-0906"]
+
+        assert retomada["verificacion_vigente"] is False, (
+            "El tablero presenta como actual el verde de una ejecución que "
+            "ya no existe."
+        )
+
+        # Y muerta: latido antiguo y proceso inexistente.
+        con = estado_global.abrir(estado_global.ruta_base(principal))
+
+        try:
+            with estado_global.transaccion(con):
+                con.execute(
+                    "UPDATE tareas SET ultimo_latido = ?, pid = ? "
+                    "WHERE id = ?",
+                    ("2020-01-01T00:00:00+00:00", 999999, "T-0906"),
+                )
+        finally:
+            con.close()
+
+        datos = nucleo.tablero(principal)
+        muerta = {una["id"]: una for una in datos["tareas"]}["T-0906"]
+
+        assert muerta["vitalidad"] == nucleo.VITALIDAD_HUERFANA, repr(muerta)
+        assert muerta["requiere_atencion"] is True
+        assert datos["resumen"]["agentes_activos"] == 0, (
+            "Una ejecución muerta se sigue contando como agente activo."
+        )
+        assert "worker-B" in datos["resumen"]["agentes_sin_senal"]
+
+        comprobar_integridad(principal)
+    finally:
+        borrar(aparte)
+        borrar(principal)
+
+    print("OK")
+
+
+def prueba_aa_el_tablero_no_escribe_y_aguanta_una_fila_rota():
+    """
+    Una lectura no crea tareas, y una fila mala no borra el tablero.
+
+    `tablero()` pedía `BEGIN IMMEDIATE` e insertaba filas desde un GET de
+    la API web. Y una sola fila con un JSON operativo malformado lo tumbaba
+    entero: desaparecían TODAS las tareas y el navegador decía «sin
+    conexión con el motor local», que además es falso.
+    """
+    print(" 26. el tablero no escribe y aguanta una fila rota:", end=" ")
+
+    raiz = crear_repositorio("tablero_")
+
+    try:
+        # Una ficha escrita a mano, que la base no conoce.
+        ficha = fichas.Ficha(
+            id="T-0907",
+            titulo="Escrita a mano",
+            ambito_archivos=["modulos/x/*.py"],
+            pruebas_requeridas=["pruebas/demostracion/prueba_verde.py"],
+        )
+        fichas.guardar(raiz, ficha)
+
+        datos = nucleo.tablero(raiz)
+
+        assert datos["resumen"]["totales"] == 0, (
+            "Una lectura incorporó la tarea a la base."
+        )
+        assert datos["resumen"]["sin_importar"] == ["T-0907"], (
+            repr(datos["resumen"]["sin_importar"])
+        )
+        METRICAS["OPERACIONES"] += 1
+
+        # Se incorpora con la orden explícita.
+        estado_global.sincronizar_definiciones(raiz)
+
+        datos = nucleo.tablero(raiz)
+
+        assert datos["resumen"]["totales"] == 1
+        assert datos["resumen"]["sin_importar"] == []
+
+        # Y ahora se rompe su JSON operativo en la base.
+        con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+        try:
+            with estado_global.transaccion(con):
+                con.execute(
+                    "UPDATE tareas SET ultima_verificacion = ? WHERE id = ?",
+                    ('"8 de 8"', "T-0907"),
+                )
+        finally:
+            con.close()
+
+        datos = nucleo.tablero(raiz)
+
+        assert datos["base_global"]["estado"] == "ACTIVA", (
+            "Una fila rota se presentó como base caída."
+        )
+        assert len(datos["tareas"]) == 1, (
+            "Una fila rota hizo desaparecer el tablero entero."
+        )
+        assert datos["tareas"][0]["fila_legible"] is False
+        assert any(
+            "T-0907" in str(error.get("motivo", ""))
+            or "T-0907" in str(error.get("archivo", ""))
+            for error in datos["fichas_ilegibles"]
+        ), repr(datos["fichas_ilegibles"])
+
+        METRICAS["OPERACIONES"] += 1
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+def prueba_ab_la_consola_distingue_sus_rechazos():
+    """
+    Los códigos de salida son estables y distinguen cada rechazo.
+
+    Ninguna prueba del repositorio ejercía la línea de órdenes, así que el
+    día que alguien moviera un `except` por debajo del genérico, el código
+    se convertía en 2 en silencio y un orquestador dejaba de poder
+    distinguir «tu árbol desapareció» de «el Supervisor se rompió».
+    """
+    print(" 27. la consola distingue sus rechazos:", end=" ")
+
+    raiz = crear_repositorio("consola_")
+
+    try:
+        _git(raiz, "add", "-A")
+        _git(raiz, "commit", "-q", "-m", "base")
+
+        def cli(*argumentos):
+            entorno = dict(os.environ)
+            entorno["PYTHONPATH"] = os.pathsep.join(
+                [str(RAIZ), str(RAIZ / "nucleo"), str(RAIZ / "orquestacion")]
+            )
+            entorno["PYTHONDONTWRITEBYTECODE"] = "1"
+
+            return subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "orquestacion.ingenieria_supervisor",
+                    "--raiz",
+                    str(raiz),
+                    "--sin-git",
+                    *argumentos,
+                ],
+                cwd=str(RAIZ),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=entorno,
+                timeout=ESPERA_PROCESO_S,
+            )
+
+        esperados = []
+
+        primera = cli(
+            "crear", "T-0908",
+            "--titulo", "Tarea de consola",
+            "--ambito", "modulos/c/*.py",
+            "--prueba", "pruebas/demostracion/prueba_verde.py",
+        )
+        esperados.append(("crear por primera vez", primera, 0))
+
+        esperados.append((
+            "crear dos veces",
+            cli("crear", "T-0908", "--titulo", "Repetida"),
+            5,
+        ))
+
+        tomada = cli("tomar", "T-0908", "--trabajador", "W1")
+        esperados.append(("tomar libre", tomada, 0))
+
+        esperados.append((
+            "tomar ya tomada",
+            cli("tomar", "T-0908", "--trabajador", "W2"),
+            3,
+        ))
+
+        esperados.append((
+            "latido con generación vieja",
+            cli("latido", "T-0908", "--trabajador", "W1", "--generacion", "0"),
+            4,
+        ))
+
+        esperados.append((
+            "worktree que no vale",
+            cli(
+                "devolver", "T-0908", "--trabajador", "W1", "--generacion", "1"
+            ),
+            0,
+        ))
+
+        esperados.append((
+            "tomar con un árbol ajeno",
+            cli(
+                "tomar", "T-0908", "--trabajador", "W3",
+                "--worktree", str(raiz / "pruebas"),
+            ),
+            6,
+        ))
+
+        esperados.append((
+            "ver una tarea inexistente",
+            cli("ver", "T-9999"),
+            2,
+        ))
+
+        for caso, salida, codigo in esperados:
+            METRICAS["OPERACIONES"] += 1
+
+            if salida.returncode == 0:
+                METRICAS["ACEPTADAS"] += 1
+            else:
+                METRICAS["RECHAZADAS"] += 1
+
+            assert salida.returncode == codigo, (
+                "«" + caso + "» devolvió " + str(salida.returncode)
+                + " y se esperaba " + str(codigo) + ". Salida: "
+                + (salida.stdout or salida.stderr)[-400:]
+            )
+
+        # Y la ayuda documenta los códigos, en español.
+        ayuda = cli("--ayuda")
+
+        assert ayuda.returncode == 0
+        for fragmento in ("Códigos de salida", "Uso:", "Opciones:"):
+            assert fragmento in ayuda.stdout, (
+                "La ayuda no contiene '" + fragmento + "'."
+            )
+
+        assert "positional arguments" not in ayuda.stdout, (
+            "La ayuda sigue teniendo rótulos en inglés."
+        )
+        assert "show this help message" not in ayuda.stdout
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
 
 
 # ----------------------------------------------------------------------
@@ -2215,6 +3033,15 @@ COMPROBACIONES = (
     prueba_p_tras_recuperar_b_toma_y_la_orden_tardia_de_a_cae,
     prueba_s_el_worktree_que_desaparece_se_avisa_y_frena_la_retoma,
     prueba_q_rutas_raras_pero_legitimas_se_aceptan,
+    prueba_t_verificar_rechaza_un_arbol_invalido,
+    prueba_u_un_arbol_que_se_mueve_invalida_la_corrida,
+    prueba_v_verificar_abandona_si_pierde_la_propiedad,
+    prueba_w_cada_precondicion_del_latido_frena_por_separado,
+    prueba_x_un_trabajador_de_otra_maquina_no_se_juzga_por_el_pid_local,
+    prueba_y_una_fila_incompleta_no_se_da_por_muerta,
+    prueba_z_el_tablero_publica_la_vitalidad_y_el_arbol_reales,
+    prueba_aa_el_tablero_no_escribe_y_aguanta_una_fila_rota,
+    prueba_ab_la_consola_distingue_sus_rechazos,
 )
 
 
@@ -2261,12 +3088,39 @@ def prueba_ejecucion_segura(rondas: int = RONDAS_POR_OMISION) -> None:
     imprimir_metricas()
 
     # El veredicto no se declara: se comprueba contra lo medido.
-    assert METRICAS["ACTUALIZACIONES_PERDIDAS"] == 0
-    assert METRICAS["ROBOS_INDEBIDOS"] == 0
-    assert METRICAS["VERIFICACIONES_EN_ARBOL_INCORRECTO"] == 0
-    assert METRICAS["ERRORES_SQLITE"] == 0
-    assert METRICAS["EXCEPCIONES"] == 0
-    assert METRICAS["FALLOS_INTEGRIDAD"] == 0
+    #
+    # Los contadores POSITIVOS llevan cota mínima. Sin ella, el bloque de
+    # métricas era decorativo: los contadores de fallo se incrementan justo
+    # antes de un assert que ya aborta la corrida, así que ninguno puede
+    # llegar vivo hasta aquí y las seis comprobaciones eran inalcanzables.
+    # Una corrida que no hubiera hecho nada habría salido igual de verde.
+    minimos = {
+        "OPERACIONES": 90,
+        "ACEPTADAS": 55,
+        "RECHAZADAS": 30,
+        "LATIDOS_AUTOMATICOS": 20,
+        "COMPROBACIONES_INTEGRIDAD": 20,
+    }
+
+    for clave, minimo in minimos.items():
+        assert METRICAS[clave] >= minimo, (
+            "La corrida hizo menos trabajo del que esta batería debería "
+            "hacer: " + clave + " = " + str(METRICAS[clave]) + ", se "
+            "esperaban al menos " + str(minimo) + ". O falta una "
+            "comprobación, o alguna se está saltando en silencio."
+        )
+
+    for clave in (
+        "ACTUALIZACIONES_PERDIDAS",
+        "ROBOS_INDEBIDOS",
+        "VERIFICACIONES_EN_ARBOL_INCORRECTO",
+        "ERRORES_SQLITE",
+        "EXCEPCIONES",
+        "FALLOS_INTEGRIDAD",
+    ):
+        assert METRICAS[clave] == 0, (
+            clave + " = " + str(METRICAS[clave]) + ", y tiene que ser 0."
+        )
 
     print("  Tiempo: " + str(round(duracion, 2)) + " s")
     print("")
