@@ -940,6 +940,14 @@ def resumen_de_corrida(corrida: dict | None) -> dict | None:
         "es_worktree": corrida.get("es_worktree"),
         "rama": corrida.get("rama"),
         "commit": corrida.get("commit"),
+        "commit_final": corrida.get("commit_final"),
+        "arbol_estable": corrida.get("arbol_estable"),
+        # A QUIÉN pertenece esta verificación. `ultima_verificacion`
+        # sobrevive a `reabrir`, a `reanudar` y a una retoma, así que sin
+        # esto el tablero seguía enseñando el verde de una ejecución muerta
+        # como si fuera el de la que está en curso.
+        "generacion": corrida.get("generacion"),
+        "trabajador_id": corrida.get("trabajador_id"),
         "total": corrida.get("total", 0),
         "ok": corrida.get("ok", 0),
         "fallidas": corrida.get("fallidas", 0),

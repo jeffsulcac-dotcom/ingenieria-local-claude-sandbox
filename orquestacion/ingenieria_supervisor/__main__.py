@@ -110,6 +110,25 @@ def mostrar_tablero(raiz: Path) -> int:
     _linea("Aprobadas", resumen["aprobadas"])
     _linea("Rechazadas", resumen["rechazadas"])
 
+    if resumen.get("agentes_sin_senal"):
+        print("")
+        print(
+            "  AVISO: hay ejecuciones sin señal de vida ("
+            + ", ".join(resumen["agentes_sin_senal"])
+            + "). Mira su vitalidad más abajo."
+        )
+
+    if resumen.get("sin_importar"):
+        print("")
+        print(
+            "  FICHAS NO REGISTRADAS EN LA BASE: "
+            + ", ".join(resumen["sin_importar"])
+        )
+        print(
+            "      El tablero no escribe nada. Para incorporarlas: "
+            "`sincronizar-definiciones`."
+        )
+
     if not datos["tareas"]:
         print("")
         print("  Todavía no hay ninguna ficha de tarea.")
@@ -158,6 +177,11 @@ def mostrar_tablero(raiz: Path) -> int:
                 str(verificacion.get("fecha"))
                 + "  "
                 + str(verificacion.get("resultado"))
+                + (
+                    ""
+                    if tarea.get("verificacion_vigente")
+                    else "  (DE OTRA EJECUCIÓN)"
+                )
             )
             if verificacion
             else None,
@@ -570,6 +594,11 @@ CODIGO_PROPIEDAD_INVALIDA = 4
 # que crea tareas en lote necesita distinguir "ya existía" de una avería.
 CODIGO_YA_EXISTE = 5
 
+# El árbol de trabajo declarado o heredado no sirve. Se distingue del 2
+# (avería genérica) porque lo que tiene que hacer el operador es otra cosa:
+# mirar el worktree, no el Supervisor.
+CODIGO_WORKTREE_INVALIDO = 6
+
 
 def orden_tomar(raiz: Path, argumentos) -> int:
     try:
@@ -579,6 +608,7 @@ def orden_tomar(raiz: Path, argumentos) -> int:
             trabajador_id=argumentos.trabajador,
             pid=argumentos.pid,
             git=_git(raiz, argumentos),
+            worktree=argumentos.worktree,
         )
     except nucleo.ErrorToma as rechazo:
         print("")
@@ -597,6 +627,7 @@ def orden_tomar(raiz: Path, argumentos) -> int:
     print("Trabajador: " + str(ficha.trabajador_id))
     print("Generación: " + str(ficha.generacion))
     print("Rama exigida: " + str(ficha.rama))
+    print("Árbol de ejecución: " + (ficha.worktree or "(la raíz)"))
 
     return 0
 
@@ -662,6 +693,20 @@ def orden_verificar(raiz: Path, argumentos) -> int:
     print("")
     print("  Estado resultante: " + informe["estado"].upper())
     print("  " + informe["motivo"])
+
+    # El latido acompaña a la corrida y hasta ahora no se veía. Una
+    # verificación con cero latidos y otra con veinticinco se mostraban
+    # exactamente igual, y la primera deja la tarea sin señal todo el rato.
+    print("  Latidos emitidos: " + str(informe.get("latidos")))
+
+    if informe.get("latido_error"):
+        print("  AVISO: el latido falló: " + str(informe["latido_error"]))
+
+    if informe.get("latido_cierre_incompleto"):
+        print(
+            "  AVISO: el hilo del latido no cerró dentro del plazo; puede "
+            "haber escrito después de terminar la verificación."
+        )
 
     if informe["git"]:
         print("")
@@ -813,10 +858,65 @@ def _git(raiz: Path, argumentos):
 # Análisis de argumentos
 # ----------------------------------------------------------------------
 
+CODIGOS_DE_SALIDA = """\
+Códigos de salida:
+  0   la orden se completó.
+  1   la orden se completó pero el resultado no es el deseado (por ejemplo,
+      una verificación que no deja la tarea en PROPUESTO).
+  2   error de uso o avería del Supervisor.
+  3   toma rechazada: la tarea ya la tiene otro, o su estado no la admite.
+  4   orden rechazada por propiedad: identidad, generación o estado no
+      coinciden con los de la ejecución vigente.
+  5   la tarea ya existe.
+  6   el árbol de trabajo declarado o heredado no sirve.
+"""
+
+
+class AyudaEnEspanol(argparse.RawDescriptionHelpFormatter):
+    """
+    Formateador con los rótulos de `argparse` en español.
+
+    La regla de idioma del proyecto vale también para la primera pantalla
+    que ve cualquiera. `usage`, `positional arguments` y `options` son
+    cadenas de la biblioteca, no nombres exigidos por ninguna API.
+    """
+
+    def add_usage(self, uso, acciones, grupos, prefijo=None):
+        # `None` significa «pon el rótulo»; la cadena vacía la usa argparse
+        # internamente para calcular el `prog` de los subanalizadores, y
+        # ahí no debe aparecer ningún rótulo (salía «Uso: Uso: ...»).
+        if prefijo is None:
+            prefijo = "Uso: "
+
+        return super().add_usage(uso, acciones, grupos, prefijo)
+
+
+def _en_espanol(analizador: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    analizador._positionals.title = "Órdenes y argumentos"
+    analizador._optionals.title = "Opciones"
+
+    return analizador
+
+
 def construir_analizador() -> argparse.ArgumentParser:
     analizador = argparse.ArgumentParser(
         prog="ingenieria_supervisor",
         description="Supervisor de Desarrollo de Ingeniería Local.",
+        formatter_class=AyudaEnEspanol,
+        epilog=CODIGOS_DE_SALIDA,
+        add_help=False,
+    )
+
+    _en_espanol(analizador)
+
+    # `argparse` rotula su ayuda en inglés («options», «show this help
+    # message and exit»). Toda la interfaz de este proyecto va en español,
+    # así que la opción se declara a mano.
+    analizador.add_argument(
+        "-h",
+        "--ayuda",
+        action="help",
+        help="Mostrar esta ayuda y salir.",
     )
 
     analizador.add_argument(
@@ -832,7 +932,27 @@ def construir_analizador() -> argparse.ArgumentParser:
         help="No registrar la transición de la ficha en Git.",
     )
 
-    ordenes = analizador.add_subparsers(dest="orden", required=True)
+    ordenes = analizador.add_subparsers(
+        dest="orden", required=True, title="Órdenes"
+    )
+
+    # Cada subanalizador trae sus propios rótulos en inglés y su propia
+    # `-h`. Se envuelve `add_parser` para no repetir lo mismo diecisiete
+    # veces ni olvidarlo en la siguiente orden que se añada.
+    _crudo = ordenes.add_parser
+
+    def add_parser(nombre, **extras):
+        extras.setdefault("add_help", False)
+        extras.setdefault("formatter_class", AyudaEnEspanol)
+
+        sub = _crudo(nombre, **extras)
+        sub.add_argument(
+            "-h", "--ayuda", action="help", help="Mostrar esta ayuda y salir."
+        )
+
+        return _en_espanol(sub)
+
+    ordenes.add_parser = add_parser
 
     estado = ordenes.add_parser("estado", help="Tablero de tareas.")
     estado.add_argument(
@@ -883,6 +1003,15 @@ def construir_analizador() -> argparse.ArgumentParser:
         help=(
             "PID del trabajador real y duradero. Sin esta opción se registra "
             "el del propio mandato, que termina de inmediato."
+        ),
+    )
+    tomar.add_argument(
+        "--worktree",
+        help=(
+            "Árbol de trabajo donde se ejecutará la tarea. Debe ser un "
+            "worktree que Git tenga registrado para este repositorio "
+            "(`git worktree list`). Sin esta opción se usa el que la tarea "
+            "ya tuviera registrado, y si no tiene ninguno, la raíz."
         ),
     )
     tomar.set_defaults(funcion=orden_tomar)
@@ -991,6 +1120,14 @@ def principal(argumentos_crudos: list[str] | None = None) -> int:
         print("")
 
         return CODIGO_PROPIEDAD_INVALIDA
+    except nucleo.ErrorWorktree as problema:
+        # Código propio: la respuesta del operador no es la misma que ante
+        # una avería del Supervisor. Aquí hay que mirar el árbol.
+        print("")
+        print("  ÁRBOL DE TRABAJO NO VÁLIDO: " + str(problema))
+        print("")
+
+        return CODIGO_WORKTREE_INVALIDO
     except (
         nucleo.ErrorSupervisor,
         ErrorFicha,

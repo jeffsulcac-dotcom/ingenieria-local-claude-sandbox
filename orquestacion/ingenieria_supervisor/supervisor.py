@@ -1347,9 +1347,17 @@ def crear(
         requiere_decision_humana=normalizar_decisiones(decisiones),
     )
 
+    # Las marcas se ponen aquí y no al escribir el JSON: el espejo se
+    # escribe DESPUÉS del COMMIT y con `marcar_actualizacion=False`, así
+    # que si no se fijaran ahora la fila nacería sin fechas.
+    nacimiento = ahora_utc()
+
+    ficha.creado_en = nacimiento
+    ficha.actualizado_en = nacimiento
+
     ficha.registrar_evento(
         {
-            "fecha": ahora_utc(),
+            "fecha": nacimiento,
             "tipo": global_.EVENTO_CREACION,
             "estado_anterior": None,
             "estado_nuevo": str(Estado.NUEVO),
@@ -1360,19 +1368,32 @@ def crear(
 
     # Crear es un acto único: o lo hace uno o no lo hace nadie (A3.3).
     #
-    # La comprobación de existencia, la escritura del JSON y el INSERT
-    # ocurren DENTRO de la misma transacción, y en ese orden. Antes la
-    # comprobación se hacía en autocommit y el JSON se escribía ANTES del
-    # INSERT, con lo que dos procesos que crearan la misma tarea a la vez
-    # pasaban los dos la comprobación, los dos escribían su JSON —el
-    # segundo pisando al primero— y sólo entonces la clave primaria
-    # rechazaba a uno. El perdedor se iba con un error, pero dejaba su
-    # definición escrita encima de la del ganador.
+    # La comprobación de existencia y el INSERT ocurren DENTRO de la misma
+    # transacción. Antes la comprobación se hacía en autocommit, con lo que
+    # dos procesos que crearan la misma tarea a la vez pasaban los dos, los
+    # dos escribían su JSON —el segundo pisando al primero— y sólo entonces
+    # la clave primaria rechazaba a uno. El perdedor se iba con un error,
+    # pero dejaba su definición escrita encima de la del ganador.
     #
     # Con BEGIN IMMEDIATE el segundo espera a que el primero confirme, y
-    # entonces ve la fila y se rechaza SIN escribir nada. Y si la escritura
-    # del JSON fallara, el ROLLBACK deja la base sin fila: no queda una
-    # tarea registrada cuya definición no existe.
+    # entonces ve la fila y se rechaza SIN escribir nada.
+    #
+    # EL JSON SE ESCRIBE DESPUÉS DEL COMMIT, y esto importa (auditoría R1).
+    # El sistema de archivos no es transaccional: `os.replace` es visible
+    # para todo el mundo en el acto y ningún ROLLBACK lo deshace. Con la
+    # escritura dentro, cualquier corte posterior —Ctrl-C, un `kill`, un
+    # apagón— dejaba exactamente lo que esta función declara imposible:
+    # ficha JSON sin fila. Y el huérfano no era inerte: `crear` fallaba
+    # para siempre con ese identificador, y la primera orden de LECTURA lo
+    # incorporaba en silencio, así que la tarea que no creó nadie acababa
+    # existiendo con la definición del proceso muerto.
+    #
+    # Al revés el daño es reparable y menor: si falla el espejo, hay fila
+    # sin ficha, y la base es la autoridad. Se dice y se puede regenerar.
+    #
+    # De paso, el candado de escritura de TODA la base deja de retenerse
+    # durante el `fsync` del archivo, que es lo que `tomar` ya evitaba a
+    # propósito.
     with global_.conexion(raiz) as con:
         with global_.transaccion(con):
             if global_.obtener_tarea(con, identificador) is not None:
@@ -1390,9 +1411,9 @@ def crear(
                     "Ya existe la ficha '" + identificador + "'."
                 )
 
-            guardar(raiz, ficha)
-
             global_.importar_ficha(con, ficha, evento_importacion=False)
+
+    _regenerar_espejo(raiz, ficha)
 
     ficha.eventos_pendientes.clear()
 
@@ -1921,6 +1942,8 @@ def verificar(
     corrida["rama"] = rama_inicio
     corrida["commit"] = commit_inicio
     corrida["commit_final"] = commit_fin
+    corrida["generacion"] = esperada
+    corrida["trabajador_id"] = propietario
 
     # Un árbol que cambió a mitad invalida la corrida entera: no se sabe qué
     # se ejecutó. Se dice, y no se graba un verde que nadie puede reproducir.
@@ -2077,9 +2100,16 @@ def verificar(
         "git": registro,
         "raiz": str(arbol),
         "latidos": acompanante.emitidos,
+        # Que el latido muriera no invalida la corrida, pero tiene que
+        # verse: hasta ahora se calculaba y se tiraba, y una verificación
+        # larga sin ninguna señal acababa pareciendo una tarea abandonada.
+        "latido_error": acompanante.error,
+        "latido_cierre_incompleto": acompanante.cierre_incompleto,
         "es_worktree": corrida["es_worktree"],
         "rama": corrida["rama"],
         "commit": corrida["commit"],
+        "commit_final": corrida["commit_final"],
+        "arbol_estable": corrida["arbol_estable"],
     }
 
 
@@ -2547,6 +2577,10 @@ def vitalidad(
         "worktree": fila.get("worktree"),
         "vitalidad": None,
         "motivo": None,
+        # Lo decide el motor, no la interfaz. LATIDO_VENCIDO y HUÉRFANA
+        # piden que alguien mire; REANUDABLE y FINALIZADA, no: son el
+        # estado normal de una tarea que nadie está ejecutando.
+        "requiere_atencion": False,
     }
 
     if estado != str(Estado.EN_EJECUCION):
@@ -2567,6 +2601,9 @@ def vitalidad(
             detalle = "está cerrada."
 
         informe["motivo"] = "Sin ejecución en curso; la tarea " + detalle
+        informe["requiere_atencion"] = (
+            estado in ESTADOS_QUE_ESPERAN_A_UNA_PERSONA
+        )
 
         return informe
 
@@ -2599,6 +2636,10 @@ def vitalidad(
         CLASE_INCONSISTENTE: VITALIDAD_LATIDO_VENCIDO,
     }.get(clase, VITALIDAD_LATIDO_VENCIDO)
     informe["motivo"] = motivo
+    informe["requiere_atencion"] = informe["vitalidad"] in (
+        VITALIDAD_LATIDO_VENCIDO,
+        VITALIDAD_HUERFANA,
+    )
 
     return informe
 
@@ -3071,11 +3112,30 @@ def resumen_de_tarea(fila: dict, definicion: Ficha | None) -> dict:
     # temprano diría algo distinto de lo que decide la recuperación.
     senales = vitalidad(fila)
 
+    # Si la verificación guardada es de una ejecución anterior, el verde no
+    # dice nada de la actual. Lo decide el motor y no la interfaz: ni el
+    # tablero ni la consola deben reimplementar este criterio.
+    vigente = None
+
+    if verificacion:
+        registrada = verificacion.get("generacion")
+        vigente = (
+            registrada is not None
+            and registrada == fila.get("generacion")
+        )
+
     return {
         "id": fila["id"],
         "vitalidad": senales["vitalidad"],
         "vitalidad_motivo": senales["motivo"],
         "edad_latido_s": senales["edad_latido_s"],
+        # Qué merece la atención de una persona. Lo dice el motor: la
+        # plantilla lo tenía en una lista propia y marcaba en alerta toda
+        # tarea NUEVA o REABIERTA, que es el estado normal de lo que nadie
+        # ha tomado todavía. Un tablero donde lo normal está en rojo deja
+        # de leerse.
+        "requiere_atencion": senales["requiere_atencion"],
+        "verificacion_vigente": vigente,
         "verificacion_raiz": (
             verificacion.get("raiz") if verificacion else None
         ),
@@ -3119,9 +3179,59 @@ def resumen_de_tarea(fila: dict, definicion: Ficha | None) -> dict:
     }
 
 
+def _resumen_ilegible(fila: dict) -> dict:
+    """
+    Tarjeta mínima para una fila que no se pudo interpretar.
+
+    Se muestra igual, diciendo la verdad, en vez de hacer desaparecer el
+    tablero entero por una fila mala.
+    """
+    return {
+        "id": str(fila.get("id") or "?"),
+        "titulo": str(fila.get("titulo") or "(sin título)"),
+        "objetivo": "",
+        "estado": str(fila.get("estado") or ""),
+        "vitalidad": None,
+        "vitalidad_motivo": "La fila de la base no se pudo interpretar.",
+        "requiere_atencion": True,
+        "edad_latido_s": None,
+        "verificacion_raiz": None,
+        "verificacion_commit": None,
+        "verificacion_rama": None,
+        "verificacion_fecha": None,
+        "verificacion_vigente": None,
+        "rama": fila.get("rama"),
+        "worktree": fila.get("worktree"),
+        "intentos": 0,
+        "max_intentos": 0,
+        "pruebas_ok": 0,
+        "pruebas_total": 0,
+        "pruebas_requeridas": [],
+        "ambito_archivos": [],
+        "actualizado_en": fila.get("actualizado_en"),
+        "creado_en": fila.get("creado_en"),
+        "ultima_falla": None,
+        "decisiones_pendientes": [],
+        "decisiones_totales": 0,
+        "requiere_decision_humana": False,
+        "trabajador_id": fila.get("trabajador_id"),
+        "generacion": fila.get("generacion"),
+        "pid": fila.get("pid"),
+        "iniciado_en": fila.get("iniciado_en"),
+        "ultimo_latido": fila.get("ultimo_latido"),
+        "ultima_verificacion": None,
+        "commit_inicial": fila.get("commit_inicial"),
+        "definicion_ruta": fila.get("definicion_ruta"),
+        "definicion_legible": False,
+        "fila_legible": False,
+    }
+
+
 def _resumen_vacio() -> dict:
     return {
         "agentes_activos": 0,
+        "agentes_sin_senal": [],
+        "sin_importar": [],
         "totales": 0,
         "nuevas": 0,
         "en_ejecucion": 0,
@@ -3139,13 +3249,19 @@ def tablero(raiz: Path, maximo_actividad: int = 20) -> dict:
     """
     Estado completo del Supervisor para la interfaz de sólo lectura.
 
-    Todo el estado operativo proviene de la base SQLite global. Antes de
-    leer se sincronizan las definiciones JSON legibles (idempotente), de
-    modo que una ficha recién añadida aparece sin pasos manuales.
+    Todo el estado operativo proviene de la base SQLite global.
 
-    Nunca lanza excepción: una ficha corrupta se reporta, y si la base
-    global no está disponible el tablero lo dice (estado ERROR) en lugar de
-    inventar datos a partir de los JSON.
+    NO ESCRIBE NADA (auditoría R1). Antes incorporaba a la base las fichas
+    que no conocía, es decir: pedía `BEGIN IMMEDIATE` —el candado de
+    escritura de toda la base— desde un GET de la API web, y una tarea
+    podía nacer con sólo refrescar el tablero. Las fichas que la base no
+    conoce se reportan en `sin_importar`, como ya hace `diagnostico`, y se
+    incorporan con `sincronizar-definiciones`, que es una orden explícita.
+
+    Nunca lanza excepción: una ficha corrupta se reporta, una FILA
+    corrupta se degrada a una tarjeta que lo dice, y si la base global no
+    está disponible el tablero lo dice (estado ERROR) en lugar de inventar
+    datos a partir de los JSON.
     """
     raiz = Path(raiz)
 
@@ -3172,10 +3288,6 @@ def tablero(raiz: Path, maximo_actividad: int = 20) -> dict:
         base["ubicacion_resumida"] = global_.ubicacion_resumida(ruta)
 
         with global_.conexion(raiz) as con:
-            # Camino de sólo lectura: incorpora tareas ausentes, no
-            # refresca definiciones (ver sincronizar_lista).
-            global_.sincronizar_lista(con, fichas, solo_importar=True)
-
             base["version_esquema"] = global_.version_esquema(con)
             base["journal_mode"] = con.execute(
                 "PRAGMA journal_mode"
@@ -3200,19 +3312,58 @@ def tablero(raiz: Path, maximo_actividad: int = 20) -> dict:
         base["estado"] = "ERROR"
         base["detalle"] = str(error)
 
-    tareas = [
-        resumen_de_tarea(fila, definiciones.get(fila["id"]))
-        for fila in filas
-    ]
+    tareas = []
+
+    for fila in filas:
+        try:
+            tareas.append(
+                resumen_de_tarea(fila, definiciones.get(fila["id"]))
+            )
+        except Exception as problema:
+            # Una sola fila con un JSON operativo malformado tumbaba el
+            # tablero ENTERO —desaparecían todas las tareas— y el navegador
+            # mostraba «sin conexión con el motor local», que además es
+            # falso: el motor contestó perfectamente. Se degrada esa fila y
+            # las demás se ven.
+            errores.append(
+                {
+                    "archivo": str(fila.get("definicion_ruta") or fila["id"]),
+                    "motivo": "La fila de '" + str(fila.get("id"))
+                    + "' no se pudo interpretar: "
+                    + type(problema).__name__ + ": " + str(problema),
+                }
+            )
+            tareas.append(_resumen_ilegible(fila))
 
     def contar(estado: Estado) -> int:
         return sum(1 for una in tareas if una["estado"] == str(estado))
 
+    # «Agente activo» significa que hay alguien trabajando, no que quede
+    # una fila con nombre de dueño. Una ejecución muerta hace horas contaba
+    # igual que una viva, y el resumen decía que había gente trabajando
+    # cuando no había nadie.
     agentes = {
         una["trabajador_id"]
         for una in tareas
-        if una["estado"] == str(Estado.EN_EJECUCION) and una["trabajador_id"]
+        if una["estado"] == str(Estado.EN_EJECUCION)
+        and una["trabajador_id"]
+        and una.get("vitalidad") == VITALIDAD_ACTIVA
     }
+
+    sin_senal = sorted(
+        {
+            una["trabajador_id"]
+            for una in tareas
+            if una["estado"] == str(Estado.EN_EJECUCION)
+            and una["trabajador_id"]
+            and una.get("vitalidad") != VITALIDAD_ACTIVA
+        }
+    )
+
+    conocidas = {fila["id"] for fila in filas}
+    sin_importar = sorted(
+        ficha.id for ficha in fichas if ficha.id not in conocidas
+    )
 
     actividad = [
         {
@@ -3234,6 +3385,8 @@ def tablero(raiz: Path, maximo_actividad: int = 20) -> dict:
         resumen.update(
             {
                 "agentes_activos": len(agentes),
+                "agentes_sin_senal": sin_senal,
+                "sin_importar": sin_importar,
                 "totales": len(tareas),
                 "nuevas": contar(Estado.NUEVO),
                 "en_ejecucion": contar(Estado.EN_EJECUCION),

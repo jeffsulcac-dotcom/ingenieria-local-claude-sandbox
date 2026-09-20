@@ -214,7 +214,13 @@ const ETIQUETAS_VITALIDAD = {
     "FINALIZADA": "FINALIZADA"
 };
 
-const VITALIDAD_EN_ALERTA = ["LATIDO_VENCIDO", "HUERFANA", "REANUDABLE"];
+/*
+ * Qué merece atención lo decide el MOTOR (`requiere_atencion`), no esta
+ * plantilla. Antes había aquí una lista propia que incluía REANUDABLE, de
+ * modo que toda tarea nueva o reabierta —el estado normal de lo que nadie
+ * ha tomado todavía— se pintaba en alerta. Un tablero donde lo normal está
+ * en rojo deja de leerse.
+ */
 
 function duracion(segundos) {
     if (segundos === null || segundos === undefined) {
@@ -243,7 +249,11 @@ function escapar(valor) {
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;");
+        .replace(/"/g, "&quot;")
+        // Hoy todos los atributos de esta plantilla usan comillas dobles,
+        // así que esto no arregla ningún agujero abierto: evita que se
+        // abra el día que alguien escriba un atributo con comilla simple.
+        .replace(/'/g, "&#39;");
 }
 
 function fecha(texto) {
@@ -268,16 +278,20 @@ function fila(etiqueta, valor) {
 }
 
 function dibujarTarea(tarea) {
-    const estado = ETIQUETAS_ESTADO[tarea.estado] || tarea.estado.toUpperCase();
+    // `tarea.estado` puede faltar en una fila que no se pudo interpretar.
+    // Sin esta guarda, una sola fila mala tumbaba el pintado entero y el
+    // usuario veía «sin conexión con el motor local», que además es falso.
+    const bruto = tarea.estado || "";
+    const estado = ETIQUETAS_ESTADO[bruto] || (bruto.toUpperCase() || "—");
 
-    let bloque = '<article class="tarea" data-estado="' + escapar(tarea.estado) + '">';
+    let bloque = '<article class="tarea" data-estado="' + escapar(bruto) + '">';
 
     bloque += '<div class="tarea-cabecera">'
         + '<div>'
         + '<span class="tarea-id">' + escapar(tarea.id) + '</span>'
         + '<span class="tarea-titulo">' + escapar(tarea.titulo) + '</span>'
         + '</div>'
-        + '<span class="insignia insignia-' + escapar(tarea.estado) + '">'
+        + '<span class="insignia insignia-' + escapar(bruto) + '">'
         + escapar(estado) + '</span>'
         + '</div>';
 
@@ -304,7 +318,7 @@ function dibujarTarea(tarea) {
 
     bloque += fila(
         "Vitalidad",
-        VITALIDAD_EN_ALERTA.indexOf(vitalidad) >= 0
+        tarea.requiere_atencion
             ? '<span class="pendiente">' + etiquetaVitalidad + motivo + '</span>'
             : etiquetaVitalidad + motivo
     );
@@ -314,11 +328,24 @@ function dibujarTarea(tarea) {
 
     const verificacion = tarea.ultima_verificacion;
 
+    /*
+     * Una verificación sobrevive a `reabrir`, a `reanudar` y a una retoma,
+     * así que el verde puede ser de una ejecución que ya no existe. El
+     * motor dice si es de la vigente; aquí sólo se pinta.
+     */
+    const vigente = tarea.verificacion_vigente;
+
     bloque += fila(
         "Última verificación",
         verificacion
-            ? escapar(verificacion.resultado) + " · " + escapar(verificacion.ok)
-              + " de " + escapar(verificacion.total) + " · " + fecha(tarea.verificacion_fecha)
+            ? (vigente === false
+                ? '<span class="pendiente">'
+                  + escapar(verificacion.resultado) + " · "
+                  + escapar(verificacion.ok) + " de "
+                  + escapar(verificacion.total) + " · DE OTRA EJECUCIÓN</span>"
+                : escapar(verificacion.resultado) + " · " + escapar(verificacion.ok)
+                  + " de " + escapar(verificacion.total) + " · "
+                  + fecha(tarea.verificacion_fecha))
             : "—"
     );
 
@@ -387,7 +414,11 @@ function dibujarTarea(tarea) {
 }
 
 function dibujar(datos) {
-    const resumen = datos.resumen;
+    // Guardas: un fallo al PINTAR no es un fallo de red, y hasta ahora los
+    // dos se mostraban con el mismo mensaje («sin conexión con el motor
+    // local»), que manda a buscar el problema donde no está.
+    const resumen = datos.resumen || {};
+    const tareas = datos.tareas || [];
     const base = datos.base_global || { estado: "ERROR", detalle: "sin datos" };
 
     const indicador = document.getElementById("dato-base");
@@ -425,7 +456,7 @@ function dibujar(datos) {
 
     const contenedor = document.getElementById("tareas");
 
-    if (datos.tareas.length === 0) {
+    if (tareas.length === 0) {
         contenedor.innerHTML = '<div class="vacio">'
             + (base.estado === "ACTIVA"
                 ? 'La base global no registra ninguna tarea. Las definiciones '
@@ -433,7 +464,7 @@ function dibujar(datos) {
                 : 'Sin estado operativo: la base global no está disponible.')
             + '</div>';
     } else {
-        contenedor.innerHTML = datos.tareas.map(dibujarTarea).join("");
+        contenedor.innerHTML = tareas.map(dibujarTarea).join("");
     }
 
     const actividad = document.getElementById("actividad");
