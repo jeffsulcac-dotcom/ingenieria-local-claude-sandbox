@@ -323,6 +323,17 @@ function dibujarTarea(tarea) {
             : etiquetaVitalidad + motivo
     );
 
+    /*
+     * Una FILA de la base que no se pudo interpretar no es un JSON roto: el
+     * rótulo del archivo mandaba a arreglar una ficha que estaba bien.
+     */
+    if (tarea.fila_legible === false) {
+        bloque += fila(
+            "Fila de la base",
+            '<span class="pendiente">NO LEGIBLE · la definición JSON no es el problema</span>'
+        );
+    }
+
     bloque += fila("Último latido", fecha(tarea.ultimo_latido));
     bloque += fila("Edad del latido", duracion(tarea.edad_latido_s));
 
@@ -342,7 +353,8 @@ function dibujarTarea(tarea) {
                 ? '<span class="pendiente">'
                   + escapar(verificacion.resultado) + " · "
                   + escapar(verificacion.ok) + " de "
-                  + escapar(verificacion.total) + " · DE OTRA EJECUCIÓN</span>"
+                  + escapar(verificacion.total) + " · " + fecha(tarea.verificacion_fecha)
+                  + " · DE OTRA EJECUCIÓN</span>"
                 : escapar(verificacion.resultado) + " · " + escapar(verificacion.ok)
                   + " de " + escapar(verificacion.total) + " · "
                   + fecha(tarea.verificacion_fecha))
@@ -364,6 +376,7 @@ function dibujarTarea(tarea) {
         "Commit verificado",
         verificacion
             ? escapar(tarea.verificacion_commit) + " · " + escapar(tarea.verificacion_rama)
+              + (tarea.verificacion_sin_confirmar ? " · CON CAMBIOS SIN CONFIRMAR" : "")
             : "—"
     );
 
@@ -434,6 +447,33 @@ function dibujar(datos) {
         ? ""
         : '<div class="mensaje-tecnico aviso">Base global SQLite no disponible: '
           + escapar(base.detalle) + '</div>';
+
+    /*
+     * Lo que el motor publica aparte y la consola ya decía: ejecuciones sin
+     * señal de vida y fichas que la base no conoce. El tablero no las
+     * importa; se incorporan con una orden explícita.
+     */
+    const avisos = [];
+
+    if ((resumen.agentes_sin_senal || []).length > 0) {
+        avisos.push(
+            "Ejecuciones sin señal de vida: "
+            + resumen.agentes_sin_senal.map(escapar).join(", ")
+            + ". Mira su vitalidad en la tarjeta."
+        );
+    }
+
+    if ((resumen.sin_importar || []).length > 0) {
+        avisos.push(
+            "Fichas no registradas en la base: "
+            + resumen.sin_importar.map(escapar).join(", ")
+            + ". El tablero no las importa: incorpóralas con sincronizar-definiciones."
+        );
+    }
+
+    aviso.innerHTML += avisos
+        .map(function (texto) { return '<div class="mensaje-tecnico aviso">' + texto + '</div>'; })
+        .join("");
 
     document.getElementById("dato-agentes").textContent = resumen.agentes_activos;
     document.getElementById("dato-totales").textContent = resumen.totales;

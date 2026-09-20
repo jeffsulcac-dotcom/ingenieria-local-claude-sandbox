@@ -328,13 +328,26 @@ def _comprobar_estado_desarrollo() -> dict:
     # SQLite y cambia legítimamente en cuanto se trabaja una tarea.
     por_id = {tarea["id"]: tarea for tarea in datos["tareas"]}
 
+    # Desde A3.3 el tablero NO escribe: una ficha que la base global todavía
+    # no conoce no se importa al refrescar, sino que se anuncia en
+    # `sin_importar` hasta que una orden explícita la incorpore. En un clon
+    # limpio, sin ninguna orden previa, ése es el caso de TODAS las fichas;
+    # exigir que aparecieran publicadas hacía que esta prueba dependiera del
+    # estado operativo de la máquina (pasaba donde la base ya las conocía y
+    # fallaba en un clon recién hecho).
+    sin_importar = set(datos["resumen"].get("sin_importar") or [])
+
     for ruta_ficha in sorted(CARPETA_TAREAS.glob("T-*.json")):
         identificador = ruta_ficha.stem
         declarada = json.loads(ruta_ficha.read_text(encoding="utf-8"))
 
-        assert identificador in por_id, (
-            "La ficha " + identificador + " no aparece en el tablero."
+        assert identificador in por_id or identificador in sin_importar, (
+            "La ficha " + identificador + " no aparece en el tablero ni está "
+            "anunciada como pendiente de importar."
         )
+
+        if identificador not in por_id:
+            continue
 
         publicada = por_id[identificador]
 

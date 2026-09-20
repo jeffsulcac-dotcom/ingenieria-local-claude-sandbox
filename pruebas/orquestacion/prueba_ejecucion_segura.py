@@ -253,8 +253,10 @@ def prueba_a_dos_ordenes_validas_no_se_pisan():
         )
         tomada = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
 
-        # Las DOS leen antes de que ninguna escriba. Es exactamente lo que
-        # pasa cuando dos órdenes se solapan.
+        # Las dos órdenes van UNA TRAS OTRA: esta comprobación demuestra el
+        # efecto (ningún campo vuelve atrás). El solapamiento real lo
+        # prueban la 2, que mira el SET de cada orden, y la 37, con procesos
+        # escribiendo a la vez.
         nucleo.latido(
             raiz,
             "T-0901",
@@ -357,6 +359,48 @@ def prueba_b_una_orden_no_escribe_columnas_ajenas():
         assert escritas == {"ultimo_latido", "actualizado_en"}, (
             "El latido escribe columnas que no son suyas o le faltan las "
             "que sí lo son. Escribió: " + repr(sorted(escritas))
+        )
+
+        # `decidir` no pasa por `persistir`, así que se mira aparte. Sus
+        # columnas son las decisiones, la bandera y la marca; nada más. Un
+        # `decidir` que reescribiera el latido o los intentos desde su foto
+        # sobrevivía a la batería porque la 1 va en serie.
+        ficha_minima(
+            raiz, "T-0902",
+            decisiones=[{"clave": "D-1", "descripcion": "una"}],
+        )
+        sentencias.clear()
+        sqlite3.connect = conectar_vigilado
+
+        try:
+            nucleo.decidir(raiz, "T-0902", "D-1", "resuelta")
+        finally:
+            sqlite3.connect = conectar
+
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        actualizaciones = [
+            una for una in sentencias
+            if una.strip().upper().startswith("UPDATE TAREAS")
+        ]
+
+        assert len(actualizaciones) == 1, (
+            "Decidir debería producir UN solo UPDATE: " + repr(actualizaciones)
+        )
+
+        asignaciones = actualizaciones[0].split(" SET ", 1)[1].split(" WHERE ", 1)[0]
+        escritas = {
+            trozo.split("=", 1)[0].strip()
+            for trozo in asignaciones.split(",")
+            if "=" in trozo
+        }
+
+        assert escritas == {
+            "decisiones", "requiere_decision_humana", "actualizado_en"
+        }, (
+            "Decidir escribe columnas que no son suyas o le faltan las que "
+            "sí lo son. Escribió: " + repr(sorted(escritas))
         )
 
         comprobar_integridad(raiz)
@@ -664,6 +708,52 @@ def prueba_e_una_ruta_ajena_no_se_ejecuta():
         impostor = principal.parent / (principal.name + "_impostor")
         shutil.copytree(legitimo, impostor, symlinks=True)
 
+        # Un worktree registrado cuyo directorio se borró con `rm -rf` y se
+        # volvió a crear como carpeta corriente, con una prueba verde
+        # dentro. Git lo sigue listando, marcado `prunable`; esa línea se
+        # ignoraba y la carpeta se aceptaba como árbol de ejecución.
+        fantasma = principal.parent / (principal.name + "_fantasma")
+        alta = _git(principal, "worktree", "add", str(fantasma), "-b", "rama-f")
+        assert alta.returncode == 0, alta.stderr
+        shutil.rmtree(fantasma)
+        (fantasma / "pruebas").mkdir(parents=True)
+        (fantasma / "pruebas" / "prueba_verde.py").write_text(
+            PRUEBA_VERDE, encoding="utf-8"
+        )
+
+        # Y una ruta que ESTE repositorio registró y borró, y que OTRO
+        # repositorio reutilizó después para un worktree suyo. Git sólo
+        # mira que `<ruta>/.git` exista, así que aquí la sigue listando
+        # como válida (sin `prunable`), pero el checkout —rama, commit,
+        # pruebas— es del otro.
+        _git(ajeno, "add", "-A")
+        hecho = _git(ajeno, "commit", "-q", "-m", "base ajena")
+        assert hecho.returncode == 0, hecho.stderr
+
+        reutilizada = principal.parent / (principal.name + "_reutilizada")
+        alta = _git(principal, "worktree", "add", str(reutilizada), "-b", "rama-r")
+        assert alta.returncode == 0, alta.stderr
+        shutil.rmtree(reutilizada)
+        alta = _git(ajeno, "worktree", "add", str(reutilizada), "-b", "rama-ajena")
+        assert alta.returncode == 0, alta.stderr
+
+        # Un worktree ANIDADO en la raíz al que le falta el archivo `.git`.
+        # Git lo lista `prunable`, y desde dentro `git` SUBE y responde por
+        # la raíz: rama y commit de main sobre las pruebas del worktree.
+        anidado = principal / ".arboles" / "wb"
+        alta = _git(
+            principal, "worktree", "add", str(anidado), "-b", "rama-anidada"
+        )
+        assert alta.returncode == 0, alta.stderr
+        (anidado / ".git").unlink()
+
+        listado = _git(principal, "worktree", "list", "--porcelain").stdout
+        assert "worktree " + str(reutilizada) + "\n" in listado, listado
+        assert "prunable" not in listado.split(str(reutilizada), 1)[1].split("\n\n")[0], (
+            "Git marcó la ruta reutilizada como prunable: el caso ya no "
+            "prueba lo que dice."
+        )
+
         casos = (
             ("otro repositorio", str(ajeno), "no es un worktree registrado"),
             ("no existe", str(principal / "no_existe"), "no existe"),
@@ -686,6 +776,31 @@ def prueba_e_una_ruta_ajena_no_se_ejecuta():
                 "la carpeta .git",
                 str(principal / ".git"),
                 "no es un worktree registrado",
+            ),
+            (
+                "worktree prunable (directorio recreado sin .git)",
+                str(fantasma),
+                "no es utilizable",
+            ),
+            (
+                "ruta reutilizada por otro repositorio",
+                str(reutilizada),
+                "responde por otro repositorio",
+            ),
+            (
+                "worktree anidado sin .git",
+                str(anidado),
+                "no es utilizable",
+            ),
+            # `~usuario` de un usuario que no existe: pathlib lanza
+            # RuntimeError y salía como traceback (código 1). En Windows
+            # `expanduser` construye la ruta sin comprobar el usuario y el
+            # rechazo llega por «no existe»; en los dos casos es
+            # ErrorWorktree, que es lo que se exige.
+            (
+                "usuario inexistente en ~",
+                "~usuario_que_no_existe_a33/wt",
+                "",
             ),
         )
 
@@ -747,6 +862,8 @@ def prueba_e_una_ruta_ajena_no_se_ejecuta():
         borrar(ajeno)
         borrar(principal.parent / (principal.name + "_impostor"))
         borrar(principal.parent / (principal.name + "_wt"))
+        borrar(principal.parent / (principal.name + "_fantasma"))
+        borrar(principal.parent / (principal.name + "_reutilizada"))
         borrar(principal)
 
     print("OK")
@@ -1139,11 +1256,38 @@ def prueba_k_el_acompanante_se_para_aunque_el_trabajo_falle():
         assert not acompanante._hilo.is_alive(), (
             "El hilo del latido sobrevivió al fallo del trabajo."
         )
-        assert acompanante.emitidos > 0, (
-            "No llegó a latir: la prueba no probó nada."
+        # Con 80 ms de trabajo y 5 ms de intervalo, un acompañante que
+        # repite el bucle late muchas veces; uno que sólo late al entrar,
+        # una. Exigir «más de cero» no distinguía las dos cosas.
+        assert acompanante.emitidos >= 3, (
+            "El acompañante no repite el bucle: " + str(acompanante.emitidos)
+            + " latidos en 80 ms con intervalo de 5 ms."
         )
 
         METRICAS["LATIDOS_AUTOMATICOS"] += acompanante.emitidos
+
+        # Reutilizar la instancia es un error ruidoso, no cero latidos en
+        # silencio.
+        try:
+            with acompanante:
+                pass
+        except nucleo.ErrorSupervisor:
+            pass
+        else:
+            raise AssertionError(
+                "Se pudo reutilizar un acompañante ya cerrado."
+            )
+
+        # Y un intervalo de cero —miles de BEGIN IMMEDIATE por segundo sobre
+        # la base compartida— se rechaza al construir.
+        try:
+            nucleo.LatidoAutomatico(
+                raiz, "T-0901", "worker-A", tomada.generacion, intervalo_s=0
+            )
+        except nucleo.ErrorSupervisor:
+            pass
+        else:
+            raise AssertionError("Se admitió un intervalo de latido de cero.")
 
         # Y deja de escribir de verdad: la marca no se mueve más.
         quieto = fila_de(raiz, "T-0901")["ultimo_latido"]
@@ -1186,22 +1330,58 @@ def prueba_l_verificar_late_mientras_corre():
         )
         tomada = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
 
-        informe = nucleo.verificar(
-            raiz,
-            "T-0901",
-            trabajador_id="worker-A",
-            generacion=tomada.generacion,
-            intervalo_latido_s=0.02,
-        )
+        # Un tropiezo transitorio en el PRIMER latido de la corrida: tiene
+        # que verse en el informe («hasta ahora se calculaba y se tiraba»)
+        # sin invalidar la corrida ni parar el acompañante.
+        abrir_real = estado_global.abrir
+        tropiezo = {"pendiente": True}
+
+        def abrir_con_tropiezo_en_el_latido(*argumentos, **claves):
+            if (
+                tropiezo["pendiente"]
+                and threading.current_thread().name.startswith("latido-")
+            ):
+                tropiezo["pendiente"] = False
+                raise sqlite3.OperationalError("database is locked")
+
+            return abrir_real(*argumentos, **claves)
+
+        estado_global.abrir = abrir_con_tropiezo_en_el_latido
+
+        try:
+            informe = nucleo.verificar(
+                raiz,
+                "T-0901",
+                trabajador_id="worker-A",
+                generacion=tomada.generacion,
+                intervalo_latido_s=0.02,
+            )
+        finally:
+            estado_global.abrir = abrir_real
+
         METRICAS["OPERACIONES"] += 1
         METRICAS["ACEPTADAS"] += 1
         METRICAS["LATIDOS_AUTOMATICOS"] += informe["latidos"]
 
-        assert informe["latidos"] > 0, (
-            "La verificación no emitió ni un latido: una corrida larga "
-            "seguiría pareciendo abandono."
+        assert not tropiezo["pendiente"], (
+            "El tropiezo no llegó a ocurrir: la prueba no probó nada."
+        )
+        # Con 250 ms de prueba e intervalo de 20 ms caben muchos latidos; un
+        # acompañante que sólo latiera al entrar daría uno (o cero, tras el
+        # tropiezo). Exigir «más de cero» no distinguía nada.
+        assert informe["latidos"] >= 3, (
+            "La verificación emitió " + str(informe["latidos"]) + " latidos "
+            "en 250 ms con intervalo de 20 ms: una corrida larga seguiría "
+            "pareciendo abandono."
         )
         assert informe["estado"] == str(Estado.PROPUESTO), informe["motivo"]
+        assert informe["latido_error"] and "locked" in informe["latido_error"], (
+            "El fallo del latido no llegó al informe: "
+            + repr(informe["latido_error"])
+        )
+        assert informe["latido_cierre_incompleto"] is False, (
+            "El hilo del latido no cerró dentro del plazo."
+        )
 
         comprobar_integridad(raiz)
     finally:
@@ -1277,7 +1457,7 @@ def prueba_g_crear_concurrente_tiene_un_solo_ganador(creadores: int):
     ganó. Contar ganadores no bastaría.
     """
     print(
-        " 35. crear concurrente (" + str(creadores) + " procesos): ",
+        " 36. crear concurrente (" + str(creadores) + " procesos): ",
         end="",
     )
 
@@ -1808,6 +1988,36 @@ def prueba_s_el_worktree_que_desaparece_se_avisa_y_frena_la_retoma():
 
         assert tomada.worktree == str(arboles["A"].resolve())
 
+        # Primero, con la ejecución todavía FRESCA: el árbol desaparece y
+        # `reanudar` tiene que avisarlo sin tocar nada. Antes sólo se
+        # miraba el árbol de las tareas que se liberaban, así que una
+        # ejecución activa con el worktree borrado salía como «sigue
+        # activa» y nada más.
+        shutil.rmtree(arboles["A"])
+        assert not arboles["A"].exists()
+
+        fresco = nucleo.reanudar(principal, comprobar_proceso=lambda _pid: True)
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        assert [uno["id"] for uno in fresco["activas"]] == ["T-0903"], (
+            "Una ejecución viva se tocó por perder el árbol: " + repr(fresco)
+        )
+        assert [uno["id"] for uno in fresco["worktree_ausente"]] == [
+            "T-0903"
+        ], (
+            "La recuperación calló el worktree ausente de una ejecución "
+            "activa: " + repr(fresco["worktree_ausente"])
+        )
+        assert fresco["worktree_ausente"][0]["clase"] == nucleo.CLASE_ACTIVA
+
+        viva = fila_de(principal, "T-0903")
+
+        assert viva["estado"] == str(Estado.EN_EJECUCION)
+        assert viva["worktree"] == str(arboles["A"].resolve()), (
+            "Avisar del árbol ausente no debía cambiar la fila."
+        )
+
         # La ejecución queda demostrada muerta: latido antiguo.
         con = estado_global.abrir(estado_global.ruta_base(principal))
 
@@ -1819,11 +2029,6 @@ def prueba_s_el_worktree_que_desaparece_se_avisa_y_frena_la_retoma():
                 )
         finally:
             con.close()
-
-        # Y el árbol desaparece.
-        shutil.rmtree(arboles["A"])
-
-        assert not arboles["A"].exists()
 
         informe = nucleo.reanudar(
             principal, comprobar_proceso=lambda _pid: False
@@ -1963,6 +2168,32 @@ def prueba_q_rutas_raras_pero_legitimas_se_aceptan():
                 + str(resuelta) + " en vez de " + str(esperado)
             )
 
+        # Las dos formas de Windows que NO son absolutas y que al unirse a
+        # la raíz la descartarían —`C:pruebas`, relativa a la unidad, y
+        # `\pruebas`, con raíz y sin unidad— se rechazan con mensaje
+        # propio. En POSIX son nombres relativos corrientes y el caso no se
+        # puede ejercitar: se dice, no se calla.
+        if os.name == "nt":
+            for forma in ("C:pruebas", "\\pruebas"):
+                METRICAS["OPERACIONES"] += 1
+
+                try:
+                    nucleo.resolver_worktree(principal, forma)
+                except nucleo.ErrorWorktree as rechazo:
+                    METRICAS["RECHAZADAS"] += 1
+                    assert "lleva unidad o raíz" in str(rechazo), str(rechazo)
+                else:
+                    METRICAS["ACEPTADAS"] += 1
+                    raise AssertionError(
+                        "Se aceptó la forma de Windows '" + forma + "', que "
+                        "ignora la raíz del repositorio."
+                    )
+        else:
+            OMITIDAS.append(
+                "rutas relativas a unidad de Windows (C:pruebas, \\pruebas): "
+                "sólo se pueden ejercitar en Windows"
+            )
+
         # Un enlace simbólico al worktree resuelve al mismo sitio, no a otro.
         if os.name != "nt":
             enlace = base / "atajo"
@@ -2026,6 +2257,7 @@ def _escritor_concurrente(ruta_raiz: str, identificador: str, papel: str,
         "errores_sqlite": 0,
         "inesperadas": 0,
         "ultimo": None,
+        "retrocesos": 0,
         "detalles": [],
     }
 
@@ -2040,14 +2272,26 @@ def _escritor_concurrente(ruta_raiz: str, identificador: str, papel: str,
         marca = papel + "-" + str(vuelta)
         recuento["emitidas"] += 1
 
+        retroceso = False
+
         try:
             if papel.startswith("latido"):
-                # Marca propia y creciente por vuelta. Con un literal fijo
-                # para todos, un lost update entre dos latidos era
-                # indetectable: la aserción final pasaba aunque sólo
-                # hubiera entrado UNA escritura de dieciocho.
-                marca_latido = (
-                    "2030-01-01T00:00:%02d+00:00" % min(vuelta, 59)
+                # Marca propia, distinta para cada proceso y cada vuelta.
+                # Con un literal fijo para todos, un lost update entre dos
+                # latidos era indetectable: la aserción final pasaba aunque
+                # sólo hubiera entrado UNA escritura de dieciocho.
+                #
+                # Los procesos se intercalan como quieren, así que la guarda
+                # de no regresión rechazará las marcas que lleguen «tarde»:
+                # eso NO es una orden rechazada ni una pérdida, es la guarda
+                # haciendo su trabajo, y se cuenta aparte. Lo que se mide
+                # como aceptado es lo que el acompañante confirma
+                # (`emitidos`), no lo que `emitir_uno` devuelve, que es
+                # True también en un retroceso.
+                indice = int("".join(c for c in papel if c.isdigit()) or "0")
+                total = vuelta * 10 + indice
+                marca_latido = "2030-01-01T%02d:%02d:%02d+00:00" % (
+                    total // 3600, (total // 60) % 60, total % 60
                 )
                 acompanante = _nucleo.LatidoAutomatico(
                     raiz,
@@ -2056,7 +2300,9 @@ def _escritor_concurrente(ruta_raiz: str, identificador: str, papel: str,
                     credencial["generacion"],
                     reloj=lambda valor=marca_latido: valor,
                 )
-                aceptada = acompanante.emitir_uno()
+                sigue = acompanante.emitir_uno()
+                aceptada = acompanante.emitidos == 1
+                retroceso = sigue and not aceptada and acompanante.retrocesos == 1
 
                 if aceptada:
                     recuento.setdefault("latidos", []).append(marca_latido)
@@ -2084,6 +2330,8 @@ def _escritor_concurrente(ruta_raiz: str, identificador: str, papel: str,
                 recuento["aceptadas"] += 1
                 recuento["ultimo"] = marca
                 recuento.setdefault("marcas", []).append(marca)
+            elif retroceso:
+                recuento["retrocesos"] += 1
             else:
                 recuento["rechazadas"] += 1
         except sqlite3.Error as error:
@@ -2108,7 +2356,7 @@ def prueba_r_estres_de_escrituras_concurrentes(escritores: int, vueltas: int):
     puesta acaba apareciendo.
     """
     print(
-        " 36. estrés: " + str(escritores) + " escritores x " + str(vueltas)
+        " 37. estrés: " + str(escritores) + " escritores x " + str(vueltas)
         + " vueltas:",
         end=" ",
     )
@@ -2160,6 +2408,7 @@ def prueba_r_estres_de_escrituras_concurrentes(escritores: int, vueltas: int):
         emitidas = sum(uno["emitidas"] for uno in recuentos)
         aceptadas = sum(uno["aceptadas"] for uno in recuentos)
         rechazadas = sum(uno["rechazadas"] for uno in recuentos)
+        retrocesos = sum(uno["retrocesos"] for uno in recuentos)
         errores = sum(uno["errores_sqlite"] for uno in recuentos)
         raras = sum(uno["inesperadas"] for uno in recuentos)
 
@@ -2173,9 +2422,12 @@ def prueba_r_estres_de_escrituras_concurrentes(escritores: int, vueltas: int):
 
         assert not errores, "Errores de SQLite: " + "; ".join(detalles)
         assert not raras, "Excepciones: " + "; ".join(detalles)
-        assert aceptadas == emitidas, (
+        # Toda orden válida entra, salvo el latido que llega con una marca
+        # más vieja que la grabada: ése lo frena la guarda de no regresión
+        # a propósito, y se cuenta como retroceso, no como rechazo.
+        assert rechazadas == 0 and aceptadas + retrocesos == emitidas, (
             "Se rechazaron órdenes válidas: " + str(rechazadas) + " de "
-            + str(emitidas)
+            + str(emitidas) + " (" + str(retrocesos) + " retrocesos)"
         )
 
         fila = fila_de(raiz, "T-0901")
@@ -2201,6 +2453,8 @@ def prueba_r_estres_de_escrituras_concurrentes(escritores: int, vueltas: int):
 
         assert latidos, "Ningún latido llegó a confirmarse."
         assert marcas, "Ninguna escritura de `ultima_falla` se confirmó."
+
+        METRICAS["LATIDOS_AUTOMATICOS"] += len(latidos)
 
         # El latido que sobrevive debe ser el MAYOR de los confirmados. La
         # guarda de no retroceso lo garantiza; sin comprobarlo, un
@@ -2230,7 +2484,9 @@ def prueba_r_estres_de_escrituras_concurrentes(escritores: int, vueltas: int):
 
         print(
             "OK (" + str(emitidas) + " órdenes, " + str(aceptadas)
-            + " aceptadas, 0 perdidas)"
+            + " aceptadas, " + str(len(latidos)) + " latidos confirmados, "
+            + str(retrocesos) + " retrocesos frenados por la guarda, "
+            "0 perdidas)"
         )
     finally:
         borrar(raiz)
@@ -2311,6 +2567,78 @@ def prueba_t_verificar_rechaza_un_arbol_invalido():
         assert despues["intentos"] == antes["intentos"], (
             "El rechazo consumió un intento."
         )
+
+        # Segunda mitad: el árbol desaparece A MITAD de la corrida. El
+        # corredor lanza cada prueba con `cwd` en el árbol, así que la
+        # siguiente prueba fallaba con FileNotFoundError y eso salía como
+        # traceback de Python con código 1, no como ErrorWorktree (6).
+        # Windows no permite borrar el directorio de trabajo de un proceso
+        # vivo: ahí el caso se omite, y se dice.
+        if os.name == "nt":
+            OMITIDAS.append(
+                "árbol que desaparece a mitad de la corrida (Windows no "
+                "permite borrar el directorio de trabajo de un proceso vivo)"
+            )
+        else:
+            arbol_b = arboles["B"]
+            (
+                arbol_b / "pruebas" / "demostracion" / "prueba_0_lenta.py"
+            ).write_text(
+                "import time\ntime.sleep(1.5)\nprint('PRUEBA_LENTA=OK')\n",
+                encoding="utf-8",
+            )
+            _git(arbol_b, "add", "-A")
+            hecho = _git(arbol_b, "commit", "-q", "-m", "prueba lenta")
+            assert hecho.returncode == 0, hecho.stderr
+
+            nucleo.devolver(
+                principal, "T-0904",
+                trabajador_id="worker-A", generacion=tomada.generacion,
+            )
+            segunda = nucleo.tomar(
+                principal, "T-0904",
+                trabajador_id="worker-A", worktree=str(arbol_b),
+            )
+            METRICAS["OPERACIONES"] += 2
+            METRICAS["ACEPTADAS"] += 2
+
+            def borrar_a_mitad():
+                time.sleep(0.6)
+                shutil.rmtree(arbol_b, ignore_errors=True)
+
+            hilo = threading.Thread(target=borrar_a_mitad)
+            hilo.start()
+
+            METRICAS["OPERACIONES"] += 1
+
+            try:
+                nucleo.verificar(
+                    principal, "T-0904",
+                    trabajador_id="worker-A", generacion=segunda.generacion,
+                )
+                METRICAS["ACEPTADAS"] += 1
+                METRICAS["VERIFICACIONES_EN_ARBOL_INCORRECTO"] += 1
+                raise AssertionError(
+                    "verificar terminó como si nada sobre un árbol que "
+                    "desapareció a mitad de la corrida."
+                )
+            except nucleo.ErrorWorktree as rechazo:
+                METRICAS["RECHAZADAS"] += 1
+                assert "desapareció" in str(rechazo), str(rechazo)
+            finally:
+                hilo.join()
+
+            assert not arbol_b.exists(), (
+                "El hilo no llegó a borrar el árbol: la prueba no probó nada."
+            )
+
+            fila = fila_de(principal, "T-0904")
+
+            assert not fila["ultima_verificacion"], (
+                "Se grabó la corrida de un árbol que desapareció: "
+                + repr(fila["ultima_verificacion"])
+            )
+            assert fila["estado"] == str(Estado.EN_EJECUCION), fila["estado"]
 
         comprobar_integridad(principal)
     finally:
@@ -2436,6 +2764,94 @@ def prueba_u_un_arbol_que_se_mueve_invalida_la_corrida():
             "invalidó la corrida."
         )
         assert informe["estado"] == str(Estado.PROPUESTO), informe["estado"]
+        assert informe["sin_confirmar"] is False, (
+            "Un árbol limpio se grabó como sucio."
+        )
+
+        # Tercera dirección: un árbol que YA estaba sucio y cuyo contenido
+        # sin confirmar cambia a mitad. Comparar sólo «¿hay cambios?» antes
+        # y después daba True == True y pasaba por quieto.
+        (carpeta / "prueba_lenta.py").write_text(
+            "import time\ntime.sleep(1.5)\nprint('PRUEBA_LENTA=OK')\n",
+            encoding="utf-8",
+        )
+        _git(principal, "add", "-A")
+        hecho = _git(principal, "commit", "-q", "-m", "prueba lenta otra vez")
+        assert hecho.returncode == 0, hecho.stderr
+
+        nucleo.reabrir(principal, "T-0905", "Tercer intento.")
+        tercera = nucleo.tomar(principal, "T-0905", trabajador_id="worker-A")
+        METRICAS["OPERACIONES"] += 2
+        METRICAS["ACEPTADAS"] += 2
+
+        # Sucio ANTES de empezar, sin confirmar.
+        (principal / "otro.txt").write_text("v3 sin confirmar", encoding="utf-8")
+        assert _git(principal, "status", "--porcelain").stdout.strip(), (
+            "El árbol no quedó sucio: la prueba no probaría nada."
+        )
+
+        def editar_a_mitad():
+            time.sleep(0.6)
+            (principal / "otro.txt").write_text(
+                "v4 editado a mitad", encoding="utf-8"
+            )
+
+        hilo = threading.Thread(target=editar_a_mitad)
+        hilo.start()
+
+        METRICAS["OPERACIONES"] += 1
+
+        try:
+            nucleo.verificar(
+                principal, "T-0905",
+                trabajador_id="worker-A", generacion=tercera.generacion,
+            )
+            METRICAS["ACEPTADAS"] += 1
+            raise AssertionError(
+                "Se dio por buena una corrida cuyo contenido sin confirmar "
+                "cambió a mitad: sucio antes, sucio después, y distinto."
+            )
+        except nucleo.ErrorWorktree as rechazo:
+            METRICAS["RECHAZADAS"] += 1
+            assert "contenido sin confirmar cambió" in str(rechazo), (
+                str(rechazo)
+            )
+        finally:
+            hilo.join()
+
+        assert (principal / "otro.txt").read_text(encoding="utf-8").startswith(
+            "v4"
+        ), "El hilo no llegó a editar: la prueba no probó nada."
+
+        # Cuarta: el árbol sigue sucio pero quieto. La corrida vale, y la
+        # evidencia DICE que el commit grabado no contiene lo ejecutado.
+        METRICAS["OPERACIONES"] += 1
+        informe = nucleo.verificar(
+            principal, "T-0905",
+            trabajador_id="worker-A", generacion=tercera.generacion,
+        )
+        METRICAS["ACEPTADAS"] += 1
+
+        assert informe["estado"] == str(Estado.PROPUESTO), informe["estado"]
+        assert informe["sin_confirmar"] is True, (
+            "La evidencia no dice que había cambios sin confirmar."
+        )
+
+        fila = fila_de(principal, "T-0905")
+
+        assert fila["ultima_verificacion"]["sin_confirmar"] is True, (
+            "La marca de cambios sin confirmar no llegó a la base: "
+            + repr(fila["ultima_verificacion"])
+        )
+
+        tarjeta = next(
+            una for una in nucleo.tablero(principal)["tareas"]
+            if una["id"] == "T-0905"
+        )
+        assert tarjeta["verificacion_sin_confirmar"] is True, (
+            "El tablero no publica que el commit verificado no contiene lo "
+            "ejecutado: " + repr(tarjeta["verificacion_sin_confirmar"])
+        )
 
         comprobar_integridad(principal)
     finally:
@@ -2498,7 +2914,6 @@ def prueba_v_verificar_abandona_si_pierde_la_propiedad():
             )
         except nucleo.ErrorPropiedad as rechazo:
             METRICAS["RECHAZADAS"] += 1
-            METRICAS["ROBOS_INDEBIDOS"] += 0
 
             # El motivo tiene que ser el REAL, no uno fijo. Aquí la tarea
             # cambió de dueño y además de generación.
@@ -2507,6 +2922,15 @@ def prueba_v_verificar_abandona_si_pierde_la_propiedad():
                 estado_global.MOTIVO_GENERACION_VENCIDA,
                 estado_global.MOTIVO_SIN_PROPIETARIO,
             ), repr(rechazo.informe["motivo"])
+
+            # Y lo detectó el ACOMPAÑANTE mientras corría, no la escritura
+            # final. Sin esto, borrar el bloque de `verificar` que abandona
+            # al perder la propiedad pasaba igual: `persistir` lanzaba el
+            # mismo error, y el docstring de esta comprobación mentía.
+            assert "MIENTRAS se verificaba" in str(rechazo.informe["detalle"]), (
+                "El rechazo no lo produjo el acompañante: "
+                + str(rechazo.informe["detalle"])
+            )
         finally:
             hilo.join()
 
@@ -2670,9 +3094,6 @@ def prueba_x_un_trabajador_de_otra_maquina_no_se_juzga_por_el_pid_local():
         )
         assert vencido["requiere_atencion"] is True
 
-    METRICAS["OPERACIONES"] += 4
-    METRICAS["RECHAZADAS"] += 4
-
     print("OK")
 
 
@@ -2730,9 +3151,6 @@ def prueba_y_una_fila_incompleta_no_se_da_por_muerta():
             caso + " se informó como " + str(informe["vitalidad"])
             + ": " + repr(informe["motivo"])
         )
-
-    METRICAS["OPERACIONES"] += 6
-    METRICAS["RECHAZADAS"] += 6
 
     print("OK")
 
@@ -2802,6 +3220,9 @@ def prueba_z_el_tablero_publica_la_vitalidad_y_el_arbol_reales():
         )
         assert verificada["verificacion_rama"] == "rama-b", (
             repr(verificada["verificacion_rama"])
+        )
+        assert verificada["verificacion_sin_confirmar"] is False, (
+            "Un árbol limpio aparece en el tablero con cambios sin confirmar."
         )
         assert verificada["verificacion_vigente"] is True
 
@@ -2919,6 +3340,20 @@ def prueba_aa_el_tablero_no_escribe_y_aguanta_una_fila_rota():
             for error in datos["fichas_ilegibles"]
         ), repr(datos["fichas_ilegibles"])
 
+        # La fila está rota; el JSON, no. La tarjeta lo dice así y el aviso
+        # no señala la ruta del archivo: antes mandaba a arreglar una ficha
+        # que estaba bien.
+        assert datos["tareas"][0]["definicion_legible"] is True, (
+            "Una fila rota culpó al JSON, que está bien."
+        )
+        assert not any(
+            str(error.get("archivo", "")).endswith(".json")
+            and "T-0907" in str(error.get("archivo", ""))
+            for error in datos["fichas_ilegibles"]
+        ), "El aviso de la fila rota señala la ruta del JSON: " + repr(
+            datos["fichas_ilegibles"]
+        )
+
         METRICAS["OPERACIONES"] += 1
 
         comprobar_integridad(raiz)
@@ -3003,7 +3438,7 @@ def prueba_ab_la_consola_distingue_sus_rechazos():
         ))
 
         esperados.append((
-            "worktree que no vale",
+            "devolver con generación vigente",
             cli(
                 "devolver", "T-0908", "--trabajador", "W1", "--generacion", "1"
             ),
@@ -3024,6 +3459,26 @@ def prueba_ab_la_consola_distingue_sus_rechazos():
             cli("ver", "T-9999"),
             2,
         ))
+
+        # Una fila de la base que no se puede interpretar: avería (2) con
+        # mensaje en español, no un traceback con código 1, que la ayuda
+        # define como «se completó pero el resultado no es el deseado».
+        con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+        try:
+            with estado_global.transaccion(con):
+                con.execute(
+                    "UPDATE tareas SET decisiones = ? WHERE id = ?",
+                    ('"esto no es una lista"', "T-0908"),
+                )
+        finally:
+            con.close()
+
+        rota = cli("ver", "T-0908")
+        esperados.append(("ver una fila rota", rota, 2))
+
+        assert "AVERÍA DEL SUPERVISOR" in rota.stdout, rota.stdout[-400:]
+        assert "Traceback" not in rota.stderr, rota.stderr[-400:]
 
         for caso, salida, codigo in esperados:
             METRICAS["OPERACIONES"] += 1
@@ -3072,7 +3527,7 @@ def prueba_ac_un_latido_a_tiempo_evita_la_recuperacion():
     Y `reclamadas_mientras_tanto` quedaba vacío: el sistema ni se enteraba
     de que había robado.
     """
-    print(" 30. un latido a tiempo evita la recuperación:", end=" ")
+    print(" 28. un latido a tiempo evita la recuperación:", end=" ")
 
     raiz = crear_repositorio("latido_a_tiempo_")
 
@@ -3135,6 +3590,19 @@ def prueba_ac_un_latido_a_tiempo_evita_la_recuperacion():
         )
         METRICAS["RECHAZADAS"] += 1
 
+        # Y el motivo dice lo que pasó. Antes caía en «estado incompatible»
+        # con un detalle que se contradecía a sí mismo («está en
+        # en_ejecucion, que no admite esta orden; la admiten: en_ejecucion»)
+        # y eso era lo que la consola enseñaba bajo el rótulo de «reclamada».
+        motivo = informe["reclamadas_mientras_tanto"][0]["motivo"]
+
+        assert "señal de vida" in motivo, (
+            "El motivo no dice que el dueño latió: " + motivo
+        )
+        assert "no admite esta orden" not in motivo, (
+            "El motivo se contradice a sí mismo: " + motivo
+        )
+
         comprobar_integridad(raiz)
     finally:
         borrar(raiz)
@@ -3153,7 +3621,7 @@ def prueba_ad_el_latido_aguanta_un_fallo_transitorio():
     verificación durase para que la recuperación le quitara la tarea al
     trabajador mientras trabajaba.
     """
-    print(" 31. el latido aguanta un fallo transitorio:", end=" ")
+    print(" 29. el latido aguanta un fallo transitorio:", end=" ")
 
     raiz = crear_repositorio("transitorio_")
 
@@ -3224,6 +3692,32 @@ def prueba_ad_el_latido_aguanta_un_fallo_transitorio():
         )
         METRICAS["RECHAZADAS"] += 1
 
+        # Una excepción que NO es de SQLite no es transitoria: se anota y
+        # se para, sin confundirla con perder la tarea. Esa rama no la
+        # ejercitaba nadie.
+        otro = nucleo.LatidoAutomatico(
+            raiz, "T-0901", "worker-A", tomada.generacion
+        )
+
+        def abrir_roto(*argumentos, **extras):
+            raise RuntimeError("avería que no es de SQLite")
+
+        estado_global.abrir = abrir_roto
+
+        try:
+            METRICAS["OPERACIONES"] += 1
+            sigue = otro.emitir_uno()
+        finally:
+            estado_global.abrir = abrir_real
+
+        assert sigue is False, (
+            "Una avería que no es transitoria dejó el latido girando."
+        )
+        assert otro.propiedad_perdida is False
+        assert "RuntimeError" in str(otro.error), otro.error
+        assert otro.fallos_totales == 1, otro.fallos_totales
+        METRICAS["RECHAZADAS"] += 1
+
         comprobar_integridad(raiz)
     finally:
         borrar(raiz)
@@ -3242,7 +3736,7 @@ def prueba_ae_el_latido_no_puede_retroceder_la_marca_de_vida():
     huérfana una ejecución viva: el componente que existe para mantenerla
     viva se convierte en el que la mata.
     """
-    print(" 32. el latido no puede retroceder la marca de vida:", end=" ")
+    print(" 30. el latido no puede retroceder la marca de vida:", end=" ")
 
     raiz = crear_repositorio("monotonia_")
 
@@ -3290,6 +3784,42 @@ def prueba_ae_el_latido_no_puede_retroceder_la_marca_de_vida():
             "La marca de vida retrocedió: " + repr(fila["ultimo_latido"])
         )
 
+        # Y si la relectura que distingue «reloj atrasado» de «perdí la
+        # tarea» falla por un error transitorio, eso NO es perder la tarea.
+        # Antes se marcaba `propiedad_perdida` y `verificar` tiraba la
+        # batería entera con un diagnóstico falso. La primera apertura es
+        # la del UPDATE (rechazado por la guarda); la segunda, la relectura.
+        abrir_real = estado_global.abrir
+        aperturas = []
+
+        def abrir_fragil(*argumentos, **claves):
+            aperturas.append(1)
+
+            if len(aperturas) == 2:
+                raise sqlite3.OperationalError("database is locked")
+
+            return abrir_real(*argumentos, **claves)
+
+        estado_global.abrir = abrir_fragil
+
+        try:
+            METRICAS["OPERACIONES"] += 1
+            sigue = retrasado.emitir_uno()
+        finally:
+            estado_global.abrir = abrir_real
+
+        assert len(aperturas) == 2, (
+            "La relectura no llegó a ejecutarse: " + str(len(aperturas))
+        )
+        assert sigue is True, (
+            "Un error transitorio en la relectura se confundió con perder "
+            "la tarea."
+        )
+        assert retrasado.propiedad_perdida is False
+        assert retrasado.fallos_seguidos == 1, retrasado.fallos_seguidos
+        assert "locked" in str(retrasado.error), retrasado.error
+        METRICAS["RECHAZADAS"] += 1
+
         comprobar_integridad(raiz)
     finally:
         borrar(raiz)
@@ -3309,10 +3839,12 @@ def prueba_af_dos_decisiones_humanas_no_se_pisan():
     pasaban el WHERE y la segunda revertía a la primera. Sin error y sin
     rastro: al humano que decidió se le devolvía su decisión como resuelta.
 
-    Se prueba con dos fichas leídas ANTES de que ninguna escriba, que es
-    justo el solapamiento que ocurre entre dos procesos.
+    Aquí las dos resoluciones van una tras otra y se exige que las dos
+    sobrevivan en la base Y en el espejo JSON; el orden BEGIN < lectura <
+    escritura lo fija `resolver_decision` dentro de la transacción, y el
+    solapamiento real entre procesos lo mide la 37.
     """
-    print(" 33. dos decisiones humanas no se pisan:", end=" ")
+    print(" 31. dos decisiones humanas no se pisan:", end=" ")
 
     raiz = crear_repositorio("decisiones_")
 
@@ -3346,6 +3878,23 @@ def prueba_af_dos_decisiones_humanas_no_se_pisan():
             )
 
         assert fila_de(raiz, "T-0901")["requiere_decision_humana"] in (0, False)
+
+        # Y el espejo JSON —lo que ve el ingeniero— dice lo mismo que la
+        # base. Un espejo que no fusionara la resolución con la definición
+        # dejaba el archivo diciendo «pendiente» lo que la base decía
+        # «resuelta», y ninguna prueba lo miraba.
+        leida = fichas.leer(raiz, "T-0901")
+        en_archivo = {
+            str(una["clave"]): una for una in leida.requiere_decision_humana
+        }
+
+        for clave in ("D-1", "D-2"):
+            assert en_archivo.get(clave, {}).get("resuelta"), (
+                "El espejo JSON dice pendiente lo que la base dice resuelta: "
+                + repr(en_archivo)
+            )
+
+        assert not leida.decisiones_pendientes()
 
         # Y una definición que no declara una clave NO borra su resolución.
         archivo = fichas.carpeta_tareas(raiz) / "T-0901.json"
@@ -3391,7 +3940,7 @@ def prueba_ag_el_espejo_no_borra_lo_que_escribe_una_persona():
     declarada desaparecía, así que la tarea se iba a PROPUESTO saltándose
     justo la decisión que esa persona quería forzar.
     """
-    print(" 34. el espejo no borra lo que escribe una persona:", end=" ")
+    print(" 32. el espejo no borra lo que escribe una persona:", end=" ")
 
     raiz = crear_repositorio("espejo_")
 
@@ -3485,6 +4034,408 @@ def prueba_ag_el_espejo_no_borra_lo_que_escribe_una_persona():
 # ----------------------------------------------------------------------
 # Corredor de este archivo
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# GRUPO 9 — Revisión final: lo que el README prometía y el código no hacía
+# ----------------------------------------------------------------------
+
+def prueba_ah_el_latido_toma_el_instante_con_el_candado_pedido():
+    """
+    El instante que se graba se lee DESPUÉS de pedir el candado, no antes.
+
+    Bajo contención, `BEGIN IMMEDIATE` puede esperar hasta `busy_timeout`
+    (cinco segundos). Tomar la hora antes de esa espera y grabarla después
+    equivale a registrar una señal de vida ya rancia: la marca dice «vivo
+    hace cinco segundos» en el instante mismo en que se confirma. El
+    README y el comentario del código lo prometían; el código leía el
+    reloj fuera de la transacción. Aquí se lee el orden REAL de lo que
+    ocurre, con el trazador de SQLite: BEGIN IMMEDIATE, luego el reloj,
+    luego el UPDATE.
+    """
+    print(" 33. el latido toma el instante con el candado ya pedido:",
+          end=" ")
+
+    raiz = crear_repositorio("instante_")
+
+    try:
+        ficha_minima(raiz, "T-0901")
+        tomada = nucleo.tomar(raiz, "T-0901", trabajador_id="worker-A")
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        sucesos = []
+        conectar = sqlite3.connect
+
+        def conectar_vigilado(*argumentos, **claves):
+            con_nueva = conectar(*argumentos, **claves)
+            con_nueva.set_trace_callback(
+                lambda sentencia: sucesos.append(("sql", str(sentencia)))
+            )
+
+            return con_nueva
+
+        def reloj():
+            sucesos.append(("reloj", ""))
+
+            return nucleo.ahora_utc()
+
+        acompanante = nucleo.LatidoAutomatico(
+            raiz, "T-0901", "worker-A", tomada.generacion, reloj=reloj
+        )
+
+        sqlite3.connect = conectar_vigilado
+
+        try:
+            METRICAS["OPERACIONES"] += 1
+            assert acompanante.emitir_uno() is True
+        finally:
+            sqlite3.connect = conectar
+
+        METRICAS["ACEPTADAS"] += 1
+        METRICAS["LATIDOS_AUTOMATICOS"] += 1
+
+        def exigir_orden(quien: str, marca_de_escritura: str) -> None:
+            """BEGIN IMMEDIATE, después el reloj, después el UPDATE."""
+            escritura = next(
+                (
+                    numero for numero, (clase, texto) in enumerate(sucesos)
+                    if clase == "sql"
+                    and texto.strip().upper().startswith("UPDATE TAREAS")
+                    and marca_de_escritura in texto
+                ),
+                None,
+            )
+            assert escritura is not None, quien + " no escribió."
+
+            candado = max(
+                (
+                    numero for numero, (clase, texto) in enumerate(sucesos)
+                    if numero < escritura and clase == "sql"
+                    and texto.strip().upper().startswith("BEGIN IMMEDIATE")
+                ),
+                default=None,
+            )
+            assert candado is not None, quien + " no abrió ninguna transacción."
+
+            instante = next(
+                (
+                    numero for numero, (clase, _texto) in enumerate(sucesos)
+                    if clase == "reloj"
+                ),
+                None,
+            )
+            assert instante is not None, quien + " no consultó el reloj."
+
+            assert candado < instante < escritura, (
+                "El instante de " + quien + " tiene que leerse con el candado "
+                "ya pedido: BEGIN=" + str(candado) + " reloj="
+                + str(instante) + " UPDATE=" + str(escritura)
+            )
+
+        exigir_orden("el latido", "ultimo_latido")
+
+        # Lo mismo para la toma: su `momento` es el primer latido de la
+        # ejecución, y también se tomaba antes de pedir el candado.
+        ficha_minima(raiz, "T-0902")
+        sucesos.clear()
+        reloj_real = nucleo.ahora_datetime
+
+        def reloj_de_toma():
+            sucesos.append(("reloj", ""))
+
+            return reloj_real()
+
+        nucleo.ahora_datetime = reloj_de_toma
+        sqlite3.connect = conectar_vigilado
+
+        try:
+            METRICAS["OPERACIONES"] += 1
+            nucleo.tomar(raiz, "T-0902", trabajador_id="worker-A")
+        finally:
+            sqlite3.connect = conectar
+            nucleo.ahora_datetime = reloj_real
+
+        METRICAS["ACEPTADAS"] += 1
+
+        exigir_orden("la toma", "generacion = generacion + 1")
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+def _demostrar_muertas(raiz: Path) -> None:
+    """Latido antiguo en todas las filas: con el proceso ausente, HUÉRFANA."""
+    con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+    try:
+        with estado_global.transaccion(con):
+            con.execute(
+                "UPDATE tareas SET ultimo_latido = ?",
+                ("2020-01-01T00:00:00+00:00",),
+            )
+    finally:
+        con.close()
+
+
+def prueba_ai_un_espejo_que_falla_no_tumba_la_recuperacion():
+    """
+    Si el espejo JSON de una tarea no se puede escribir, la recuperación
+    lo anota y sigue con las demás.
+
+    El README lo prometía (`espejo_no_regenerado`) y el código no lo
+    cumplía: el `except` estaba alrededor de `_registrar_en_git`, que ni
+    regenera el espejo ni lanza `ErrorSupervisor`. El espejo se regenera
+    dentro de `persistir`, cuyo error subía sin capturar y abortaba la
+    pasada entera: la primera tarea quedaba REABIERTA en la base, con el
+    JSON diciendo EN_EJECUCION y sin figurar en el informe, y todas las
+    que venían detrás, sin revisar. Reproducido antes de arreglarlo.
+    """
+    print(" 34. un espejo que falla no tumba la recuperación:", end=" ")
+
+    raiz = crear_repositorio("espejo_falla_")
+
+    try:
+        for identificador in ("T-0901", "T-0902"):
+            ficha_minima(raiz, identificador)
+            nucleo.tomar(
+                raiz, identificador,
+                trabajador_id="worker-" + identificador, pid=999999,
+            )
+            METRICAS["OPERACIONES"] += 1
+            METRICAS["ACEPTADAS"] += 1
+
+        _demostrar_muertas(raiz)
+
+        original = nucleo.guardar
+
+        def guardar_roto(raiz_, ficha, **claves):
+            if ficha.id == "T-0901":
+                raise OSError("disco lleno (simulado)")
+
+            return original(raiz_, ficha, **claves)
+
+        nucleo.guardar = guardar_roto
+
+        try:
+            METRICAS["OPERACIONES"] += 1
+            informe = nucleo.reanudar(
+                raiz, comprobar_proceso=lambda _pid: False
+            )
+        finally:
+            nucleo.guardar = original
+
+        METRICAS["ACEPTADAS"] += 1
+
+        assert sorted(uno["id"] for uno in informe["huerfanas"]) == [
+            "T-0901", "T-0902"
+        ], (
+            "La recuperación no llegó a todas las tareas: "
+            + repr(informe["huerfanas"])
+        )
+        assert [uno["id"] for uno in informe["espejo_no_regenerado"]] == [
+            "T-0901"
+        ], (
+            "El fallo del espejo no quedó anotado: "
+            + repr(informe["espejo_no_regenerado"])
+        )
+        assert "espejo" in informe["espejo_no_regenerado"][0]["motivo"]
+
+        for identificador in ("T-0901", "T-0902"):
+            assert fila_de(raiz, identificador)["estado"] == str(
+                Estado.REABIERTO
+            ), identificador + " no quedó recuperada en la base."
+
+        # El espejo que sí se pudo escribir refleja la base; el otro quedó
+        # viejo, y lo regenera la siguiente orden que confirme.
+        assert fichas.leer(raiz, "T-0902").estado == Estado.REABIERTO
+        assert fichas.leer(raiz, "T-0901").estado == Estado.EN_EJECUCION
+
+        nucleo.tomar(raiz, "T-0901", trabajador_id="worker-C")
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        regenerada = fichas.leer(raiz, "T-0901")
+
+        assert regenerada.estado == Estado.EN_EJECUCION
+        assert regenerada.trabajador_id == "worker-C", (
+            "La siguiente orden no regeneró el espejo: "
+            + repr(regenerada.trabajador_id)
+        )
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
+
+def prueba_aj_la_consola_muestra_lo_que_reanudar_informa():
+    """
+    Lo que el motor informa llega a la persona que ejecuta `reanudar`.
+
+    `reanudar` devolvía `inconsistentes_sin_tocar` y `espejo_no_regenerado`
+    y la consola no los imprimía. El README decía que la salida para una
+    fila incompleta es `reabrir`, una orden humana; pero el operador de
+    consola nunca se enteraba de que existiera esa fila, así que la orden
+    humana no llegaba a darse. Y «Inconsistentes recuperadas» salía siempre
+    0, porque desde A3.3 ese camino no existe.
+
+    Se ejecuta la consola real en este proceso (`principal`), con la
+    salida capturada, para poder provocar el fallo del espejo.
+    """
+    print(" 35. la consola muestra lo que reanudar informa:", end=" ")
+
+    import contextlib
+    import io
+
+    from ingenieria_supervisor import __main__ as consola
+
+    raiz = crear_repositorio("consola_reanudar_")
+
+    try:
+        # T-0909: fila en ejecución sin identidad, propia de una escritura
+        # interrumpida a medias. Se inyecta en la base, que es la autoridad.
+        ficha_minima(raiz, "T-0909")
+
+        con = estado_global.abrir(estado_global.ruta_base(raiz))
+
+        try:
+            with estado_global.transaccion(con):
+                estado_global.actualizar_tarea(
+                    con, "T-0909", {"estado": str(Estado.EN_EJECUCION)}
+                )
+        finally:
+            con.close()
+
+        # T-0910: huérfana de verdad, y con el espejo roto.
+        ficha_minima(raiz, "T-0910")
+        nucleo.tomar(raiz, "T-0910", trabajador_id="worker-A", pid=999999)
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        # T-0911: de OTRA máquina y con el latido vencido. No se libera sola
+        # y la consola tiene que decir que hay que mirarla a mano.
+        ficha_minima(raiz, "T-0911")
+        nucleo.tomar(
+            raiz, "T-0911", trabajador_id="otro-equipo/4321/abcd1234",
+            pid=999999,
+        )
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        _demostrar_muertas(raiz)
+
+        original = nucleo.guardar
+
+        def guardar_roto(raiz_, ficha, **claves):
+            if ficha.id == "T-0910":
+                raise OSError("disco lleno (simulado)")
+
+            return original(raiz_, ficha, **claves)
+
+        # Con el PID 999999 muerto y el latido de 2020, no hace falta
+        # inyectar `comprobar_proceso`: la consola usa el real.
+        assert not nucleo.proceso_vivo(999999), (
+            "El PID 999999 existe en esta máquina; la comprobación no puede "
+            "distinguir un proceso muerto."
+        )
+
+        salida = io.StringIO()
+        nucleo.guardar = guardar_roto
+
+        try:
+            METRICAS["OPERACIONES"] += 1
+
+            with contextlib.redirect_stdout(salida):
+                codigo = consola.principal(
+                    ["--raiz", str(raiz), "--sin-git", "reanudar"]
+                )
+        finally:
+            nucleo.guardar = original
+
+        METRICAS["ACEPTADAS"] += 1
+
+        texto = salida.getvalue()
+
+        # Deja tareas que una persona debe mirar: código 1, no 0. Un guion
+        # de arranque no podía distinguir «todo recuperado» de «hay algo
+        # que mirar» sin leer el texto.
+        assert codigo == 1, "reanudar devolvió " + str(codigo) + ":\n" + texto
+
+        for fragmento in (
+            "INCONSISTENTES (no recuperadas",
+            "T-0909",
+            "reabrir",
+            "SIN ESPEJO JSON",
+            "T-0910",
+            "LATIDO VENCIDO",
+            "T-0911",
+        ):
+            assert fragmento in texto, (
+                "La consola no muestra '" + fragmento + "':\n" + texto
+            )
+
+        assert "INCONSISTENTES RECUPERADAS" not in texto, (
+            "La consola sigue anunciando un camino que no existe."
+        )
+
+        resumen = [
+            linea for linea in texto.splitlines()
+            if "Inconsistentes (sin tocar)" in linea
+        ]
+
+        assert resumen and resumen[0].rstrip().endswith(" 1"), (
+            "El resumen no cuenta la fila inconsistente: " + repr(resumen)
+        )
+
+        vencidas = [
+            linea for linea in texto.splitlines()
+            if "Latido vencido (sin tocar)" in linea
+        ]
+
+        assert vencidas and vencidas[0].rstrip().endswith(" 1"), (
+            "El resumen no cuenta la ejecución con latido vencido: "
+            + repr(vencidas)
+        )
+        assert fila_de(raiz, "T-0911")["estado"] == str(Estado.EN_EJECUCION)
+
+        # Y lo que dice es verdad: la inconsistente no se tocó y la huérfana
+        # sí se recuperó en la base.
+        assert fila_de(raiz, "T-0909")["estado"] == str(Estado.EN_EJECUCION)
+        assert fila_de(raiz, "T-0910")["estado"] == str(Estado.REABIERTO)
+
+        # Una persona resuelve lo pendiente y la siguiente reanudación no
+        # deja nada que mirar: entonces sí, 0.
+        nucleo.reabrir(raiz, "T-0909", "Fila incompleta revisada a mano.")
+        nucleo.reabrir(raiz, "T-0911", "Trabajador remoto dado por perdido.")
+        METRICAS["OPERACIONES"] += 2
+        METRICAS["ACEPTADAS"] += 2
+
+        limpia = io.StringIO()
+
+        with contextlib.redirect_stdout(limpia):
+            codigo = consola.principal(
+                ["--raiz", str(raiz), "--sin-git", "reanudar"]
+            )
+
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        assert codigo == 0, (
+            "reanudar sin nada pendiente devolvió " + str(codigo) + ":\n"
+            + limpia.getvalue()
+        )
+        assert "INCONSISTENTES" not in limpia.getvalue()
+        assert "LATIDO VENCIDO" not in limpia.getvalue()
+
+        comprobar_integridad(raiz)
+    finally:
+        borrar(raiz)
+
+    print("OK")
+
 
 COMPROBACIONES = (
     prueba_a_dos_ordenes_validas_no_se_pisan,
@@ -3519,6 +4470,9 @@ COMPROBACIONES = (
     prueba_ae_el_latido_no_puede_retroceder_la_marca_de_vida,
     prueba_af_dos_decisiones_humanas_no_se_pisan,
     prueba_ag_el_espejo_no_borra_lo_que_escribe_una_persona,
+    prueba_ah_el_latido_toma_el_instante_con_el_candado_pedido,
+    prueba_ai_un_espejo_que_falla_no_tumba_la_recuperacion,
+    prueba_aj_la_consola_muestra_lo_que_reanudar_informa,
 )
 
 

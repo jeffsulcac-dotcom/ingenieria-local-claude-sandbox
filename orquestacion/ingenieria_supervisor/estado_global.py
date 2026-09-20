@@ -148,6 +148,12 @@ MOTIVO_SIN_PROPIETARIO = "sin_propietario"
 MOTIVO_OTRO_PROPIETARIO = "otro_propietario"
 MOTIVO_GENERACION_VENCIDA = "generacion_vencida"
 MOTIVO_ESTADO_INCOMPATIBLE = "estado_incompatible"
+# La fila sigue siendo del mismo dueño, generación y estado, pero una
+# columna sobre la que la orden DECIDIÓ cambió entre su lectura y su
+# escritura (A3.3, `exigir_iguales`), o la marca que traía es más vieja que
+# la grabada (`exigir_no_retroceso`).
+MOTIVO_PRECONDICION_CAMBIADA = "precondicion_cambiada"
+MOTIVO_MARCA_MAS_NUEVA = "marca_mas_nueva"
 
 # Migraciones versionadas. Cada versión es una lista de sentencias que se
 # aplican dentro de una única transacción. Nunca se edita una versión ya
@@ -1100,6 +1106,10 @@ def resumen_de_corrida(corrida: dict | None) -> dict | None:
         "commit": corrida.get("commit"),
         "commit_final": corrida.get("commit_final"),
         "arbol_estable": corrida.get("arbol_estable"),
+        # Si había cambios sin confirmar, el commit no contiene lo que se
+        # ejecutó. Se guarda para que la evidencia no diga «commit X en
+        # verde» a secas.
+        "sin_confirmar": corrida.get("sin_confirmar"),
         # A QUIÉN pertenece esta verificación. `ultima_verificacion`
         # sobrevive a `reabrir`, a `reanudar` y a una retoma, así que sin
         # esto el tablero seguía enseñando el verde de una ejecución muerta
@@ -1734,6 +1744,8 @@ def actualizar_si_propietario(
         generacion,
         momento,
         estados,
+        exigir_iguales=exigir_iguales,
+        exigir_no_retroceso=exigir_no_retroceso,
     )
 
 
@@ -1744,6 +1756,8 @@ def rechazo_propiedad(
     generacion: int,
     momento: str,
     estados_admitidos=None,
+    exigir_iguales=None,
+    exigir_no_retroceso=None,
 ) -> dict:
     """
     Describe por qué se rechaza una orden del ciclo, con un formato único.
@@ -1752,6 +1766,13 @@ def rechazo_propiedad(
     son fallos distintos. El segundo es el caso del MISMO trabajador que
     vuelve a tomar la tarea, y es justo el que un control por identidad
     dejaría pasar.
+
+    Las precondiciones de A3.3 también se describen. Sin esto, un rechazo
+    por `exigir_iguales` —el dueño latió mientras la recuperación decidía—
+    caía en «estado incompatible» con un detalle que se contradecía a sí
+    mismo («está en en_ejecucion, que no admite esta orden; la admiten:
+    en_ejecucion»), y eso era lo que la consola le enseñaba al operador
+    bajo el rótulo de «reclamada».
     """
     base = {
         "resultado": ESCRITURA_RECHAZADA,
@@ -1813,6 +1834,58 @@ def rechazo_propiedad(
         )
 
         return base
+
+    if estados_admitidos and str(fila["estado"]) not in {
+        str(uno) for uno in estados_admitidos
+    }:
+        base.update(
+            {
+                "motivo": MOTIVO_ESTADO_INCOMPATIBLE,
+                "detalle": "La tarea '" + str(identificador) + "' está en "
+                "estado '" + str(fila["estado"]) + "', que no admite esta "
+                "orden. La admiten: " + ", ".join(estados_admitidos) + ".",
+            }
+        )
+
+        return base
+
+    for columna, valor in (exigir_iguales or {}).items():
+        actual = fila.get(columna)
+
+        if actual != valor:
+            base.update(
+                {
+                    "motivo": MOTIVO_PRECONDICION_CAMBIADA,
+                    "detalle": "La columna '" + str(columna) + "' de '"
+                    + str(identificador) + "' cambió entre la lectura y la "
+                    "escritura de esta orden (era " + repr(valor)
+                    + ", ahora " + repr(actual) + ")"
+                    + (
+                        ": el propietario dio señal de vida entre medias"
+                        if columna == "ultimo_latido"
+                        else ": otra orden legítima escribió entre medias"
+                    )
+                    + ". No se modificó nada.",
+                }
+            )
+
+            return base
+
+    for columna, valor in (exigir_no_retroceso or {}).items():
+        actual = fila.get(columna)
+
+        if actual is not None and valor is not None and actual > valor:
+            base.update(
+                {
+                    "motivo": MOTIVO_MARCA_MAS_NUEVA,
+                    "detalle": "La columna '" + str(columna) + "' de '"
+                    + str(identificador) + "' ya tiene una marca más nueva ("
+                    + repr(actual) + ") que la que traía esta orden ("
+                    + repr(valor) + "). No se modificó nada.",
+                }
+            )
+
+            return base
 
     base.update(
         {

@@ -50,6 +50,7 @@ Este módulo no realiza cálculos de ingeniería.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import socket
 import sqlite3
@@ -1035,12 +1036,70 @@ def entorno_git_limpio() -> dict:
     return entorno
 
 
-def arboles_registrados(raiz: Path) -> set:
+def _identidad_de_arbol(ruta: Path) -> tuple:
     """
-    Los worktrees que Git reconoce para este repositorio, ya resueltos.
+    (raíz del checkout, directorio común) que `git` ve desde DENTRO de
+    `ruta`; (None, None) si no puede contestar desde ahí (una carpeta
+    corriente, un `.git` roto, un repositorio bare, un volumen que no
+    responde).
+
+    Con el entorno saneado y sin memorizar, por lo mismo que
+    `arboles_registrados`: es una decisión de seguridad. No reutiliza
+    `estado_global.git_common_dir` a propósito: aquélla memoriza por
+    proceso y lanza sus propios errores; aquí una respuesta dudosa tiene
+    que valer «no», no «lo que se recordaba».
+    """
+    try:
+        resultado = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel", "--git-common-dir"],
+            cwd=str(ruta),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=entorno_git_limpio(),
+        )
+    except OSError:
+        return (None, None)
+
+    if resultado.returncode != 0:
+        return (None, None)
+
+    lineas = [linea for linea in resultado.stdout.splitlines() if linea.strip()]
+
+    if len(lineas) < 2:
+        return (None, None)
+
+    def resolver(texto: str) -> Path | None:
+        camino = Path(texto.strip())
+
+        if not camino.is_absolute():
+            camino = Path(ruta) / camino
+
+        try:
+            return camino.resolve()
+        except OSError:
+            return None
+
+    return (resolver(lineas[0]), resolver(lineas[1]))
+
+
+def _inventario_de_arboles(raiz: Path) -> tuple:
+    """
+    Lo que `git worktree list --porcelain` conoce, ya resuelto y en dos
+    montones: los árboles UTILIZABLES y los que Git lista pero no sirven,
+    con el motivo.
 
     Es la lista canónica: la que `git worktree list` imprime, la misma que
     ve una persona. Incluye el árbol principal.
+
+    Git sigue listando una entrada cuyo directorio o cuyo `.git` ya no
+    están, y la marca `prunable` con el motivo; y un repositorio `bare`
+    figura sin árbol de trabajo. Ninguna de las dos vale como destino de
+    una ejecución. La línea `prunable` se ignoraba: un worktree borrado con
+    `rm -rf` y vuelto a crear como carpeta corriente —sin `.git`, con una
+    prueba verde dentro— se aceptaba, `git` no podía leer ahí ni rama ni
+    commit, y `verificar` corría igual grabando los dos vacíos.
 
     Se pregunta a Git cada vez, sin memorizar. Es una invocación por
     validación —no cientos—, y una decisión de seguridad no debe depender
@@ -1069,22 +1128,60 @@ def arboles_registrados(raiz: Path) -> set:
             + (resultado.stderr or "").strip()
         )
 
-    arboles = set()
+    utilizables = set()
+    descartados = {}
 
-    for linea in resultado.stdout.splitlines():
-        if not linea.startswith("worktree "):
+    # El formato porcelain va por bloques separados por una línea en
+    # blanco: `worktree <ruta>` primero y después sus atributos (`HEAD`,
+    # `branch`, `detached`, `bare`, `locked`, `prunable [motivo]`).
+    bloque = []
+
+    for linea in resultado.stdout.splitlines() + [""]:
+        if linea:
+            bloque.append(linea)
             continue
 
-        declarada = Path(linea[len("worktree "):])
+        if not bloque:
+            continue
+
+        ruta_declarada = None
+        motivo = None
+
+        for atributo in bloque:
+            if atributo.startswith("worktree "):
+                # Sin recortar: un nombre que termina en espacio es legal.
+                ruta_declarada = atributo[len("worktree "):]
+            elif atributo == "bare":
+                motivo = "es un repositorio bare, sin árbol de trabajo"
+            elif atributo.startswith("prunable"):
+                detalle = atributo[len("prunable"):].strip()
+                motivo = "Git la marca como prunable" + (
+                    " (" + detalle + ")" if detalle else ""
+                )
+
+        bloque = []
+
+        if ruta_declarada is None:
+            continue
 
         try:
-            arboles.add(declarada.resolve())
+            resuelta = Path(ruta_declarada).resolve()
         except OSError:
             # Un worktree listado pero irresoluble no sirve como destino;
             # tampoco es motivo para tumbar la validación de los demás.
             continue
 
-    return arboles
+        if motivo is None:
+            utilizables.add(resuelta)
+        else:
+            descartados[resuelta] = motivo
+
+    return utilizables, descartados
+
+
+def arboles_registrados(raiz: Path) -> set:
+    """Los worktrees UTILIZABLES que Git reconoce para este repositorio."""
+    return _inventario_de_arboles(raiz)[0]
 
 
 def resolver_worktree(raiz: Path, declarado: str | None) -> Path:
@@ -1116,6 +1213,15 @@ def resolver_worktree(raiz: Path, declarado: str | None) -> Path:
       con una sola prueba verde dentro bastaba para llegar a PROPUESTO
       saltándose la batería entera.
 
+      Dos cosas más que la lista sola no cubre (revisión final de A3.3):
+      una entrada `prunable` —el directorio o su `.git` desaparecieron— o
+      `bare` no vale aunque Git la liste; y el árbol que hay en la ruta
+      tiene que responder por ESTE repositorio (`git rev-parse
+      --git-common-dir` desde dentro). Git sólo comprueba que
+      `<ruta>/.git` exista, así que una ruta que este repositorio registró
+      y borró, y que OTRO repositorio reutilizó después para un worktree
+      suyo, sigue en la lista como válida con el checkout del otro.
+
     Sobre las rutas, que es donde se esconden los disgustos:
 
     - Una ruta RELATIVA se interpreta contra `raiz`, nunca contra el
@@ -1138,7 +1244,15 @@ def resolver_worktree(raiz: Path, declarado: str | None) -> Path:
     if declarado is None or not str(declarado).strip():
         return Path(raiz).resolve()
 
-    candidato = Path(str(declarado)).expanduser()
+    try:
+        candidato = Path(str(declarado)).expanduser()
+    except RuntimeError as error:
+        # `~usuario` de un usuario que no existe: pathlib lanza RuntimeError
+        # y salía como traceback con código 1, no como ruta inválida (6).
+        raise ErrorWorktree(
+            "No se pudo expandir '~' en la ruta del worktree '"
+            + str(declarado) + "': " + str(error)
+        ) from None
 
     if not candidato.is_absolute():
         if candidato.drive or candidato.root:
@@ -1194,7 +1308,15 @@ def resolver_worktree(raiz: Path, declarado: str | None) -> Path:
     if candidato == propia:
         return candidato
 
-    registrados = arboles_registrados(raiz)
+    registrados, descartados = _inventario_de_arboles(raiz)
+
+    if candidato in descartados:
+        raise ErrorWorktree(
+            "La ruta '" + str(candidato) + "' figura en la lista de "
+            "worktrees de Git, pero no es utilizable: "
+            + descartados[candidato] + ". Repárala (`git worktree repair`) "
+            "o retírala (`git worktree prune`) antes de declararla."
+        )
 
     if candidato not in registrados:
         raise ErrorWorktree(
@@ -1202,6 +1324,47 @@ def resolver_worktree(raiz: Path, declarado: str | None) -> Path:
             "de este repositorio. Git conoce estos: "
             + (", ".join(sorted(str(uno) for uno in registrados)) or "ninguno")
             + ". No se ejecuta una ruta ajena por el hecho de que exista."
+        )
+
+    # Y que el árbol que HAY AHÍ sea un checkout de este repositorio con
+    # la raíz justo en esa ruta. La lista de Git no lo garantiza: Git sólo
+    # comprueba que `<ruta>/.git` exista, así que si otro repositorio
+    # registra un worktree en una ruta que aquí se había registrado y
+    # borrado, esta lista la sigue dando por buena y el checkout es del
+    # otro. Reproducido: `verificar` habría corrido las pruebas del otro
+    # proyecto y grabado SU rama y SU commit como evidencia de esta tarea.
+    # Y si el `.git` de un worktree anidado en la raíz desaparece, `git`
+    # desde dentro SUBE y responde por la raíz: rama y commit de main
+    # sobre las pruebas del worktree. Comparar el directorio común no
+    # bastaba SOLO —un `.git` copiado lo declara igual—; junto con la
+    # lista y la raíz del checkout, sí: la lista descarta la copia, el
+    # directorio común descarta la ruta reutilizada y la raíz descarta el
+    # directorio que responde por otro árbol.
+    raiz_candidato, comun_candidato = _identidad_de_arbol(candidato)
+    _, comun_propio = _identidad_de_arbol(propia)
+
+    if raiz_candidato is None or comun_candidato is None:
+        raise ErrorWorktree(
+            "La ruta '" + str(candidato) + "' está registrada como "
+            "worktree, pero Git no responde desde dentro de ella: no hay "
+            "ahí un checkout que se pueda ejecutar."
+        )
+
+    if raiz_candidato != candidato:
+        raise ErrorWorktree(
+            "La ruta '" + str(candidato) + "' está registrada como "
+            "worktree, pero el árbol que Git ve desde ahí tiene su raíz en '"
+            + str(raiz_candidato) + "': no es un checkout propio y su rama "
+            "y su commit serían los de otro árbol."
+        )
+
+    if comun_propio is None or comun_candidato != comun_propio:
+        raise ErrorWorktree(
+            "La ruta '" + str(candidato) + "' está registrada como "
+            "worktree, pero el árbol que hay ahí responde por otro "
+            "repositorio (directorio común " + str(comun_candidato)
+            + " frente a " + str(comun_propio) + "). No se ejecuta un "
+            "árbol ajeno."
         )
 
     return candidato
@@ -1280,6 +1443,28 @@ class Git:
             return False
 
         return bool(resultado.stdout.strip())
+
+    def huella_de_cambios(self) -> str | None:
+        """
+        Resumen (SHA-1) de TODO lo que difiere de HEAD en archivos
+        versionados, preparado o no. None si Git no puede responder.
+
+        Comparar sólo «¿hay cambios sin confirmar?» antes y después de la
+        corrida no detectaba que el CONTENIDO cambiara a mitad: un archivo
+        editado antes de correr y vuelto a editar durante la batería daba
+        `True == True` y pasaba por «árbol quieto». La huella cambia con
+        cualquier edición de un archivo versionado; los archivos sin
+        versionar siguen fuera, por lo mismo que en
+        `hay_cambios_sin_confirmar`.
+        """
+        resultado = self._ejecutar(
+            "diff", "HEAD", "--no-ext-diff", "--no-color", "--"
+        )
+
+        if resultado.returncode != 0:
+            return None
+
+        return hashlib.sha1(resultado.stdout.encode("utf-8")).hexdigest()
 
     def commit_ficha(self, identificador: str, mensaje: str) -> dict:
         """
@@ -1615,8 +1800,6 @@ def tomar(
         str(resolver_worktree(raiz, worktree)) if worktree else None
     )
 
-    momento = (ahora or ahora_datetime()).isoformat(timespec="seconds")
-
     aspirante = trabajador_id or nuevo_trabajador_id()
     proceso = pid if pid is not None else os.getpid()
 
@@ -1647,6 +1830,12 @@ def tomar(
         global_.sincronizar_lista(con, definiciones, solo_importar=True)
 
         with global_.transaccion(con):
+            # El instante de la toma —que es también el primer latido— se
+            # toma con el candado ya pedido, por lo mismo que en el latido
+            # automático: `BEGIN IMMEDIATE` puede esperar segundos bajo
+            # contención y una marca tomada antes nacería ya rancia.
+            momento = (ahora or ahora_datetime()).isoformat(timespec="seconds")
+
             filas = global_.listar_tareas(con)
 
             # Estado previo tal como lo ve ESTA transacción. Sólo sirve
@@ -1818,10 +2007,11 @@ def latido(
 
     Es una orden manual. Los latidos automáticos pertenecen a A3.3/B.
 
-    A3.2: sólo la escribe el propietario VIGENTE. Un latido rezagado del
-    dueño anterior es el caso más peligroso de todos, porque `persistir`
-    reescribe también `trabajador_id`, `pid` e `iniciado_en`: sin condición
-    resucitaría a un propietario ya desplazado.
+    A3.2: sólo la escribe el propietario VIGENTE, con identidad, generación
+    y estado EN_EJECUCION en el WHERE. A3.3: escribe únicamente
+    `ultimo_latido` (`CAMPOS_LATIDO`); un latido rezagado del dueño
+    anterior se rechaza por la generación, y aunque entrara no podría
+    tocar la identidad de nadie.
     """
     ficha = cargar(raiz, identificador)
 
@@ -1979,9 +2169,33 @@ def verificar(
     rama_inicio = testigo.rama_actual()
     commit_inicio = testigo.hash_actual()
     sucio_inicio = testigo.hay_cambios_sin_confirmar()
+    huella_inicio = testigo.huella_de_cambios()
 
-    with acompanante:
-        corrida = corredor.ejecutar_todas(arbol, tiempo_limite_s, ejecutable)
+    try:
+        with acompanante:
+            corrida = corredor.ejecutar_todas(
+                arbol, tiempo_limite_s, ejecutable
+            )
+    except OSError as error:
+        # El corredor lanza cada prueba con `cwd=arbol`. Si el árbol
+        # desaparece ENTRE dos pruebas —`git worktree remove --force` de
+        # otra persona, una unidad extraíble—, `subprocess` falla con
+        # FileNotFoundError y eso salía como traceback de Python con
+        # código 1, no como el código 6 que la consola promete para un
+        # árbol que no vale. La tarea sigue EN_EJECUCION y nada se graba,
+        # igual que cuando el árbol se mueve.
+        if not Path(arbol).is_dir():
+            raise ErrorWorktree(
+                "El árbol '" + str(arbol) + "' desapareció MIENTRAS corrían "
+                "las pruebas (" + type(error).__name__ + ": " + str(error)
+                + "). El resultado no corresponde a ningún estado concreto "
+                "del árbol, así que no se graba."
+            ) from None
+
+        raise ErrorSupervisor(
+            "No se pudieron lanzar las pruebas en '" + str(arbol) + "': "
+            + type(error).__name__ + ": " + str(error)
+        ) from None
 
     # Si durante la corrida la tarea cambió de manos, el acompañante lo
     # detectó antes que nadie. Se dice aquí y no se disimula: el resultado
@@ -2014,6 +2228,7 @@ def verificar(
     rama_fin = testigo.rama_actual()
     commit_fin = testigo.hash_actual()
     sucio_fin = testigo.hay_cambios_sin_confirmar()
+    huella_fin = testigo.huella_de_cambios()
 
     corrida["rama"] = rama_inicio
     corrida["commit"] = commit_inicio
@@ -2021,12 +2236,21 @@ def verificar(
     corrida["generacion"] = esperada
     corrida["trabajador_id"] = propietario
 
+    # Si el árbol tenía cambios sin confirmar, el commit grabado NO contiene
+    # lo que se ejecutó, y quien audite después tiene que verlo: antes se
+    # calculaba, se usaba para comparar y se tiraba, y la evidencia decía
+    # «commit X en verde» a secas.
+    corrida["sin_confirmar"] = bool(sucio_inicio)
+
     # Un árbol que cambió a mitad invalida la corrida entera: no se sabe qué
     # se ejecutó. Se dice, y no se graba un verde que nadie puede reproducir.
+    # La huella compara el CONTENIDO de lo no confirmado, no sólo si lo hay:
+    # un archivo editado a mitad en un árbol que ya estaba sucio daba
+    # «sucio antes, sucio después» y pasaba por quieto.
     corrida["arbol_estable"] = (
         commit_inicio == commit_fin
         and rama_inicio == rama_fin
-        and sucio_inicio == sucio_fin
+        and huella_inicio == huella_fin
     )
 
     if not corrida["arbol_estable"]:
@@ -2037,6 +2261,11 @@ def verificar(
                                     if sucio_inicio else "")
             + "; después: " + str(rama_fin) + " @ " + str(commit_fin)
             + (", con cambios sin confirmar" if sucio_fin else "")
+            + (
+                "; el contenido sin confirmar cambió"
+                if commit_inicio == commit_fin and rama_inicio == rama_fin
+                else ""
+            )
             + "). El resultado no corresponde a ningún estado concreto del "
             "árbol, así que no se graba. Repite la verificación con el "
             "árbol quieto."
@@ -2214,6 +2443,7 @@ def verificar(
         "commit": corrida["commit"],
         "commit_final": corrida["commit_final"],
         "arbol_estable": corrida["arbol_estable"],
+        "sin_confirmar": corrida["sin_confirmar"],
     }
 
 
@@ -2523,13 +2753,17 @@ class LatidoAutomatico:
             con = global_.abrir(global_.ruta_base(self.raiz))
 
             try:
-                # El instante se toma con el candado ya pedido y no antes:
-                # bajo contención, `busy_timeout` puede hacer esperar
-                # segundos, y grabar una marca tomada antes de esa espera
-                # equivale a registrar una señal de vida ya rancia.
-                momento = self._reloj()
-
                 with global_.transaccion(con):
+                    # El instante se toma con el candado ya pedido y no
+                    # antes: bajo contención, `BEGIN IMMEDIATE` puede
+                    # esperar hasta `busy_timeout` (segundos), y grabar una
+                    # marca tomada antes de esa espera equivale a registrar
+                    # una señal de vida ya rancia. La lectura del reloj
+                    # estuvo FUERA de este bloque mientras el comentario
+                    # decía lo contrario; la comprobación 33 lee ahora el
+                    # orden real: BEGIN, reloj, UPDATE.
+                    momento = self._reloj()
+
                     informe = global_.actualizar_si_propietario(
                         con,
                         self.identificador,
@@ -2571,7 +2805,20 @@ class LatidoAutomatico:
             # Un rechazo por la guarda de monotonía NO es perder la tarea:
             # significa que ya hay una marca igual o más nueva, que es
             # exactamente lo que el latido quería conseguir.
-            if self._sigue_siendo_mio():
+            mia = self._sigue_siendo_mio()
+
+            if mia is None:
+                # No se pudo COMPROBAR, que no es lo mismo que haberla
+                # perdido. Tratarlo como pérdida hacía que `verificar`
+                # tirase una batería entera por un `database is locked` en
+                # esta relectura, con un diagnóstico falso. Cuenta como un
+                # fallo transitorio más, con el mismo límite.
+                self.fallos_seguidos += 1
+                self.fallos_totales += 1
+
+                return self.fallos_seguidos < FALLOS_LATIDO_SEGUIDOS
+
+            if mia:
                 self.retrocesos += 1
 
                 return True
@@ -2586,12 +2833,14 @@ class LatidoAutomatico:
 
         return True
 
-    def _sigue_siendo_mio(self) -> bool:
+    def _sigue_siendo_mio(self):
         """
         Relee la fila para distinguir «reloj atrasado» de «perdí la tarea».
 
-        Sólo se llama tras un rechazo, que es raro: no está en el camino
-        normal del latido.
+        Devuelve True, False, o None si no se pudo leer: un error de lectura
+        no demuestra nada sobre la propiedad, y quien llama lo trata como
+        fallo transitorio. Sólo se llama tras un rechazo, que es raro: no
+        está en el camino normal del latido.
         """
         try:
             con = global_.abrir(global_.ruta_base(self.raiz))
@@ -2600,8 +2849,10 @@ class LatidoAutomatico:
                 fila = global_.obtener_tarea(con, self.identificador)
             finally:
                 con.close()
-        except Exception:
-            return False
+        except Exception as error:
+            self.error = type(error).__name__ + ": " + str(error)
+
+            return None
 
         if fila is None:
             return False
@@ -2792,17 +3043,20 @@ def clasificar_ejecucion(
     """
     Clasifica una tarea EN_EJECUCION como ACTIVA, HUERFANA o INCONSISTENTE.
 
-    Nunca se juzga por UNA sola señal, ni por el PID ni por el latido:
+    Nunca se juzga por UNA sola señal, ni por el PID ni por el latido, y
+    ningún umbral decide solo:
 
-    - un latido vencido NO basta por sí solo: hace falta confirmarlo con el
-      proceso, o que la antigüedad pase del umbral de abandono, que es
-      holgado a propósito. Si no, se devuelve LATIDO_VENCIDO, que informa
-      sin arrebatar;
+    - un latido vencido NO basta por sí solo: HUÉRFANA exige además el
+      proceso local confirmado muerto. Con el proceso vivo se devuelve
+      LATIDO_VENCIDO, que informa sin arrebatar; el umbral de abandono
+      sólo añade al motivo que el latido probablemente murió;
     - la desaparición del proceso sólo cuenta si además el latido dejó de
-      ser reciente, porque el proceso que reclamó la tarea puede haber sido
-      un mandato breve de línea de comandos ya terminado;
-    - si la ficha proviene de otro equipo, el PID local carece de sentido y
-      se juzga únicamente por el latido.
+      ser reciente (margen de cortesía), porque el proceso que reclamó la
+      tarea puede haber sido un mandato breve de línea de comandos ya
+      terminado. Para una toma desde la consola ésa es la ventana real;
+    - si la ficha proviene de OTRO equipo, el PID local carece de sentido
+      y no hay segunda señal posible: con latido reciente es ACTIVA y con
+      latido vencido es LATIDO_VENCIDO, nunca HUÉRFANA. Decide una persona.
     """
     if (
         not ficha.trabajador_id
@@ -2955,9 +3209,14 @@ def reanudar(
     Ninguna tarea se pierde: las ejecuciones interrumpidas se registran como
     tales, conservando el historial, y la tarea vuelve a REABIERTO.
 
-    A2: es una orden manual que juzga por PID y por el latido registrado.
-    La detección avanzada de trabajadores huérfanos y los latidos
-    automáticos pertenecen a A3/B.
+    Sigue siendo una orden manual. A3.3: clasifica cada ejecución con
+    `clasificar_ejecucion` (nunca con una sola señal); libera sólo las
+    HUÉRFANAS, exigiendo en el WHERE la generación y el latido sobre el
+    que decidió (`exigir_iguales`); deja sin tocar, informándolas, las
+    ACTIVAS, las de LATIDO_VENCIDO y las INCONSISTENTES; avisa del
+    worktree ausente de toda ejecución revisada; y un fallo del espejo de
+    una tarea no detiene la pasada. El lanzamiento y la expiración
+    automática de trabajadores siguen siendo de C.
     """
     ahora = ahora or ahora_datetime()
 
@@ -2974,10 +3233,11 @@ def reanudar(
         # Ejecuciones con el latido caducado que NO se recuperan porque no
         # están demostradas muertas (A3.3).
         "latido_vencido": [],
-        # Tareas cuyo worktree registrado ya no resuelve (A3.3). No se
-        # borra el dato: el árbol puede volver (una unidad desconectada,
-        # un `git worktree` que se rehace). Se avisa, que es lo que una
-        # persona necesita para decidir.
+        # Ejecuciones cuyo worktree registrado ya no resuelve (A3.3), se
+        # toquen o no: también las ACTIVAS y las de latido vencido. La ruta
+        # se conserva en el informe y en el evento de recuperación; en la
+        # fila se suelta con el turno, porque el árbol pertenece a la
+        # ejecución y no a la tarea.
         "worktree_ausente": [],
         # Filas en ejecución con la identidad incompleta (A3.3). NO se
         # liberan: una fila rota no demuestra que el trabajador esté
@@ -3044,6 +3304,26 @@ def reanudar(
             latido_gracia_s,
             latido_abandono_s,
         )
+
+        # El árbol se comprueba para TODA ejecución revisada, se toque o no
+        # la fila. Antes sólo se miraba en las que se liberaban, así que una
+        # ejecución ACTIVA o con el latido vencido cuyo worktree había
+        # desaparecido no se avisaba: `reanudar` decía «sigue activa» y
+        # nada más, y la persona que tenía que decidir no recibía justo el
+        # dato que necesitaba. Es sólo informar: no cambia nada de la fila.
+        if ficha.worktree:
+            try:
+                resolver_worktree(raiz, ficha.worktree)
+            except ErrorWorktree as problema:
+                informe["worktree_ausente"].append(
+                    {
+                        "id": ficha.id,
+                        "titulo": ficha.titulo,
+                        "worktree": ficha.worktree,
+                        "clase": clase,
+                        "motivo": str(problema),
+                    }
+                )
 
         if clase == CLASE_ACTIVA:
             informe["activas"].append(
@@ -3127,7 +3407,6 @@ def reanudar(
         # Se guarda ANTES de liberar: es la prueba de vida sobre la que se
         # tomó la decisión, y tiene que viajar en el WHERE de la escritura.
         latido_juzgado = ficha.ultimo_latido
-        arbol_juzgado = ficha.worktree
 
         _liberar_trabajador(ficha)
 
@@ -3164,13 +3443,18 @@ def reanudar(
                 }
             )
             continue
-
-        try:
-            _registrar_en_git(git, ficha, "Recuperación tras interrupción.")
         except ErrorSupervisor as problema:
-            # La base ya está bien; lo que falló es el espejo en disco. Se
-            # anota y se sigue: abortar aquí dejaba sin revisar todas las
-            # tareas que venían detrás, que es un daño mayor.
+            # La base YA quedó confirmada: `persistir` sólo lanza
+            # ErrorSupervisor después del COMMIT, cuando no puede regenerar
+            # el espejo JSON (sus validaciones previas no dependen de la
+            # fila y con estos argumentos fijos no pueden fallar; un error
+            # de SQLite es ErrorEstadoGlobal y sí aborta, porque entonces
+            # la base no está bien). Se anota y se sigue: abortar aquí
+            # dejaba sin revisar todas las tareas que venían detrás, y
+            # ésta, recuperada en la base, sin figurar en el informe.
+            # Reproducido en la revisión final: el `except` estaba puesto
+            # alrededor de `_registrar_en_git`, que ni regenera el espejo
+            # ni lanza ErrorSupervisor, así que no protegía nada.
             informe["espejo_no_regenerado"].append(
                 {
                     "id": ficha.id,
@@ -3178,6 +3462,8 @@ def reanudar(
                     "motivo": str(problema),
                 }
             )
+        else:
+            _registrar_en_git(git, ficha, "Recuperación tras interrupción.")
 
         destino = (
             informe["huerfanas"]
@@ -3193,22 +3479,6 @@ def reanudar(
                 "estado_nuevo": str(ficha.estado),
             }
         )
-
-        # La tarea ya está recuperada; lo que sigue es sólo informar. Se
-        # comprueba después de persistir para no dejar sin recuperar una
-        # tarea por un problema de su árbol: son cosas independientes.
-        if arbol_juzgado:
-            try:
-                resolver_worktree(raiz, arbol_juzgado)
-            except ErrorWorktree as problema:
-                informe["worktree_ausente"].append(
-                    {
-                        "id": ficha.id,
-                        "titulo": ficha.titulo,
-                        "worktree": arbol_juzgado,
-                        "motivo": str(problema),
-                    }
-                )
 
     return informe
 
@@ -3283,6 +3553,9 @@ def resumen_de_tarea(fila: dict, definicion: Ficha | None) -> dict:
         "verificacion_rama": (
             verificacion.get("rama") if verificacion else None
         ),
+        "verificacion_sin_confirmar": (
+            bool(verificacion.get("sin_confirmar")) if verificacion else None
+        ),
         "verificacion_fecha": (
             verificacion.get("fecha") if verificacion else None
         ),
@@ -3317,17 +3590,27 @@ def resumen_de_tarea(fila: dict, definicion: Ficha | None) -> dict:
     }
 
 
-def _resumen_ilegible(fila: dict) -> dict:
+def _entero_o_cero(valor) -> int:
+    try:
+        return int(valor or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _resumen_ilegible(fila: dict, definicion: Ficha | None = None) -> dict:
     """
     Tarjeta mínima para una fila que no se pudo interpretar.
 
     Se muestra igual, diciendo la verdad, en vez de hacer desaparecer el
-    tablero entero por una fila mala.
+    tablero entero por una fila mala. Y la verdad incluye que el JSON
+    puede estar perfectamente bien: `definicion_legible` habla del archivo
+    y `fila_legible` de la base, y antes la tarjeta culpaba al archivo e
+    inventaba «0 / 0» intentos.
     """
     return {
         "id": str(fila.get("id") or "?"),
         "titulo": str(fila.get("titulo") or "(sin título)"),
-        "objetivo": "",
+        "objetivo": definicion.objetivo if definicion else "",
         "estado": str(fila.get("estado") or ""),
         "vitalidad": None,
         "vitalidad_motivo": "La fila de la base no se pudo interpretar.",
@@ -3336,12 +3619,13 @@ def _resumen_ilegible(fila: dict) -> dict:
         "verificacion_raiz": None,
         "verificacion_commit": None,
         "verificacion_rama": None,
+        "verificacion_sin_confirmar": None,
         "verificacion_fecha": None,
         "verificacion_vigente": None,
         "rama": fila.get("rama"),
         "worktree": fila.get("worktree"),
-        "intentos": 0,
-        "max_intentos": 0,
+        "intentos": _entero_o_cero(fila.get("intentos")),
+        "max_intentos": _entero_o_cero(fila.get("max_intentos")),
         "pruebas_ok": 0,
         "pruebas_total": 0,
         "pruebas_requeridas": [],
@@ -3360,7 +3644,7 @@ def _resumen_ilegible(fila: dict) -> dict:
         "ultima_verificacion": None,
         "commit_inicial": fila.get("commit_inicial"),
         "definicion_ruta": fila.get("definicion_ruta"),
-        "definicion_legible": False,
+        "definicion_legible": definicion is not None,
         "fila_legible": False,
     }
 
@@ -3465,13 +3749,19 @@ def tablero(raiz: Path, maximo_actividad: int = 20) -> dict:
             # las demás se ven.
             errores.append(
                 {
-                    "archivo": str(fila.get("definicion_ruta") or fila["id"]),
+                    # Es la FILA de la base la que está mal, no el archivo:
+                    # nombrar aquí la ruta del JSON mandaba a arreglar una
+                    # ficha que estaba bien.
+                    "archivo": "base global, fila de '" + str(fila.get("id"))
+                    + "'",
                     "motivo": "La fila de '" + str(fila.get("id"))
                     + "' no se pudo interpretar: "
                     + type(problema).__name__ + ": " + str(problema),
                 }
             )
-            tareas.append(_resumen_ilegible(fila))
+            tareas.append(
+                _resumen_ilegible(fila, definiciones.get(fila["id"]))
+            )
 
     def contar(estado: Estado) -> int:
         return sum(1 for una in tareas if una["estado"] == str(estado))

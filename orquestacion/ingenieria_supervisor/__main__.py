@@ -163,11 +163,22 @@ def mostrar_tablero(raiz: Path) -> int:
         _linea(
             "Vitalidad",
             ETIQUETAS_VITALIDAD.get(
-                tarea["vitalidad"], str(tarea["vitalidad"])
+                tarea["vitalidad"],
+                "—" if tarea["vitalidad"] is None else str(tarea["vitalidad"]),
             )
             + "  "
             + str(tarea["vitalidad_motivo"]),
         )
+
+        # Una FILA de la base que no se pudo interpretar no es un JSON roto:
+        # decirlo con el rótulo del archivo mandaba al operador a arreglar
+        # una ficha que estaba bien.
+        if tarea.get("fila_legible") is False:
+            _linea(
+                "Fila de la base",
+                "NO LEGIBLE (la definición JSON no es el problema; mira "
+                "la fila en SQLite)",
+            )
 
         verificacion = tarea.get("ultima_verificacion")
 
@@ -197,7 +208,12 @@ def mostrar_tablero(raiz: Path) -> int:
                 + str(tarea["verificacion_rama"])
                 + " @ "
                 + str(tarea["verificacion_commit"])
-                + ")",
+                + ")"
+                + (
+                    "  + CAMBIOS SIN CONFIRMAR"
+                    if tarea.get("verificacion_sin_confirmar")
+                    else ""
+                ),
             )
 
         if not tarea.get("definicion_legible", True):
@@ -369,6 +385,15 @@ def mostrar_ficha(raiz: Path, identificador: str) -> int:
     _linea("PID", ficha.pid)
     _linea("Último latido", ficha.ultimo_latido)
 
+    # Por qué no está en PROPUESTO, cuando no lo está. Sin esto, tras una
+    # prueba requerida ausente `ver` enseñaba «APROBADO OK 1 de 1» y
+    # REQUIERE_REVISION sin ninguna explicación.
+    if ficha.ultima_falla:
+        print("")
+        print("  Última falla:")
+        for problema in (ficha.ultima_falla or {}).get("problemas", []):
+            print("      · " + str(problema))
+
     # Si la ficha declara un ámbito que la base no aplicó por estar la tarea
     # viva, hay que decirlo aquí: quien trabaje la tarea posee lo que la
     # base concedió, no lo que diga el archivo que acaba de editar.
@@ -437,6 +462,30 @@ def mostrar_ficha(raiz: Path, identificador: str) -> int:
                     + str(ejecucion.get("motivo"))
                 )
             else:
+                # Dónde corrió y de qué ejecución es: «8 de 8» a secas no
+                # distingue una corrida en el worktree de la tarea de una
+                # en otro árbol, ni el verde vigente del de una ejecución
+                # que ya no existe.
+                donde = ""
+
+                if ejecucion.get("raiz"):
+                    donde = (
+                        "  en " + str(ejecucion.get("raiz")) + " ("
+                        + str(ejecucion.get("rama")) + " @ "
+                        + str(ejecucion.get("commit")) + ")"
+                        + (
+                            "  + CAMBIOS SIN CONFIRMAR"
+                            if ejecucion.get("sin_confirmar")
+                            else ""
+                        )
+                        + (
+                            "  (DE OTRA EJECUCIÓN)"
+                            if ejecucion.get("generacion") is not None
+                            and ejecucion.get("generacion") != ficha.generacion
+                            else ""
+                        )
+                    )
+
                 print(
                     "      · "
                     + str(ejecucion.get("fecha"))
@@ -446,6 +495,7 @@ def mostrar_ficha(raiz: Path, identificador: str) -> int:
                     + str(ejecucion.get("ok"))
                     + " de "
                     + str(ejecucion.get("total"))
+                    + donde
                 )
 
     print("")
@@ -459,10 +509,15 @@ def mostrar_ficha(raiz: Path, identificador: str) -> int:
 
 def orden_estado(raiz: Path, argumentos) -> int:
     if argumentos.json:
-        print(
-            json.dumps(nucleo.tablero(raiz), ensure_ascii=False, indent=2)
-        )
-        return 0
+        datos = nucleo.tablero(raiz)
+
+        print(json.dumps(datos, ensure_ascii=False, indent=2))
+
+        # Mismo criterio que la salida de texto y que `diagnostico --json`:
+        # si la base no se pudo leer, lo publicado no es el estado real y
+        # el código de salida lo dice. Justo el modo que consume un guion
+        # era el que devolvía 0 con la base en ERROR.
+        return 0 if datos["base_global"]["estado"] == "ACTIVA" else 1
 
     return mostrar_tablero(raiz)
 
@@ -699,6 +754,23 @@ def orden_verificar(raiz: Path, argumentos) -> int:
     # exactamente igual, y la primera deja la tarea sin señal todo el rato.
     print("  Latidos emitidos: " + str(informe.get("latidos")))
 
+    # Dónde corrió: es la funcionalidad central de A3.3 y hasta ahora sólo
+    # se veía ejecutando `estado` después.
+    _linea(
+        "Verificado en",
+        str(informe["raiz"])
+        + ("  (worktree)" if informe["es_worktree"] else "  (la raíz)"),
+    )
+    _linea(
+        "Rama @ commit",
+        str(informe["rama"]) + " @ " + str(informe["commit"])
+        + (
+            "  + CAMBIOS SIN CONFIRMAR"
+            if informe.get("sin_confirmar")
+            else ""
+        ),
+    )
+
     if informe.get("latido_error"):
         print("  AVISO: el latido falló: " + str(informe["latido_error"]))
 
@@ -796,18 +868,38 @@ def orden_reanudar(raiz: Path, argumentos) -> int:
     _linea("Tareas en ejecución revisadas", informe["revisadas"])
     _linea("Siguen activas", len(informe["activas"]))
     _linea("Huérfanas recuperadas", len(informe["huerfanas"]))
-    _linea("Inconsistentes recuperadas", len(informe["inconsistentes"]))
+    # Desde A3.3 una fila incompleta NO se recupera: se informa y decide
+    # una persona. La línea «Inconsistentes recuperadas» salía siempre 0 y
+    # el grupo que sí importa no se imprimía: el operador no podía dar la
+    # orden humana que el motor le pedía, porque no sabía que hacía falta.
+    _linea(
+        "Inconsistentes (sin tocar)", len(informe["inconsistentes_sin_tocar"])
+    )
+    _linea("Latido vencido (sin tocar)", len(informe["latido_vencido"]))
     _linea("Sin definición en este árbol", len(informe["sin_definicion"]))
     _linea("Temporales eliminados", len(informe["temporales_eliminados"]))
 
     for grupo, etiqueta in (
         ("activas", "ACTIVAS"),
         ("huerfanas", "HUÉRFANAS RECUPERADAS"),
-        ("inconsistentes", "INCONSISTENTES RECUPERADAS"),
+        (
+            "inconsistentes_sin_tocar",
+            "INCONSISTENTES (no recuperadas: una fila incompleta no "
+            "demuestra abandono; decide una persona con `reabrir`)",
+        ),
         ("sin_definicion", "SIN DEFINICIÓN EN ESTE ÁRBOL (no modificadas)"),
-        ("reclamadas_mientras_tanto", "RECLAMADAS DURANTE LA RECUPERACIÓN"),
+        (
+            "reclamadas_mientras_tanto",
+            "NO RECUPERADAS: RETOMADAS O CON SEÑAL DE VIDA DURANTE LA "
+            "RECUPERACIÓN",
+        ),
         ("latido_vencido", "LATIDO VENCIDO (no recuperadas: mirar a mano)"),
         ("worktree_ausente", "WORKTREE REGISTRADO QUE YA NO EXISTE"),
+        (
+            "espejo_no_regenerado",
+            "RECUPERADAS EN LA BASE PERO SIN ESPEJO JSON (la siguiente "
+            "orden lo regenera)",
+        ),
     ):
         if informe[grupo]:
             print("")
@@ -823,7 +915,22 @@ def orden_reanudar(raiz: Path, argumentos) -> int:
 
     print("")
 
-    return 0
+    # 1 cuando quedan tareas que piden a una persona: latido vencido, árbol
+    # ausente, fila incompleta, espejo sin regenerar o sin definición en
+    # este árbol. Un guion de arranque no podía distinguir «todo
+    # recuperado» de «hay algo que mirar» sin leer el texto.
+    pendientes_de_persona = any(
+        informe[grupo]
+        for grupo in (
+            "latido_vencido",
+            "worktree_ausente",
+            "inconsistentes_sin_tocar",
+            "espejo_no_regenerado",
+            "sin_definicion",
+        )
+    )
+
+    return 1 if pendientes_de_persona else 0
 
 
 def orden_pruebas(raiz: Path, argumentos) -> int:
@@ -862,7 +969,8 @@ CODIGOS_DE_SALIDA = """\
 Códigos de salida:
   0   la orden se completó.
   1   la orden se completó pero el resultado no es el deseado (por ejemplo,
-      una verificación que no deja la tarea en PROPUESTO).
+      una verificación que no deja la tarea en PROPUESTO, o una
+      reanudación que deja tareas que una persona debe mirar).
   2   error de uso o avería del Supervisor.
   3   toma rechazada: la tarea ya la tiene otro, o su estado no la admite.
   4   orden rechazada por propiedad: identidad, generación o estado no
@@ -1135,6 +1243,19 @@ def principal(argumentos_crudos: list[str] | None = None) -> int:
     ) as error:
         print("")
         print("  ERROR: " + str(error))
+        print("")
+        return 2
+    except Exception as error:
+        # Una avería que no es de las conocidas —una fila de la base que no
+        # se puede interpretar, un error de programación— salía como
+        # traceback en inglés con código 1, que la ayuda define como «se
+        # completó pero el resultado no es el deseado». No se completó: es
+        # el 2, y en español.
+        print("")
+        print(
+            "  AVERÍA DEL SUPERVISOR: " + type(error).__name__ + ": "
+            + str(error)
+        )
         print("")
         return 2
 
