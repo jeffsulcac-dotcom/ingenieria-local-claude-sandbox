@@ -29,7 +29,7 @@ procesos reales lanzados por el despacho, con el Supervisor de ESTE árbol.
 Ejecución por omisión: pensada para terminar muy por debajo del tiempo
 límite del corredor único (120 s). Para más rondas de estrés:
 
-    python pruebas/orquestacion/prueba_trabajadores.py --rondas 10
+    python pruebas/orquestacion/prueba_workers_v1.py --rondas 10
 """
 
 import argparse
@@ -173,8 +173,6 @@ def crear_repositorio(prefijo="trabajadores_") -> Path:
     herramientas.mkdir()
     (herramientas / "trabajo.py").write_text(TRABAJO_DEMO, encoding="utf-8")
     (herramientas / "eco.py").write_text(ECO, encoding="utf-8")
-
-    (raiz / ".gitignore").write_text(".arboles/\n", encoding="utf-8")
 
     fichas.carpeta_tareas(raiz).mkdir(parents=True)
 
@@ -863,11 +861,17 @@ def prueba_04_sin_solapamiento_ambas_progresan():
             contenido = (Path(informe["worktree"]) / cambios[0]).read_text(encoding="utf-8")
             assert "extra " + informe["tarea"] in contenido
 
-        # La raíz no la tocó nadie (salvo el espejo JSON del Supervisor).
+        # La raíz no la tocó nadie (salvo el espejo JSON del Supervisor), y
+        # la zona no aparece como «sin versionar»: el despacho la anota en
+        # `.git/info/exclude`, que es local, sin tocar el `.gitignore`
+        # versionado del proyecto.
         sucio = _git(
             raiz, "status", "--porcelain", "--", ".", ":(exclude)orquestacion/tareas/",
         ).stdout.strip()
         assert sucio == "", sucio
+        exclusion = (raiz / ".git" / "info" / "exclude").read_text(encoding="utf-8")
+        assert "/" + trabajadores.ZONA_ARBOLES + "/" in exclusion.splitlines(), exclusion
+        assert not (raiz / ".gitignore").exists()
 
         # Limpieza: los tres árboles están limpios, sin ejecución, y se van.
         limpieza = trabajadores.limpiar_arboles(raiz)
@@ -1996,7 +2000,7 @@ def imprimir_metricas() -> None:
     print("")
 
 
-def prueba_trabajadores(despachadores: int, rondas: int) -> None:
+def prueba_workers_v1(despachadores: int, rondas: int) -> None:
     print("")
     print("PRUEBA: trabajadores V1 (T-0003)")
     print("")
@@ -2059,17 +2063,17 @@ def prueba_trabajadores(despachadores: int, rondas: int) -> None:
 
     print("  Tiempo: " + str(round(duracion, 2)) + " s")
     print("")
-    print("PRUEBA_TRABAJADORES=OK")
+    print("PRUEBA_WORKERS_V1=OK")
 
 
 def principal() -> int:
-    analizador = argparse.ArgumentParser(description="Pruebas de trabajadores V1 (T-0003).")
+    analizador = argparse.ArgumentParser(description="Pruebas de Workers V1 (T-0003).")
     analizador.add_argument("--rondas", type=int, default=RONDAS_POR_OMISION)
     analizador.add_argument("--despachadores", type=int, default=DESPACHADORES_POR_OMISION)
 
     argumentos = analizador.parse_args()
 
-    prueba_trabajadores(argumentos.despachadores, argumentos.rondas)
+    prueba_workers_v1(argumentos.despachadores, argumentos.rondas)
 
     return 0
 

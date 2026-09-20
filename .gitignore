@@ -24,6 +24,3 @@ ingenieria-supervisor.sqlite3
 ingenieria-supervisor.sqlite3-wal
 ingenieria-supervisor.sqlite3-shm
 ingenieria-supervisor.sqlite3-journal
-
-# Zona controlada de worktrees automáticos de los trabajadores (T-0003)
-.arboles/

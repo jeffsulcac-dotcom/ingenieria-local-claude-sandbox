@@ -17,7 +17,9 @@ Qué añade sobre el Supervisor de A3.3
   transacción.
 
 - WORKTREES AUTOMÁTICOS dentro de una ZONA CONTROLADA: `<raíz>/.arboles/<id>`
-  (ignorada por Git). El despacho sólo crea ahí, y la limpieza sólo borra
+  (anotada en `<común>/info/exclude`, que es local, para que Git de la
+  raíz no la vea como archivos sin versionar sin tocar el `.gitignore`
+  del proyecto). El despacho sólo crea ahí, y la limpieza sólo borra
   ahí: un árbol registrado fuera de la zona no se toca nunca, y dentro de
   ella sólo se borra el que Git reconoce (`resolver_worktree`), que no
   sostiene ninguna ejecución viva y que no tiene NADA sin confirmar, sin
@@ -138,6 +140,48 @@ class ErrorLimpieza(ErrorWorktree):
 
 def zona_de_arboles(raiz: Path) -> Path:
     return Path(raiz).resolve() / ZONA_ARBOLES
+
+
+def excluir_zona_de_git(raiz: Path) -> bool:
+    """
+    Anota `/.arboles/` en `<directorio común>/info/exclude`, si no está.
+
+    Es local y no versionado: la zona deja de aparecer como «sin
+    versionar» en `git status` de la raíz sin modificar el `.gitignore`
+    del proyecto, que es un archivo fuente. Devuelve si quedó anotada.
+    Es comodidad, no seguridad: si no se puede escribir, nada deja de
+    funcionar (los archivos sin versionar no cuentan para `verificar`).
+    """
+    try:
+        comun = global_.git_common_dir(raiz)
+    except global_.ErrorEstadoGlobal:
+        return False
+
+    exclusion = Path(comun) / "info" / "exclude"
+    linea = "/" + ZONA_ARBOLES + "/"
+
+    try:
+        existente = (
+            exclusion.read_text(encoding="utf-8") if exclusion.is_file() else ""
+        )
+
+        if linea in existente.splitlines():
+            return True
+
+        exclusion.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(exclusion, "a", encoding="utf-8", newline="\n") as manejador:
+            if existente and not existente.endswith("\n"):
+                manejador.write("\n")
+
+            manejador.write(
+                "# Zona de worktrees automáticos del Supervisor (T-0003)\n"
+                + linea + "\n"
+            )
+    except OSError:
+        return False
+
+    return True
 
 
 def ruta_de_arbol(raiz: Path, identificador: str) -> Path:
@@ -625,6 +669,7 @@ def preparar_arbol(raiz: Path, ficha) -> tuple:
             break
 
         destino.parent.mkdir(parents=True, exist_ok=True)
+        excluir_zona_de_git(raiz)
 
         if _rama_existe(raiz, rama):
             orden = ("worktree", "add", str(destino), rama)
