@@ -484,6 +484,29 @@ def prueba_01_cola_persistente_y_orden_determinista():
         assert [u["tarea_id"] for u in trabajadores.listar_cola(raiz)
                 if u["estado_cola"] in estado_global.COLA_ESTADOS_VIVOS] == esperado[:-1]
 
+        # Un despacho que eligió la entrada ANTES de que se retirara (una
+        # lectura rancia) llega al gancho con la entrada ya cerrada: el
+        # UPDATE de la cola no casa, el gancho lanza y el ROLLBACK deshace
+        # también la toma. Ni la entrada se marca ni la tarea se toma: o
+        # las dos cosas o ninguna.
+        try:
+            trabajadores._despachar_entrada(
+                raiz, retirada, False, None, "rezagado", None, None,
+            )
+            raise AssertionError("Se despachó una entrada ya retirada.")
+        except trabajadores.ErrorDespacho as rechazo:
+            METRICAS["DESPACHOS_RECHAZADOS"] += 1
+            METRICAS["WORKTREES_CREADOS"] += 1
+            assert rechazo.motivo == trabajadores.RECHAZO_NO_PENDIENTE, rechazo.motivo
+
+        fila = fila_de(raiz, "T-0905")
+        assert fila["estado"] == str(Estado.NUEVO), fila["estado"]
+        assert fila["trabajador_id"] is None and int(fila["generacion"]) == 0
+        assert entrada_de(raiz, "T-0905")["estado_cola"] == estado_global.COLA_RETIRADA
+        assert not any(
+            e["tipo"] == estado_global.EVENTO_TRANSICION for e in eventos_de(raiz, "T-0905")
+        ), "La toma rezagada dejó rastro."
+
         de_nuevo = trabajadores.encolar(raiz, "T-0905", prioridad=5)
         METRICAS["TAREAS_ENCOLADAS"] += 1
         assert de_nuevo["secuencia"] > retirada["secuencia"]
