@@ -74,7 +74,7 @@ from .tarea import (
 
 NOMBRE_BASE = "ingenieria-supervisor.sqlite3"
 
-VERSION_ESQUEMA = 2
+VERSION_ESQUEMA = 3
 
 # Milisegundos que una conexión espera si otra tiene la base ocupada.
 BUSY_TIMEOUT_MS = 5000
@@ -104,6 +104,10 @@ EVENTO_TRANSICION = "transicion"
 EVENTO_VERIFICACION = "verificacion"
 EVENTO_DECISION = "decision"
 EVENTO_RECUPERACION = "recuperacion"
+# T-0003 — movimientos de la cola de trabajadores (encolar, despachar,
+# terminar, reconciliar). Se anotan como eventos de la tarea para que el
+# historial de una tarea cuente también por qué y cuándo se lanzó.
+EVENTO_COLA = "cola"
 
 ORIGEN_AUTOMATICO = "automático"
 
@@ -154,6 +158,20 @@ MOTIVO_ESTADO_INCOMPATIBLE = "estado_incompatible"
 # la grabada (`exigir_no_retroceso`).
 MOTIVO_PRECONDICION_CAMBIADA = "precondicion_cambiada"
 MOTIVO_MARCA_MAS_NUEVA = "marca_mas_nueva"
+
+# T-0003 — estados de una entrada de la cola de trabajadores. La cola vive
+# en esta misma base (tabla `cola`, migración 3): sobrevive a un cierre o
+# a un apagón igual que el estado de las tareas, y se despacha dentro de
+# la misma transacción que concede la toma. Las primitivas que la leen y
+# escriben están en `trabajadores.py`; aquí sólo el esquema y los nombres.
+COLA_PENDIENTE = "pendiente"
+COLA_DESPACHADA = "despachada"
+COLA_TERMINADA = "terminada"
+COLA_FALLIDA = "fallida"
+COLA_RETIRADA = "retirada"
+
+# Entradas que siguen VIVAS: una tarea sólo puede tener una a la vez.
+COLA_ESTADOS_VIVOS = (COLA_PENDIENTE, COLA_DESPACHADA)
 
 # Migraciones versionadas. Cada versión es una lista de sentencias que se
 # aplican dentro de una única transacción. Nunca se edita una versión ya
@@ -226,6 +244,55 @@ MIGRACIONES = {
         #
         # 0 = fila heredada de A2/A3.1 que nunca fue reclamada bajo A3.2.
         "ALTER TABLE tareas ADD COLUMN generacion INTEGER NOT NULL DEFAULT 0",
+    ],
+    3: [
+        # T-0003 — cola persistente de trabajadores.
+        #
+        # `secuencia` es AUTOINCREMENT a propósito: SQLite no reutiliza un
+        # número aunque se borre la fila, así que el orden de llegada es
+        # estable después de cualquier reinicio. El orden de despacho es
+        # `prioridad DESC, secuencia ASC` y lo resuelve la base, no el
+        # proceso que despacha.
+        #
+        # `trabajo` es una LISTA JSON de argumentos (argv). Nunca una
+        # cadena: el trabajador la entrega a `subprocess` tal cual, sin
+        # intérprete de órdenes por medio.
+        #
+        # Una tarea puede tener varias entradas a lo largo del tiempo
+        # (cada una es el registro de un lanzamiento), pero sólo UNA viva
+        # —pendiente o despachada— a la vez: lo garantiza el índice único
+        # parcial, en el motor, no una comprobación previa en Python.
+        """
+        CREATE TABLE cola (
+            secuencia       INTEGER PRIMARY KEY AUTOINCREMENT,
+            tarea_id        TEXT NOT NULL
+                            REFERENCES tareas(id) ON DELETE RESTRICT,
+            prioridad       INTEGER NOT NULL DEFAULT 0,
+            estado_cola     TEXT NOT NULL,
+            trabajo         TEXT NOT NULL DEFAULT '[]',
+            tiempo_limite_s INTEGER NOT NULL DEFAULT 3600,
+            encolado_en     TEXT NOT NULL,
+            actualizado_en  TEXT NOT NULL,
+            despachado_en   TEXT,
+            terminado_en    TEXT,
+            trabajador_id   TEXT,
+            generacion      INTEGER,
+            pid             INTEGER,
+            worktree        TEXT,
+            registro        TEXT,
+            ultimo_rechazo  TEXT,
+            resultado       TEXT
+        )
+        """,
+        """
+        CREATE UNIQUE INDEX cola_una_viva_por_tarea
+            ON cola (tarea_id)
+            WHERE estado_cola IN ('pendiente', 'despachada')
+        """,
+        """
+        CREATE INDEX cola_por_orden
+            ON cola (estado_cola, prioridad DESC, secuencia ASC)
+        """,
     ],
 }
 

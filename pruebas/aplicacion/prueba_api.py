@@ -42,6 +42,7 @@ from fastapi.testclient import TestClient
 
 from aplicacion.ingenieria_app import servidor
 from aplicacion.ingenieria_app.servidor import app
+from ingenieria_supervisor import estado_global
 from ingenieria_supervisor import supervisor as nucleo
 from ingenieria_supervisor import tarea as fichas
 
@@ -267,7 +268,7 @@ def _comprobar_estado_desarrollo(carpeta_tareas: Path) -> dict:
 
     assert base["estado"] == "ACTIVA", base
     assert base["ruta"].endswith("ingenieria-supervisor.sqlite3")
-    assert base["version_esquema"] == 2
+    assert base["version_esquema"] == estado_global.VERSION_ESQUEMA
     assert base["journal_mode"] == "wal"
 
     # La base vive en el directorio común de Git, nunca en el árbol.

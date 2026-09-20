@@ -1,0 +1,55 @@
+{
+  "id": "T-0003",
+  "titulo": "Workers V1: cola persistente, despacho, worktrees automáticos y recuperación",
+  "objetivo": "Lanzar trabajadores sobre una cola persistente con orden determinista, worktrees automáticos en una zona controlada, un solo escritor por ámbito, argv estructurado sin intérprete de órdenes, limpieza segura y recuperación que no libera ante la duda.",
+  "criterios_aceptacion": [
+    "Dos procesos despachando la misma tarea: un solo ganador; doble lanzamiento rechazado.",
+    "Dos tareas con ámbitos solapados: sólo una con escritor; sin solapamiento, ambas progresan.",
+    "Worker que termina bien o falla deja tarea, cola y árbol en estado consistente y trazable.",
+    "Ante la duda (latido vencido con proceso vivo, otra máquina, fila incompleta) no se libera nada.",
+    "Ningún worktree fuera de .arboles/ se crea ni se borra; nunca se borra un árbol con cambios sin confirmar.",
+    "La cola sobrevive a un reinicio con el mismo orden; los argumentos del worker viajan como lista, nunca shell=True."
+  ],
+  "ambito_archivos": [
+    "orquestacion/ingenieria_supervisor/trabajadores.py",
+    "orquestacion/ingenieria_supervisor/trabajador.py",
+    "orquestacion/ingenieria_supervisor/estado_global.py",
+    "orquestacion/ingenieria_supervisor/supervisor.py",
+    "orquestacion/ingenieria_supervisor/__main__.py",
+    "pruebas/orquestacion/prueba_trabajadores.py",
+    "pruebas/orquestacion/prueba_estado_global.py",
+    "pruebas/aplicacion/prueba_api.py",
+    "orquestacion/tareas/T-0003.json",
+    "orquestacion/README.md",
+    "ESTADO.md",
+    ".gitignore"
+  ],
+  "pruebas_requeridas": [
+    "pruebas/orquestacion/prueba_trabajadores.py"
+  ],
+  "estado": "nuevo",
+  "rama": "tarea/T-0003",
+  "worktree": null,
+  "intentos": 0,
+  "max_intentos": 3,
+  "commit_inicial": null,
+  "creado_en": "2026-09-20T05:54:37+00:00",
+  "actualizado_en": "2026-09-20T05:54:37+00:00",
+  "requiere_decision_humana": [],
+  "trabajador_id": null,
+  "pid": null,
+  "iniciado_en": null,
+  "ultimo_latido": null,
+  "ultima_falla": null,
+  "ejecuciones": [],
+  "historial": [
+    {
+      "fecha": "2026-09-20T05:54:37+00:00",
+      "tipo": "creacion",
+      "estado_anterior": null,
+      "estado_nuevo": "nuevo",
+      "motivo": "Ficha creada.",
+      "origen": "humano"
+    }
+  ]
+}
