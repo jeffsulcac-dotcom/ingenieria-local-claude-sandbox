@@ -693,8 +693,8 @@ trabajar a varios escritores a la vez:
    guarda de no regresión; se para solo al terminar; aguanta un
    `database is locked` sin apagarse; no resucita nada.
 
-3. **Vitalidad en cinco estados** (ACTIVA, LATIDO_VENCIDO, HUÉRFANA,
-   REANUDABLE, FINALIZADA) que NUNCA declara abandono con una sola señal.
+3. **Vitalidad en seis estados** (ACTIVA, LATIDO_VENCIDO, HUÉRFANA,
+   REANUDABLE, ESPERA_HUMANA, FINALIZADA) que NUNCA declara abandono con una sola señal.
    Un proceso vivo y comprobable lo impide, dure lo que dure el silencio.
    Un trabajador de otra máquina no se libera solo: lo decide una persona.
 
@@ -839,24 +839,43 @@ Defectos reales encontrados y cerrados en esta rama:
     `devolver T-9003` imposible en el paso 10 del gate, un paso 8 cuyo
     resultado dependía de cuánto se tardara desde la toma, cifras de
     invocaciones rancias.
+11. Segunda tanda (misma revisión, tras la ronda de ojos frescos y la
+    verificación cruzada). Una regresión de la propia revisión: la huella
+    del contenido contaba el espejo JSON del Supervisor, y una decisión
+    resuelta a mitad de la batería abortaba la corrida; corregida antes de
+    cerrar. Y defectos de la punta original que salieron con ella: la
+    relectura de decisiones tras la corrida no releía nada (la lista en
+    memoria mandaba sobre la base); sin `--worktree` el árbol era «la raíz
+    de quien invoque la siguiente orden» (un trabajador tomando desde su
+    worktree y un operador verificando desde `main` proponían una tarea
+    cuyo trabajo nunca se ejecutó); un `database is locked` llega como
+    `ErrorEstadoGlobal` y apagaba el latido al primer choque (la prueba
+    lo simulaba con un tipo que en producción nunca llega); el `latido`
+    manual podía retroceder la marca; `verificar` decidía BLOQUEADO con un
+    `max_intentos` que ya no era el vigente; `aprobar` no exigía al motor
+    lo que comprobaba en Python; la falla ámbar quedaba rancia; PROPUESTO
+    y BLOQUEADO se rotulaban FINALIZADA; `reanudar` devolvía 0 con fichas
+    ilegibles; `os.replace` del espejo sin reintento ante un lector en
+    Windows; `prueba_api.py` ahora corre sobre un repositorio temporal.
 
 Marcado para decisión humana, sin cambiar el comportamiento (detalle en
 la deuda conocida del README): la ventana de 120 s de una toma desde la
 consola; que `verificar` no exija la rama de la tarea; que `ver` y el
 tablero creen la base o importen fichas; identificadores con `/`;
 `proceso_vivo` en Windows ante «acceso denegado»; marcas de latido sin
-zona horaria; los errores de `argparse` en inglés.
+zona horaria; los errores de `argparse` en inglés; si una prueba
+requerida sin versionar debe valer; `diagnostico` en rutas UNC.
 
 Comprobado en esta rama (Linux):
 
 - `prueba_ejecucion_segura.py`: 37 de 37, `PRUEBA_EJECUCION_SEGURA=OK`,
-  ~13 s; las seis métricas de fallo en 0; con `-X dev -W
-  error::ResourceWarning`: OK sin avisos; 398 invocaciones de `git` en el
-  proceso padre y 417 conexiones SQLite, 0 vivas al terminar.
+  ~17 s; las seis métricas de fallo en 0; con `-X dev -W
+  error::ResourceWarning`: OK sin avisos; 446 invocaciones de `git` en el
+  proceso padre y 483 conexiones SQLite, 0 vivas al terminar.
 - Las otras cuatro baterías de orquestación y `prueba_api.py`: OK.
   Corredor único (`pruebas --detalle`): 8 de 8 APROBADO en un clon limpio.
-- Mutación: las 19 reintroducciones de la tabla R1–R19 del README, una a
-  una sobre copias limpias: 19 fallos de la batería, en la comprobación
+- Mutación: las 28 reintroducciones de la tabla R1–R28 del README, una a
+  una sobre copias limpias: 28 fallos de la batería, en la comprobación
   esperada cada una.
 
 Pendiente en Windows: los cambios de esta revisión (`resolver_worktree`,

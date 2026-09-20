@@ -121,6 +121,10 @@ FALLOS_LATIDO_SEGUIDOS = 5
 ORIGEN_AUTOMATICO = "automático"
 ORIGEN_HUMANO = "humano"
 
+# Tipo de `ultima_falla` cuando lo único que frena la propuesta son
+# decisiones humanas pendientes. `decidir` la retira al resolver la última.
+FALLA_DECISIONES_PENDIENTES = "decisiones_pendientes"
+
 # Estados a los que el Supervisor NUNCA puede llegar por su cuenta.
 ESTADOS_SOLO_HUMANOS = frozenset({Estado.APROBADO, Estado.RECHAZADO})
 
@@ -191,6 +195,9 @@ VITALIDAD_LATIDO_VENCIDO = "LATIDO_VENCIDO"
 VITALIDAD_HUERFANA = "HUERFANA"
 VITALIDAD_FINALIZADA = "FINALIZADA"
 VITALIDAD_REANUDABLE = "REANUDABLE"
+# PROPUESTO y BLOQUEADO no están cerradas: esperan a alguien. Rotularlas
+# FINALIZADA contradecía al motivo que se imprimía al lado.
+VITALIDAD_ESPERA_HUMANA = "ESPERA_HUMANA"
 
 # Estados sin ejecución en curso que NO están cerrados: esperan a alguien.
 ESTADOS_QUE_ESPERAN_A_UNA_PERSONA = frozenset(
@@ -688,6 +695,7 @@ def persistir(
     campos_propios=None,
     incrementos=None,
     exigir_iguales=None,
+    exigir_no_retroceso=None,
 ) -> Ficha:
     # `campos_propios` es OBLIGATORIO. Su valor por omisión era escribir
     # las dieciséis columnas operativas, es decir, exactamente el defecto
@@ -805,6 +813,7 @@ def persistir(
                     estados_admitidos=estados_admitidos,
                     incrementos=incrementos,
                     exigir_iguales=exigir_iguales,
+                    exigir_no_retroceso=exigir_no_retroceso,
                 )
 
                 if informe["resultado"] != global_.ESCRITURA_ACEPTADA:
@@ -1188,8 +1197,10 @@ def resolver_worktree(raiz: Path, declarado: str | None) -> Path:
     """
     Convierte la ruta registrada de un worktree en una raíz utilizable.
 
-    Devuelve la raíz resuelta cuando la tarea no declara worktree: es el
-    comportamiento de siempre y el caso normal hoy.
+    Devuelve la raíz resuelta cuando no se declara nada. Desde la revisión
+    final toda toma graba su árbol —la raíz desde la que se tomó si no se
+    declaró otro—, así que este camino queda para las órdenes que no vienen
+    de una toma.
 
     Qué se comprueba, y por qué cada cosa
     -------------------------------------
@@ -1370,6 +1381,19 @@ def resolver_worktree(raiz: Path, declarado: str | None) -> Path:
     return candidato
 
 
+# El espejo JSON de las fichas está versionado y lo reescribe el propio
+# Supervisor: `tomar` lo deja modificado en cualquier rama que no sea la de
+# la tarea (el commit automático se rechaza), y `decidir` o un `latido`
+# manual lo regeneran. Si contara como «cambio del árbol», una decisión
+# humana resuelta MIENTRAS corre la batería —justo el caso que `verificar`
+# maneja releyendo las decisiones— haría abortar la corrida entera con
+# «el árbol cambió». Pasó: la huella del contenido lo introdujo y el
+# crítico de completitud de la revisión final lo destapó antes de cerrar.
+# Se excluye ese rastro de la huella y de «sucio»; el contenido que juzga
+# la evidencia es el del proyecto, no el del propio Supervisor.
+RASTRO_PROPIO_EXCLUIDO = ":(exclude)orquestacion/tareas/"
+
+
 class Git:
     """Acceso mínimo a Git, con los límites del Supervisor incorporados."""
 
@@ -1437,7 +1461,10 @@ class Git:
         verificación pudiera aprobarse jamás en un proyecto real. Lo que
         importa aquí es si cambió el CONTENIDO que el commit describe.
         """
-        resultado = self._ejecutar("status", "--porcelain", "--untracked-files=no")
+        resultado = self._ejecutar(
+            "status", "--porcelain", "--untracked-files=no",
+            "--", ".", RASTRO_PROPIO_EXCLUIDO,
+        )
 
         if resultado.returncode != 0:
             return False
@@ -1458,7 +1485,8 @@ class Git:
         `hay_cambios_sin_confirmar`.
         """
         resultado = self._ejecutar(
-            "diff", "HEAD", "--no-ext-diff", "--no-color", "--"
+            "diff", "HEAD", "--no-ext-diff", "--no-color",
+            "--", ".", RASTRO_PROPIO_EXCLUIDO,
         )
 
         if resultado.returncode != 0:
@@ -1796,8 +1824,16 @@ def tomar(
     # Se valida ANTES de abrir la transacción, porque mirar el sistema de
     # archivos y preguntarle a Git son esperas de disco y no deben hacerse
     # con el bloqueo de escritura tomado.
-    arbol_declarado = (
-        str(resolver_worktree(raiz, worktree)) if worktree else None
+    # Sin declararlo, el árbol de la ejecución es la raíz desde la que se
+    # TOMA. Grabar None significaba «la raíz desde la que se invoque la
+    # SIGUIENTE orden»: un trabajador que tomaba desde su worktree sin
+    # `--worktree` y un operador que verificaba desde main proponían una
+    # tarea cuyo trabajo nunca se ejecutó (reproducido en la revisión
+    # final). El árbol pertenece a la ejecución: se fija en la toma,
+    # siempre.
+    arbol_declarado = str(
+        resolver_worktree(raiz, worktree) if worktree
+        else Path(raiz).resolve()
     )
 
     aspirante = trabajador_id or nuevo_trabajador_id()
@@ -1808,7 +1844,9 @@ def tomar(
     commit_inicial = ficha.commit_inicial
 
     if git is not None and commit_inicial is None:
-        commit_inicial = git.hash_actual()
+        # El commit de partida es el del árbol donde se va a trabajar, no
+        # el de la raíz desde la que se ordena la toma.
+        commit_inicial = Git(Path(arbol_declarado)).hash_actual()
 
     # El árbol de trabajo y Git se leen ANTES de abrir la transacción.
     definiciones, ilegibles = listar_con_errores(raiz)
@@ -2035,6 +2073,12 @@ def latido(
         estados_admitidos={Estado.EN_EJECUCION},
         exigir_generacion=esperada,
         campos_propios=CAMPOS_LATIDO,
+        # La misma guarda que el latido automático: la marca de vida no
+        # retrocede. Un latido manual desde una máquina con el reloj
+        # atrasado podía reducir la antigüedad de la señal y dejar la
+        # tarea huérfana en el acto. Si ya hay una marca más nueva, la
+        # orden se rechaza y lo dice.
+        exigir_no_retroceso={"ultimo_latido": ficha.ultimo_latido},
     )
 
     return ficha
@@ -2314,10 +2358,29 @@ def verificar(
     with global_.conexion(raiz) as con:
         actual = global_.obtener_tarea(con, ficha.id)
 
+    # El presupuesto de intentos es declarativo y cualquier `cargar` de
+    # otro proceso —incluido `ver`— lo sincroniza desde el JSON. Decidir
+    # BLOQUEADO con la foto de antes de correr y grabar la fila con el
+    # valor nuevo dejaba «bloqueada con 1 de 5». Se decide con el vigente
+    # y se exige al escribir.
+    if actual is not None and actual.get("max_intentos"):
+        ficha.max_intentos = int(actual["max_intentos"])
+
+    # La resolución la manda la BASE. `fusionar_decisiones` se queda con la
+    # primera aparición de cada clave, y la lista en memoria iba primero:
+    # una decisión resuelta mientras corría la batería seguía contando como
+    # pendiente y la tarea se iba a REQUIERE_REVISION con la falla ámbar.
+    # La relectura «después de correr» no releía nada. Reproducido en la
+    # revisión final (comprobación 20).
+    operativas = list((actual or {}).get("decisiones") or [])
+
+    if actual is None:
+        operativas = global_.decisiones_operativas(
+            ficha.requiere_decision_humana
+        )
+
     ficha.requiere_decision_humana = global_.fusionar_decisiones(
-        declaradas,
-        global_.decisiones_operativas(ficha.requiere_decision_humana)
-        + list((actual or {}).get("decisiones") or []),
+        declaradas, operativas
     )
 
     pendientes = ficha.decisiones_pendientes()
@@ -2391,6 +2454,10 @@ def verificar(
             "fecha": corrida["fecha"],
             "intento": ficha.intentos,
             "problemas": [motivo],
+            # Marca para que `decidir` pueda retirarla al resolver la
+            # última pendiente: sin ella la fila decía a la vez «resueltas»
+            # y «hay decisiones sin resolver» hasta la siguiente corrida.
+            "tipo": FALLA_DECISIONES_PENDIENTES,
         }
 
     else:
@@ -2419,6 +2486,7 @@ def verificar(
         exigir_generacion=esperada,
         campos_propios=CAMPOS_VERIFICAR,
         incrementos=("intentos",) if consume_intento else (),
+        exigir_iguales={"max_intentos": int(ficha.max_intentos)},
     )
 
     registro = _registrar_en_git(git, ficha, motivo)
@@ -2575,7 +2643,17 @@ def aprobar(
         ORIGEN_HUMANO,
     )
 
-    persistir(raiz, ficha, campos_propios=CAMPOS_TRANSICION)
+    # Lo que se comprobó arriba en Python se exige también al motor: una
+    # decisión DECLARADA entre la lectura y la escritura —la sincroniza
+    # cualquier `cargar`, incluido `ver` desde otro proceso— no mueve ni el
+    # estado ni la generación, y la tarea quedaba APROBADA con una decisión
+    # pendiente. Reproducido en la revisión final.
+    persistir(
+        raiz,
+        ficha,
+        campos_propios=CAMPOS_TRANSICION,
+        exigir_iguales={"requiere_decision_humana": 0},
+    )
 
     _registrar_en_git(git, ficha, "Aprobación humana.")
 
@@ -2781,12 +2859,19 @@ class LatidoAutomatico:
                     )
             finally:
                 con.close()
-        except sqlite3.Error as error:
+        except (sqlite3.Error, global_.ErrorEstadoGlobal) as error:
             # `database is locked` es un fallo TRANSITORIO y esperable justo
             # en el escenario para el que existe el latido: varios procesos
             # escribiendo a la vez. Rendirse al primero dejaba la operación
             # sin señal el resto del tiempo, en silencio, hasta que la
             # recuperación la declaraba huérfana.
+            #
+            # Llega como ErrorEstadoGlobal, no como sqlite3.Error: `abrir` y
+            # `transaccion` envuelven TODO error de SQLite. Capturar sólo
+            # sqlite3.Error era código muerto en producción y el bloqueo
+            # real caía en «no es transitoria: se para» al primer choque
+            # (reproducido en la revisión final con un candado de otro
+            # proceso). Un fallo permanente sigue acotado por el límite.
             self.error = type(error).__name__ + ": " + str(error)
             self.fallos_seguidos += 1
             self.fallos_totales += 1
@@ -2934,14 +3019,15 @@ def vitalidad(
     """
     Vitalidad de una tarea, para INFORMAR. No decide ni cambia nada.
 
-    Devuelve uno de cinco estados, que son distintos del estado de la tarea:
+    Devuelve uno de seis estados, que son distintos del estado de la tarea:
 
         ACTIVA          hay una ejecución y da señales
         LATIDO_VENCIDO  hay una ejecución, el latido caducó, pero no está
                         demostrada muerta
         HUERFANA        hay una ejecución y está demostrada perdida
         REANUDABLE      no hay ejecución y la tarea se puede tomar
-        FINALIZADA      no hay ejecución y la tarea no se puede tomar
+        ESPERA_HUMANA   no hay ejecución y la tarea espera a una persona
+        FINALIZADA      no hay ejecución y la tarea está cerrada
 
     Separar esto de `clasificar_ejecucion` es deliberado: aquélla decide si
     la recuperación toca o no toca una tarea, y sólo mira las que están en
@@ -2973,19 +3059,19 @@ def vitalidad(
 
     if estado != str(Estado.EN_EJECUCION):
         tomable = estado in {str(uno) for uno in ESTADOS_TOMABLES}
-
-        informe["vitalidad"] = (
-            VITALIDAD_REANUDABLE if tomable else VITALIDAD_FINALIZADA
-        )
+        espera = estado in ESTADOS_QUE_ESPERAN_A_UNA_PERSONA
 
         if tomable:
+            informe["vitalidad"] = VITALIDAD_REANUDABLE
             detalle = "puede tomarse."
-        elif estado in ESTADOS_QUE_ESPERAN_A_UNA_PERSONA:
+        elif espera:
             # PROPUESTO y BLOQUEADO no son finales: son las que MÁS piden
             # atención. Decir de ellas lo mismo que de APROBADO escondía en
             # el tablero justo lo que hay que mirar.
+            informe["vitalidad"] = VITALIDAD_ESPERA_HUMANA
             detalle = "está esperando una decisión humana."
         else:
+            informe["vitalidad"] = VITALIDAD_FINALIZADA
             detalle = "está cerrada."
 
         informe["motivo"] = "Sin ejecución en curso; la tarea " + detalle

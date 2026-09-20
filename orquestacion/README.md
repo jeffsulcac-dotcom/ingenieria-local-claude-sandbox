@@ -67,8 +67,8 @@ de crear una base local que pudiera divergir.
 Los campos operativos que siguen presentes en el JSON son un **espejo
 derivado**: cada operación del ciclo confirma primero la transacción
 SQLite y sólo después regenera el JSON con la escritura atómica de V1.
-La excepción es `crear`, que escribe antes el JSON porque la definición es
-el contrato: sin ficha versionada no hay tarea que registrar. Al cargar una
+Desde A3.3 también `crear` escribe el JSON después del COMMIT (puede
+faltar la ficha, nunca sobrar). Al cargar una
 tarea, SQLite se superpone a lo que diga el JSON, de modo que editar el
 JSON a mano no cambia el estado operativo. El espejo se conserva para que
 el commit automático de la ficha siga dejando rastro en Git y para que las
@@ -98,8 +98,8 @@ y reanudar. `estado`, `ver`, la API y el tablero `/desarrollo` leen SQLite.
 - Borrar una ficha JSON no borra la tarea del estado global: el
   identificador queda reservado, la tarea sigue visible marcada como
   "definición no legible" y no puede volver a crearse con el mismo id.
-- `verificar` ejecuta las pruebas sobre la raíz indicada, no sobre el
-  worktree registrado de la tarea.
+- `verificar` ejecutaba las pruebas sobre la raíz indicada, no sobre el
+  árbol de la ejecución (resuelto en A3.3).
 - `latido` y `reanudar` siguen siendo órdenes manuales.
 
 (La atomicidad de `tomar` entre procesos era también una limitación de A2;
@@ -822,7 +822,7 @@ señal de avería), ni construirla con intervalo cero (bucle apretado contra
 la base compartida), y si el cierre no cabe en el plazo queda constancia
 en `cierre_incompleto`.
 
-**3. Vitalidad: cinco estados, nunca una sola señal.**
+**3. Vitalidad: seis estados, nunca una sola señal.**
 
 El estado dice en qué punto del ciclo está la tarea. La vitalidad dice si
 alguien la está ejecutando ahora. Son cosas distintas, y una tarea puede
@@ -834,6 +834,8 @@ murió.
                     demostrada muerta
     HUERFANA        hay una ejecución y está demostrada perdida
     REANUDABLE      no hay ejecución y la tarea se puede tomar
+    ESPERA_HUMANA   no hay ejecución y la tarea espera a una persona
+                    (PROPUESTO, BLOQUEADO)
     FINALIZADA      no hay ejecución y la tarea está cerrada
 
 Nunca se juzga por el PID a secas ni por el latido a secas, y **ningún
@@ -991,7 +993,12 @@ rechazan con mensaje propio. Una ruta demasiado larga o un volumen
 desmontado dicen que no se pudo consultar, no que no exista.
 
 **El árbol pertenece a la EJECUCIÓN, no a la tarea.** Se declara en cada
-toma (`tomar --worktree`) y se suelta con el turno. Heredarlo era una
+toma (`tomar --worktree`) y se suelta con el turno. Sin declararlo, el
+árbol es la raíz desde la que se TOMA, y queda grabado igual: grabar
+«nada» significaba «la raíz de quien invoque la siguiente orden», y un
+trabajador que tomaba desde su worktree sin declararlo y un operador que
+verificaba desde `main` proponían una tarea cuyo trabajo nunca se ejecutó
+(revisión final, comprobación 4). Heredarlo era una
 trampa: el trabajador siguiente, que no puede saberlo, acababa verificando
 en el árbol del anterior, sobre trabajo ajeno, y el resultado se grababa
 como suyo. Tampoco se importa desde el JSON: es estado de ejecución, y
@@ -1136,6 +1143,15 @@ sin cambiar el comportamiento:
   escrituras externas.
 - **Los mensajes de error de `argparse` siguen en inglés**, y `--sin-git`
   sólo se acepta antes de la orden.
+- **Una prueba requerida SIN versionar satisface `pruebas_requeridas`.**
+  Los archivos sin versionar quedan fuera de la huella a propósito (los
+  informes que dejan las propias pruebas), así que una prueba nueva sin
+  `git add` da un verde con «commit X» que no la contiene, y su edición a
+  mitad no se ve. Decidir si `verificar` debe exigir que las pruebas
+  requeridas estén versionadas.
+- **`diagnostico` en una ruta UNC.** `abrir(solo_lectura=True)` construye
+  el URI con `as_uri()`, que en `\\servidor\...` produce una autoridad que
+  SQLite rechaza; el resto de órdenes abren por ruta y funcionan.
 
 **Revisión final (20/09/2026).** Una tercera ronda adversarial —siete
 revisores de sólo lectura por dimensión más tres de ojos frescos, sobre
@@ -1166,6 +1182,23 @@ con la comprobación que ahora lo fija):
 - Documentación: «36 comprobaciones», «PENDIENTE DE EJECUTAR» con el gate
   ya ejecutado, un `devolver` imposible en el paso 10 del gate, un paso 8
   que dependía del reloj, cifras rancias.
+- Segunda tanda, tras la ronda de ojos frescos y la verificación cruzada:
+  la huella del contenido contaba el espejo JSON del propio Supervisor y
+  una decisión resuelta a mitad abortaba la corrida —regresión de la
+  propia revisión, destapada por su crítico de completitud antes de
+  cerrar—; la relectura de decisiones tras la corrida no releía nada (la
+  lista en memoria iba primero y `fusionar_decisiones` se queda con la
+  primera aparición); sin `--worktree` el árbol era «la raíz de quien
+  invoque la siguiente orden»; un `database is locked` llega envuelto en
+  `ErrorEstadoGlobal` y apagaba el latido al primer choque, mientras la
+  prueba lo simulaba con un error que en producción nunca llega así; el
+  `latido` manual podía retroceder la marca; `verificar` decidía BLOQUEADO
+  con un `max_intentos` que ya no era el vigente; `aprobar` no exigía al
+  motor lo que comprobaba en Python; la falla ámbar quedaba rancia tras
+  resolver la última decisión; PROPUESTO y BLOQUEADO se rotulaban
+  FINALIZADA; `reanudar` devolvía 0 con fichas ilegibles; el reemplazo del
+  espejo no toleraba un lector concurrente en Windows; y `prueba_api.py`
+  pasó a correr sobre un repositorio temporal (3, 4, 14, 20, 29, 30, 31).
 
 **Evidencia real de esta implementación.** Batería de 37 comprobaciones
 (`PRUEBA_EJECUCION_SEGURA=OK`), con métricas medidas y comprobadas, no
@@ -1220,7 +1253,7 @@ Once de estos veintidós no se detectaban cuando se probaron por primera
 vez. Las comprobaciones 9, 17 y 19 a 32 son exactamente los huecos que
 destaparon: el motor hacía lo correcto y nada lo comprobaba.
 
-**Diecinueve mutaciones más, de la revisión final: 19 de 19 detectadas.**
+**Veintiocho mutaciones más, de la revisión final: 28 de 28 detectadas.**
 
 | | Defecto reintroducido | La detecta |
 |---|---|---|
@@ -1243,6 +1276,15 @@ destaparon: el motor hacía lo correcto y nada lo comprobaba.
 | R17 | se admite un intervalo de latido de cero | 11 |
 | R18 | se puede reutilizar un acompañante cerrado | 11 |
 | R19 | `verificar` no devuelve `latido_error` | 12 |
+| R20 | la huella vuelve a contar el espejo JSON del propio Supervisor | 20 |
+| R21 | la toma sin `--worktree` vuelve a grabar «nada» | 4 |
+| R22 | el latido vuelve a capturar sólo `sqlite3.Error` | 29 |
+| R23 | el `latido` manual pierde la guarda de no regresión | 30 |
+| R24 | `verificar` decide con el `max_intentos` de la foto | 3 |
+| R25 | `aprobar` no exige `requiere_decision_humana = 0` al motor | 31 |
+| R26 | la lista en memoria vuelve a mandar sobre la base al releer decisiones | 20 |
+| R27 | `decidir` deja la falla ámbar rancia | 31 |
+| R28 | PROPUESTO y BLOQUEADO vuelven a rotularse FINALIZADA | 14 |
 
 **Verificación en Windows (gate ejecutado el 19/09/2026 sobre la punta
 17530d0; resultados en `ESTADO.md`).** Los cambios de la revisión final
@@ -1262,18 +1304,19 @@ sobre la nueva punta. Lo que puede comportarse distinto en Windows:
   resolverse contra el directorio actual: la 18 lo ejercita sólo en
   Windows y en Linux lo deja anotado como omitido.
 - Arrancar procesos y `git.exe` es más lento, sobre todo con Defender
-  vigilando la carpeta. Este archivo hace 398 invocaciones de `git` en el
-  proceso padre (117 `rev-parse`, 43 `worktree`, 21 `status`, 20 `diff`;
+  vigilando la carpeta. Este archivo hace 446 invocaciones de `git` en el
+  proceso padre (140 `rev-parse`, 44 `worktree`, 33 `status`, 30 `diff`;
   eran 295 antes de la revisión final). A 250 ms por invocación —el peor
-  caso medido alguna vez en esa PC— serían unos 100 s frente al límite de
+  caso medido alguna vez en esa PC— serían unos 112 s frente al límite de
   120 s; con el sobrecoste real de la corrida del 19/09 (unos 35 ms por
-  invocación sobre el tiempo de Linux) son unos 27 s. Es el punto que más
-  conviene cronometrar al repetir el gate.
+  invocación sobre los 17 s de Linux) son unos 32 s. Es el punto que más
+  conviene cronometrar al repetir el gate; si se acercara al límite, la
+  batería se parte en dos archivos antes que subir el límite.
 
 Lo que sí se pudo descartar aquí, que es justo la condición que en
 Windows decide si se puede borrar: la corrida con
 `python -X dev -W error::ResourceWarning` sale con código 0 sin un solo
-aviso, y un detector que instrumenta `sqlite3.connect` cuenta 417
+aviso, y un detector que instrumenta `sqlite3.connect` cuenta 483
 conexiones abiertas durante la tanda y **0 vivas al terminar**.
 
 Desde `C:\INGENIERIA_LOCAL\motor`, en PowerShell 7:
@@ -1447,8 +1490,8 @@ Prueba correspondiente:
   confirmados en la primera, con los críticos y altos cerrados; la
   revisión final cerró
   además los de worktrees `prunable` o reutilizados, el espejo que
-  abortaba la recuperación y la consola que callaba), y 41 mutaciones del
-  código que la batería detecta (22 de la ronda R1 y 19 de la revisión
+  abortaba la recuperación y la consola que callaba), y 50 mutaciones del
+  código que la batería detecta (22 de la ronda R1 y 28 de la revisión
   final).
 
 Pruebas correspondientes:

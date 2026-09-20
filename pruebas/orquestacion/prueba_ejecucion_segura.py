@@ -479,6 +479,60 @@ def prueba_c_los_intentos_los_cuenta_el_motor():
         finally:
             con.close()
 
+        # Y el presupuesto con el que se decide BLOQUEADO es el VIGENTE.
+        # `max_intentos` es declarativo y cualquier `cargar` de otro
+        # proceso —incluido `ver`— lo sincroniza desde el JSON: decidir
+        # con la foto de antes de correr y grabar la fila con el valor
+        # nuevo dejaba «bloqueada con 1 de 5».
+        (raiz / "pruebas" / "demostracion" / "prueba_roja_lenta.py").write_text(
+            "import time\ntime.sleep(1.5)\nraise SystemExit('falla')\n",
+            encoding="utf-8",
+        )
+        ficha_minima(
+            raiz, "T-0902",
+            pruebas_requeridas=["pruebas/demostracion/prueba_roja_lenta.py"],
+            max_intentos=1,
+        )
+        segunda = nucleo.tomar(raiz, "T-0902", trabajador_id="worker-A")
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        def ampliar_a_mitad():
+            time.sleep(0.5)
+            archivo = fichas.carpeta_tareas(raiz) / "T-0902.json"
+            datos = json.loads(archivo.read_text(encoding="utf-8"))
+            datos["max_intentos"] = 5
+            archivo.write_text(
+                json.dumps(datos, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            nucleo.cargar(raiz, "T-0902")
+
+        hilo = threading.Thread(target=ampliar_a_mitad)
+        hilo.start()
+
+        try:
+            METRICAS["OPERACIONES"] += 1
+            informe = nucleo.verificar(
+                raiz, "T-0902",
+                trabajador_id="worker-A", generacion=segunda.generacion,
+            )
+        finally:
+            hilo.join()
+
+        METRICAS["ACEPTADAS"] += 1
+
+        fila = fila_de(raiz, "T-0902")
+
+        assert fila["max_intentos"] == 5, (
+            "El hilo no llegó a ampliar el presupuesto: la prueba no probó nada."
+        )
+        assert informe["estado"] == str(Estado.REQUIERE_REVISION), (
+            "Se bloqueó con un presupuesto que ya no era el vigente: "
+            + informe["estado"] + " / " + informe["motivo"]
+        )
+        assert fila["intentos"] == 1
+
         comprobar_integridad(raiz)
     finally:
         borrar(raiz)
@@ -655,6 +709,54 @@ def prueba_d_verificar_ejecuta_en_el_worktree_de_la_tarea():
                 + repr(grabado)
             )
             assert grabado["raiz"] == str(arboles[nombre].resolve())
+
+        # Sin `--worktree`, el árbol de la ejecución es la raíz desde la
+        # que se TOMA. Grabar None significaba «la raíz de quien invoque la
+        # siguiente orden»: un trabajador que tomaba desde su worktree y un
+        # operador que verificaba desde main proponían una tarea cuyo
+        # trabajo nunca se ejecutó.
+        nucleo.crear(
+            principal, "T-0903",
+            titulo="Tomada desde A sin declarar",
+            ambito_archivos=["modulos/c/*.py"],
+            pruebas_requeridas=["pruebas/demostracion/prueba_arbol.py"],
+        )
+        destino = fichas.carpeta_tareas(arboles["A"])
+        destino.mkdir(parents=True, exist_ok=True)
+        shutil.copy(
+            fichas.carpeta_tareas(principal) / "T-0903.json",
+            destino / "T-0903.json",
+        )
+
+        tomada = nucleo.tomar(arboles["A"], "T-0903", trabajador_id="worker-C")
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        assert tomada.worktree == str(arboles["A"].resolve()), (
+            "La toma sin worktree no grabó la raíz desde la que se tomó: "
+            + repr(tomada.worktree)
+        )
+
+        # Se verifica desde la raíz PRINCIPAL: tiene que correr en A.
+        informe = nucleo.verificar(
+            principal, "T-0903",
+            trabajador_id="worker-C", generacion=tomada.generacion,
+        )
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        marcas = {
+            una["marca"] for una in informe["corrida"]["detalle"] if una["marca"]
+        }
+
+        if "PRUEBA_ARBOL_A" not in marcas or "PRUEBA_ARBOL_MAIN" in marcas:
+            METRICAS["VERIFICACIONES_EN_ARBOL_INCORRECTO"] += 1
+
+        assert "PRUEBA_ARBOL_A" in marcas and "PRUEBA_ARBOL_MAIN" not in marcas, (
+            "Una tarea tomada desde A sin declarar worktree se verificó en "
+            "otro árbol: " + repr(sorted(marcas))
+        )
+        assert Path(informe["raiz"]) == arboles["A"].resolve()
 
         comprobar_integridad(principal)
     finally:
@@ -1715,7 +1817,7 @@ def prueba_n_la_vitalidad_distingue_los_cinco_estados():
     esté ejecutando es otra cosa, y es la que hace falta para decidir si
     hay que mirar algo.
     """
-    print(" 14. la vitalidad distingue los cinco estados:", end=" ")
+    print(" 14. la vitalidad distingue los seis estados:", end=" ")
 
     raiz = crear_repositorio()
 
@@ -1761,13 +1863,24 @@ def prueba_n_la_vitalidad_distingue_los_cinco_estados():
 
         assert informe["vitalidad"] == nucleo.VITALIDAD_HUERFANA, informe
 
-        # FINALIZADA: sin ejecución y sin posibilidad de toma.
+        # ESPERA_HUMANA: sin ejecución, no se puede tomar y espera a
+        # alguien. Rotularla FINALIZADA contradecía al motivo impreso al
+        # lado («está esperando una decisión humana»).
         nucleo.devolver(raiz, "T-0901", trabajador_id="worker-A")
-        nucleo.bloquear(raiz, "T-0901", "cerrada para la prueba")
+        nucleo.bloquear(raiz, "T-0901", "bloqueada para la prueba")
+
+        informe = nucleo.vitalidad(fila_de(raiz, "T-0901"))
+
+        assert informe["vitalidad"] == nucleo.VITALIDAD_ESPERA_HUMANA, informe
+        assert informe["requiere_atencion"] is True
+
+        # FINALIZADA: sin ejecución y cerrada de verdad.
+        nucleo.rechazar(raiz, "T-0901", "cerrada para la prueba")
 
         informe = nucleo.vitalidad(fila_de(raiz, "T-0901"))
 
         assert informe["vitalidad"] == nucleo.VITALIDAD_FINALIZADA, informe
+        assert informe["requiere_atencion"] is False
 
         comprobar_integridad(raiz)
     finally:
@@ -2853,6 +2966,62 @@ def prueba_u_un_arbol_que_se_mueve_invalida_la_corrida():
             "ejecutado: " + repr(tarjeta["verificacion_sin_confirmar"])
         )
 
+        # Quinta: el rastro del PROPIO Supervisor no cuenta. El espejo JSON
+        # está versionado; `tomar` lo deja modificado y `decidir` lo
+        # regenera. Con la huella del contenido, una decisión humana
+        # resuelta MIENTRAS corría la batería —justo lo que `verificar`
+        # maneja releyendo las decisiones— abortaba la corrida entera con
+        # «el árbol cambió». Regresión de la revisión final, destapada por
+        # su crítico de completitud antes de cerrar.
+        nucleo.crear(
+            principal, "T-0906",
+            titulo="Decidida a mitad",
+            ambito_archivos=["modulos/d/*.py"],
+            pruebas_requeridas=["pruebas/demostracion/prueba_lenta.py"],
+            decisiones=[{"clave": "D-1", "descripcion": "a mitad"}],
+        )
+        _git(principal, "add", "-A")
+        hecho = _git(principal, "commit", "-q", "-m", "ficha versionada y árbol limpio")
+        assert hecho.returncode == 0, hecho.stderr
+        assert not _git(principal, "status", "--porcelain").stdout.strip()
+
+        quinta = nucleo.tomar(principal, "T-0906", trabajador_id="worker-A")
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        rastro = _git(principal, "status", "--porcelain").stdout
+        assert "orquestacion/tareas/T-0906.json" in rastro, (
+            "La toma no dejó el espejo modificado: la prueba no probaría nada."
+        )
+
+        def decidir_a_mitad():
+            time.sleep(0.6)
+            nucleo.decidir(principal, "T-0906", "D-1", "resuelta a mitad")
+
+        hilo = threading.Thread(target=decidir_a_mitad)
+        hilo.start()
+
+        try:
+            METRICAS["OPERACIONES"] += 1
+            informe = nucleo.verificar(
+                principal, "T-0906",
+                trabajador_id="worker-A", generacion=quinta.generacion,
+            )
+        finally:
+            hilo.join()
+
+        METRICAS["ACEPTADAS"] += 1
+
+        assert informe["estado"] == str(Estado.PROPUESTO), (
+            "Una decisión resuelta a mitad tiró la corrida: "
+            + informe["estado"] + " / " + informe["motivo"]
+        )
+        assert informe["sin_confirmar"] is False, (
+            "El espejo del propio Supervisor se contó como cambios sin "
+            "confirmar."
+        )
+        assert informe["arbol_estable"] is True
+
         comprobar_integridad(principal)
     finally:
         borrar(principal)
@@ -3636,61 +3805,64 @@ def prueba_ad_el_latido_aguanta_un_fallo_transitorio():
         )
 
         abrir_real = estado_global.abrir
-        fallos = {"restantes": 1}
 
-        def abrir_con_un_tropiezo(*argumentos, **extras):
-            if fallos["restantes"] > 0:
-                fallos["restantes"] -= 1
-                raise sqlite3.OperationalError("database is locked")
+        # El bloqueo es REAL: otra conexión tiene el candado de escritura.
+        # Antes se simulaba lanzando `sqlite3.OperationalError` desde
+        # `abrir`, un error que en producción nunca llega así: `abrir` y
+        # `transaccion` lo envuelven en ErrorEstadoGlobal, y esa envoltura
+        # caía en «no es transitoria: se para». La prueba certificaba una
+        # tolerancia que el bloqueo de verdad no tenía.
+        espera_real = estado_global.BUSY_TIMEOUT_MS
+        estado_global.BUSY_TIMEOUT_MS = 50
 
-            return abrir_real(*argumentos, **extras)
-
-        estado_global.abrir = abrir_con_un_tropiezo
+        candado = estado_global.abrir(estado_global.ruta_base(raiz))
 
         try:
+            candado.execute("BEGIN IMMEDIATE")
+
+            METRICAS["OPERACIONES"] += 1
             sigue = acompanante.emitir_uno()
-        finally:
-            estado_global.abrir = abrir_real
 
-        METRICAS["OPERACIONES"] += 1
+            assert sigue is True, (
+                "El latido se rindió al primer bloqueo; a partir de ahí la "
+                "operación se queda sin señal en silencio."
+            )
+            assert acompanante.propiedad_perdida is False, (
+                "Un bloqueo se confundió con perder la tarea."
+            )
+            assert "locked" in str(acompanante.error), acompanante.error
+            assert acompanante.emitidos == 0
+            assert acompanante.fallos_seguidos == 1
 
-        assert sigue is True, (
-            "El latido se rindió al primer fallo transitorio; a partir de "
-            "ahí la operación se queda sin señal en silencio."
-        )
-        assert acompanante.propiedad_perdida is False, (
-            "Un fallo de escritura se confundió con perder la tarea."
-        )
-        assert acompanante.error, "El fallo no quedó anotado."
-        assert acompanante.emitidos == 0
-
-        # Y al siguiente intento late con normalidad.
-        assert acompanante.emitir_uno() is True
-        assert acompanante.emitidos == 1
-        assert acompanante.fallos_seguidos == 0, (
-            "El contador de fallos seguidos no se reinició tras un acierto."
-        )
-        METRICAS["OPERACIONES"] += 1
-        METRICAS["ACEPTADAS"] += 1
-        METRICAS["LATIDOS_AUTOMATICOS"] += 1
-
-        # Con fallos suficientes SÍ se rinde, que también hace falta.
-        fallos["restantes"] = nucleo.FALLOS_LATIDO_SEGUIDOS
-        estado_global.abrir = abrir_con_un_tropiezo
-
-        try:
+            # Con bloqueos suficientes SÍ se rinde, que también hace falta.
             resultados = [
                 acompanante.emitir_uno()
-                for _ in range(nucleo.FALLOS_LATIDO_SEGUIDOS)
+                for _ in range(nucleo.FALLOS_LATIDO_SEGUIDOS - 1)
             ]
         finally:
-            estado_global.abrir = abrir_real
+            candado.execute("ROLLBACK")
+            candado.close()
+            estado_global.BUSY_TIMEOUT_MS = espera_real
 
         assert resultados[-1] is False, (
             "El latido no se rinde nunca: un fallo permanente lo dejaría "
             "girando para siempre."
         )
         METRICAS["RECHAZADAS"] += 1
+
+        # Soltado el candado, otro acompañante late con normalidad.
+        acompanante = nucleo.LatidoAutomatico(
+            raiz, "T-0901", "worker-A", tomada.generacion
+        )
+
+        assert acompanante.emitir_uno() is True
+        assert acompanante.emitidos == 1
+        assert acompanante.fallos_seguidos == 0
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+        METRICAS["LATIDOS_AUTOMATICOS"] += 1
+
+        resultados = [True]
 
         # Una excepción que NO es de SQLite no es transitoria: se anota y
         # se para, sin confundirla con perder la tarea. Esa rama no la
@@ -3820,6 +3992,31 @@ def prueba_ae_el_latido_no_puede_retroceder_la_marca_de_vida():
         assert "locked" in str(retrasado.error), retrasado.error
         METRICAS["RECHAZADAS"] += 1
 
+        # La orden MANUAL `latido` lleva la misma guarda: desde una máquina
+        # con el reloj atrasado podía reducir la antigüedad de la señal y
+        # dejar la tarea huérfana en el acto.
+        from datetime import datetime, timezone
+
+        METRICAS["OPERACIONES"] += 1
+
+        try:
+            nucleo.latido(
+                raiz, "T-0901",
+                ahora=datetime(2030, 6, 1, 10, 0, tzinfo=timezone.utc),
+                trabajador_id="worker-A", generacion=tomada.generacion,
+            )
+            METRICAS["ACEPTADAS"] += 1
+            raise AssertionError(
+                "Un latido manual con la hora atrasada retrocedió la marca."
+            )
+        except nucleo.ErrorPropiedad as rechazo:
+            METRICAS["RECHAZADAS"] += 1
+            assert rechazo.informe["motivo"] == (
+                estado_global.MOTIVO_MARCA_MAS_NUEVA
+            ), repr(rechazo.informe)
+
+        assert fila_de(raiz, "T-0901")["ultimo_latido"] == bueno
+
         comprobar_integridad(raiz)
     finally:
         borrar(raiz)
@@ -3921,6 +4118,87 @@ def prueba_af_dos_decisiones_humanas_no_se_pisan():
             "Abrir la tarea desde una definición que no declara D-1 borró "
             "su resolución de la base: " + repr(despues)
         )
+
+        # Resolver la última pendiente retira la falla ámbar. Sin esto la
+        # fila decía a la vez «resueltas» y «hay decisiones sin resolver»
+        # hasta la siguiente corrida.
+        ficha_minima(
+            raiz, "T-0903",
+            decisiones=[{"clave": "D-1", "descripcion": "frena"}],
+        )
+        tercera = nucleo.tomar(raiz, "T-0903", trabajador_id="worker-A")
+        informe = nucleo.verificar(
+            raiz, "T-0903",
+            trabajador_id="worker-A", generacion=tercera.generacion,
+        )
+        METRICAS["OPERACIONES"] += 2
+        METRICAS["ACEPTADAS"] += 2
+
+        assert informe["estado"] == str(Estado.REQUIERE_REVISION)
+        assert fila_de(raiz, "T-0903")["ultima_falla"]["tipo"] == (
+            nucleo.FALLA_DECISIONES_PENDIENTES
+        )
+
+        nucleo.decidir(raiz, "T-0903", "D-1", "ya no frena")
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        assert fila_de(raiz, "T-0903")["ultima_falla"] is None, (
+            "La falla ámbar quedó rancia tras resolver la última decisión: "
+            + repr(fila_de(raiz, "T-0903")["ultima_falla"])
+        )
+
+        # Y `aprobar` exige al motor lo que comprobó en Python: una
+        # decisión DECLARADA entre su lectura y su escritura —cualquier
+        # `cargar` de otro proceso la sincroniza— no mueve ni el estado ni
+        # la generación, y la tarea quedaba APROBADA con una pendiente.
+        ficha_minima(raiz, "T-0904")
+        cuarta = nucleo.tomar(raiz, "T-0904", trabajador_id="worker-A")
+        nucleo.verificar(
+            raiz, "T-0904",
+            trabajador_id="worker-A", generacion=cuarta.generacion,
+        )
+        METRICAS["OPERACIONES"] += 2
+        METRICAS["ACEPTADAS"] += 2
+
+        assert fila_de(raiz, "T-0904")["estado"] == str(Estado.PROPUESTO)
+
+        persistir_real = nucleo.persistir
+
+        def persistir_con_decision_recien_declarada(*argumentos, **claves):
+            archivo = fichas.carpeta_tareas(raiz) / "T-0904.json"
+            datos = json.loads(archivo.read_text(encoding="utf-8"))
+            datos["requiere_decision_humana"] = [
+                {"clave": "D-NUEVA", "descripcion": "declarada entre medias"}
+            ]
+            archivo.write_text(
+                json.dumps(datos, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            nucleo.cargar(raiz, "T-0904")
+
+            return persistir_real(*argumentos, **claves)
+
+        nucleo.persistir = persistir_con_decision_recien_declarada
+
+        try:
+            METRICAS["OPERACIONES"] += 1
+            nucleo.aprobar(raiz, "T-0904")
+            METRICAS["ACEPTADAS"] += 1
+            raise AssertionError(
+                "Se aprobó una tarea con una decisión declarada entre la "
+                "comprobación y la escritura."
+            )
+        except nucleo.ErrorPropiedad as rechazo:
+            METRICAS["RECHAZADAS"] += 1
+            assert rechazo.informe["motivo"] == (
+                estado_global.MOTIVO_PRECONDICION_CAMBIADA
+            ), repr(rechazo.informe)
+        finally:
+            nucleo.persistir = persistir_real
+
+        assert fila_de(raiz, "T-0904")["estado"] == str(Estado.PROPUESTO)
+        assert fila_de(raiz, "T-0904")["requiere_decision_humana"] in (1, True)
 
         comprobar_integridad(raiz)
     finally:

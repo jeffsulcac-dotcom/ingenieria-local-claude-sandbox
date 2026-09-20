@@ -1065,15 +1065,24 @@ def resolver_decision(
 
     pendientes = [una for una in fusionadas if not una["resuelta"]]
 
-    actualizar_tarea(
-        con,
-        identificador,
-        {
-            "decisiones": _a_json(decisiones_operativas(fusionadas)),
-            "requiere_decision_humana": 1 if pendientes else 0,
-            "actualizado_en": momento,
-        },
-    )
+    campos = {
+        "decisiones": _a_json(decisiones_operativas(fusionadas)),
+        "requiere_decision_humana": 1 if pendientes else 0,
+        "actualizado_en": momento,
+    }
+
+    # Si lo único que frenaba la propuesta eran decisiones pendientes y se
+    # acaba de resolver la última, esa falla ya no describe nada: dejarla
+    # hacía que la fila dijera a la vez «resueltas» y «hay decisiones sin
+    # resolver» hasta la siguiente corrida.
+    falla = fila.get("ultima_falla") or {}
+
+    if not pendientes and isinstance(falla, dict) and falla.get("tipo") == (
+        "decisiones_pendientes"
+    ):
+        campos["ultima_falla"] = None
+
+    actualizar_tarea(con, identificador, campos)
 
     return {
         "resuelta": True,

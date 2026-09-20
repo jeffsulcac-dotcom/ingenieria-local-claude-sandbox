@@ -46,6 +46,7 @@ ETIQUETAS_VITALIDAD = {
     "LATIDO_VENCIDO": "LATIDO VENCIDO",
     "HUERFANA": "HUÉRFANA",
     "REANUDABLE": "REANUDABLE",
+    "ESPERA_HUMANA": "ESPERA HUMANA",
     "FINALIZADA": "FINALIZADA",
 }
 
@@ -682,7 +683,7 @@ def orden_tomar(raiz: Path, argumentos) -> int:
     print("Trabajador: " + str(ficha.trabajador_id))
     print("Generación: " + str(ficha.generacion))
     print("Rama exigida: " + str(ficha.rama))
-    print("Árbol de ejecución: " + (ficha.worktree or "(la raíz)"))
+    print("Árbol de ejecución: " + str(ficha.worktree))
 
     return 0
 
@@ -927,6 +928,7 @@ def orden_reanudar(raiz: Path, argumentos) -> int:
             "inconsistentes_sin_tocar",
             "espejo_no_regenerado",
             "sin_definicion",
+            "fichas_ilegibles",
         )
     )
 
@@ -1118,8 +1120,9 @@ def construir_analizador() -> argparse.ArgumentParser:
         help=(
             "Árbol de trabajo donde se ejecutará la tarea. Debe ser un "
             "worktree que Git tenga registrado para este repositorio "
-            "(`git worktree list`). Sin esta opción se usa el que la tarea "
-            "ya tuviera registrado, y si no tiene ninguno, la raíz."
+            "(`git worktree list`). Sin esta opción, el árbol de la "
+            "ejecución es la raíz desde la que se toma (--raiz), y "
+            "`verificar` correrá allí aunque se invoque desde otro árbol."
         ),
     )
     tomar.set_defaults(funcion=orden_tomar)

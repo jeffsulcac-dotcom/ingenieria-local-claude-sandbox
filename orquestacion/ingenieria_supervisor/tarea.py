@@ -419,6 +419,11 @@ def leer(raiz: Path, identificador: str) -> Ficha:
     return ficha
 
 
+# Reintentos del reemplazo atómico ante un lector concurrente (Windows).
+REINTENTOS_REEMPLAZO = 10
+ESPERA_REEMPLAZO_S = 0.05
+
+
 def guardar(
     raiz: Path,
     ficha: Ficha,
@@ -473,7 +478,20 @@ def guardar(
         comprobacion = json.loads(temporal.read_text(encoding="utf-8"))
         Ficha.desde_dict(comprobacion)
 
-        os.replace(temporal, destino)
+        # En Windows, reemplazar un archivo que otro proceso tiene abierto
+        # para leer —el tablero web lo lee cada pocos segundos, otra consola
+        # también— falla con PermissionError durante esos milisegundos. Se
+        # reintenta brevemente antes de rendirse; en POSIX el reemplazo no
+        # depende de los lectores y el bucle no interviene.
+        for intento in range(REINTENTOS_REEMPLAZO):
+            try:
+                os.replace(temporal, destino)
+                break
+            except PermissionError:
+                if intento + 1 == REINTENTOS_REEMPLAZO:
+                    raise
+
+                time.sleep(ESPERA_REEMPLAZO_S)
 
     except BaseException:
         temporal.unlink(missing_ok=True)
