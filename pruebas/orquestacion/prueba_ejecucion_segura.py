@@ -81,6 +81,11 @@ ESPERA_GIT_S = 30
 # Métricas reales acumuladas durante toda la ejecución
 # ----------------------------------------------------------------------
 
+# Casos que una corrida concreta no pudo ejercitar (el sistema no permite
+# enlaces simbólicos, por ejemplo). Se imprimen al final: una comprobación
+# que se salta un caso en silencio y sigue diciendo «OK» miente.
+OMITIDAS: list[str] = []
+
 METRICAS = {
     "OPERACIONES": 0,
     "ACEPTADAS": 0,
@@ -1964,8 +1969,14 @@ def prueba_q_rutas_raras_pero_legitimas_se_aceptan():
 
             try:
                 enlace.symlink_to(enlazado, target_is_directory=True)
-            except OSError:
+            except OSError as problema:
+                # Si se omite, se DICE. Un caso que desaparece en silencio
+                # y deja la comprobación imprimiendo «OK» es peor que no
+                # tenerlo: nadie se entera de que dejó de probarse.
                 enlace = None
+                OMITIDAS.append(
+                    "enlace simbólico al worktree (" + str(problema) + ")"
+                )
 
             if enlace is not None:
                 METRICAS["OPERACIONES"] += 1
@@ -3552,6 +3563,13 @@ def prueba_ejecucion_segura(rondas: int = RONDAS_POR_OMISION) -> None:
     duracion = time.monotonic() - inicio
 
     imprimir_metricas()
+
+    if OMITIDAS:
+        print("")
+        print("  Casos OMITIDOS en esta corrida (el entorno no los admite)")
+        print("  --------------------------------------------------------")
+        for omitida in OMITIDAS:
+            print("      · " + omitida)
 
     # El veredicto no se declara: se comprueba contra lo medido.
     #
