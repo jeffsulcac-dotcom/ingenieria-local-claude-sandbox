@@ -1197,7 +1197,7 @@ def prueba_g_crear_concurrente_tiene_un_solo_ganador(creadores: int):
     ganó. Contar ganadores no bastaría.
     """
     print(
-        " 18. crear concurrente (" + str(creadores) + " procesos): ",
+        " 19. crear concurrente (" + str(creadores) + " procesos): ",
         end="",
     )
 
@@ -1684,6 +1684,126 @@ def prueba_p_tras_recuperar_b_toma_y_la_orden_tardia_de_a_cae():
     print("OK")
 
 
+def prueba_s_el_worktree_que_desaparece_se_avisa_y_frena_la_retoma():
+    """
+    Si el árbol de la tarea ya no está, se avisa y no se concede a ciegas.
+
+    Escenario real: la tarea se tomó en un worktree, el proceso murió y
+    entre medias el árbol desapareció —lo borró el usuario, era una unidad
+    extraíble, o el `git worktree` se deshizo—. La recuperación devuelve
+    la tarea a REABIERTO, pero la fila sigue apuntando a una ruta muerta.
+
+    Aquí se comprueban las dos mitades:
+
+    1. `reanudar` lo dice. No borra el dato, porque el árbol puede volver
+       y esa decisión es de una persona, pero no deja el problema callado.
+
+    2. Una retoma que NO declara worktree hereda esa ruta, y se rechaza en
+       la toma. Antes se concedía: el trabajador creía tener la tarea,
+       hacía el trabajo y sólo al verificar descubría que su árbol no
+       existía. Fallar al conceder cuesta un mensaje; fallar al verificar
+       cuesta el trabajo entero.
+    """
+    print(" 17. un worktree que desaparece se avisa y frena la retoma:",
+          end=" ")
+
+    principal, aparte, arboles = montar_tres_arboles()
+
+    try:
+        nucleo.crear(
+            principal,
+            "T-0903",
+            titulo="Tarea del árbol A",
+            ambito_archivos=["modulos/a/*.py"],
+            pruebas_requeridas=["pruebas/demostracion/prueba_arbol.py"],
+        )
+        tomada = nucleo.tomar(
+            principal,
+            "T-0903",
+            trabajador_id="worker-A",
+            worktree=str(arboles["A"]),
+        )
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        assert tomada.worktree == str(arboles["A"].resolve())
+
+        # La ejecución queda demostrada muerta: latido antiguo.
+        con = estado_global.abrir(estado_global.ruta_base(principal))
+
+        try:
+            with estado_global.transaccion(con):
+                con.execute(
+                    "UPDATE tareas SET ultimo_latido = ? WHERE id = ?",
+                    ("2020-01-01T00:00:00+00:00", "T-0903"),
+                )
+        finally:
+            con.close()
+
+        # Y el árbol desaparece.
+        shutil.rmtree(arboles["A"])
+
+        assert not arboles["A"].exists()
+
+        informe = nucleo.reanudar(
+            principal, comprobar_proceso=lambda _pid: False
+        )
+
+        assert len(informe["huerfanas"]) == 1, (
+            "La recuperación no recuperó la tarea: " + repr(informe)
+        )
+        assert [uno["id"] for uno in informe["worktree_ausente"]] == [
+            "T-0903"
+        ], (
+            "La recuperación no avisó del worktree ausente: "
+            + repr(informe["worktree_ausente"])
+        )
+
+        fila = fila_de(principal, "T-0903")
+
+        assert fila["estado"] == str(Estado.REABIERTO)
+        assert fila["worktree"] == str(arboles["A"].resolve()), (
+            "Se borró el worktree registrado en vez de avisar."
+        )
+
+        # La retoma sin declarar árbol hereda la ruta muerta: se rechaza.
+        try:
+            nucleo.tomar(principal, "T-0903", trabajador_id="worker-B")
+            raise AssertionError(
+                "Se concedió la toma sobre un worktree que no existe."
+            )
+        except nucleo.ErrorWorktree as rechazo:
+            assert "no existe" in str(rechazo), str(rechazo)
+
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["RECHAZADAS"] += 1
+
+        # Y la tarea sigue libre: un rechazo no la deja reclamada a medias.
+        despues = fila_de(principal, "T-0903")
+
+        assert despues["estado"] == str(Estado.REABIERTO)
+        assert despues["trabajador_id"] is None
+
+        # Declarando un árbol válido, la misma tarea se toma sin problema.
+        rescatada = nucleo.tomar(
+            principal,
+            "T-0903",
+            trabajador_id="worker-B",
+            worktree=str(arboles["B"]),
+        )
+        METRICAS["OPERACIONES"] += 1
+        METRICAS["ACEPTADAS"] += 1
+
+        assert rescatada.worktree == str(arboles["B"].resolve())
+
+        comprobar_integridad(principal)
+    finally:
+        borrar(aparte)
+        borrar(principal)
+
+    print("OK")
+
+
 # ----------------------------------------------------------------------
 # GRUPO 6 — Seguridad de rutas
 # ----------------------------------------------------------------------
@@ -1697,7 +1817,7 @@ def prueba_q_rutas_raras_pero_legitimas_se_aceptan():
     una carpeta con espacios o por llegar escrito con `..` en medio. Los
     dos errores cuestan; éste se nota menos y por eso conviene probarlo.
     """
-    print(" 17. una ruta legítima con forma rara se acepta:", end=" ")
+    print(" 18. una ruta legítima con forma rara se acepta:", end=" ")
 
     base = Path(tempfile.mkdtemp(prefix="rutas con espacios "))
 
@@ -1878,7 +1998,7 @@ def prueba_r_estres_de_escrituras_concurrentes(escritores: int, vueltas: int):
     puesta acaba apareciendo.
     """
     print(
-        " 19. estrés: " + str(escritores) + " escritores x " + str(vueltas)
+        " 20. estrés: " + str(escritores) + " escritores x " + str(vueltas)
         + " vueltas:",
         end=" ",
     )
@@ -2007,6 +2127,7 @@ COMPROBACIONES = (
     prueba_n_la_vitalidad_distingue_los_cinco_estados,
     prueba_o_reanudar_es_idempotente,
     prueba_p_tras_recuperar_b_toma_y_la_orden_tardia_de_a_cae,
+    prueba_s_el_worktree_que_desaparece_se_avisa_y_frena_la_retoma,
     prueba_q_rutas_raras_pero_legitimas_se_aceptan,
 )
 

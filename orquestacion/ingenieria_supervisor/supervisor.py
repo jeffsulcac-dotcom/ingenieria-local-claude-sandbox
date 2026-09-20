@@ -1350,9 +1350,17 @@ def tomar(
     # sistema de archivos y preguntarle a Git son esperas de disco y no
     # deben hacerse con el bloqueo de escritura tomado. Si la ruta no vale,
     # la toma ni se intenta.
-    arbol_declarado = (
-        str(resolver_worktree(raiz, worktree)) if worktree else ficha.worktree
-    )
+    if worktree:
+        arbol_declarado = str(resolver_worktree(raiz, worktree))
+    elif ficha.worktree:
+        # Heredado de una ejecución anterior. Se valida IGUAL que el
+        # declarado: si no, una retoma después de recuperar concedería la
+        # tarea sobre un árbol que ya no existe, y el fallo aparecería
+        # mucho más tarde, al verificar, con el trabajo ya hecho. Quien
+        # quiera trabajarla en otro sitio lo declara con `--worktree`.
+        arbol_declarado = str(resolver_worktree(raiz, ficha.worktree))
+    else:
+        arbol_declarado = None
 
     momento = (ahora or ahora_datetime()).isoformat(timespec="seconds")
 
@@ -2434,6 +2442,11 @@ def reanudar(
         # Ejecuciones con el latido caducado que NO se recuperan porque no
         # están demostradas muertas (A3.3).
         "latido_vencido": [],
+        # Tareas cuyo worktree registrado ya no resuelve (A3.3). No se
+        # borra el dato: el árbol puede volver (una unidad desconectada,
+        # un `git worktree` que se rehace). Se avisa, que es lo que una
+        # persona necesita para decidir.
+        "worktree_ausente": [],
     }
 
     for temporal in temporales_huerfanos(raiz):
@@ -2599,6 +2612,22 @@ def reanudar(
                 "estado_nuevo": str(ficha.estado),
             }
         )
+
+        # La tarea ya está recuperada; lo que sigue es sólo informar. Se
+        # comprueba después de persistir para no dejar sin recuperar una
+        # tarea por un problema de su árbol: son cosas independientes.
+        if ficha.worktree:
+            try:
+                resolver_worktree(raiz, ficha.worktree)
+            except ErrorWorktree as problema:
+                informe["worktree_ausente"].append(
+                    {
+                        "id": ficha.id,
+                        "titulo": ficha.titulo,
+                        "worktree": ficha.worktree,
+                        "motivo": str(problema),
+                    }
+                )
 
     return informe
 

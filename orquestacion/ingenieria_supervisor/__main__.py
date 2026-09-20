@@ -762,6 +762,7 @@ def orden_reanudar(raiz: Path, argumentos) -> int:
         ("sin_definicion", "SIN DEFINICIÓN EN ESTE ÁRBOL (no modificadas)"),
         ("reclamadas_mientras_tanto", "RECLAMADAS DURANTE LA RECUPERACIÓN"),
         ("latido_vencido", "LATIDO VENCIDO (no recuperadas: mirar a mano)"),
+        ("worktree_ausente", "WORKTREE REGISTRADO QUE YA NO EXISTE"),
     ):
         if informe[grupo]:
             print("")
